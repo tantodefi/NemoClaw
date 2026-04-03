@@ -27,6 +27,12 @@ This skill is the orchestration layer that sits on top of the existing GitHub is
 - The GitHub workflow labels exist in the target repository.
 - If the source is ProtonMail, the `proton-calendar` skill has been synced into the sandbox and `proton-tool` has been built.
 
+## Target Repository
+
+Supachad files issues on the **fork** `tantodefi/NemoClaw`, not upstream
+`NVIDIA/NemoClaw`. The scripts default to `tantodefi/NemoClaw` when not
+inside a git checkout. Override with `--repo` if needed.
+
 ## First-Time Setup
 
 1. Bootstrap the workflow labels in the target repository:
@@ -57,10 +63,15 @@ This skill is the orchestration layer that sits on top of the existing GitHub is
 
 Use this when you or TJ tell Chad to file a bug directly in chat.
 
+Before filing, **always collect session logs** from the current skill session.
+The script auto-collects via `nemoclaw chad logs` when run inside the sandbox,
+but you can also pass an explicit log file:
+
 ```bash
 ./.github/skills/chad-bug-intake/scripts/create-bug-issue.sh \
   --subject "Credential sync missing inside sandbox" \
   --body-file /tmp/report.txt \
+  --session-log /tmp/session.log \
   --reporter "operator-chat" \
   --source chat \
   --sandbox chad
@@ -78,18 +89,21 @@ Use this when Chad reads approved email and should turn it into a GitHub issue.
 1. Use the `proton-calendar` skill to list mail and read the approved message.
 2. Treat the subject line as the title candidate.
 3. Save the message body to a temporary file.
-4. Run the create script:
+4. Capture the current session log (recent sandbox output, skill activity,
+   or `nemoclaw chad logs | tail -200 > /tmp/session.log`).
+5. Run the create script:
 
    ```bash
    ./.github/skills/chad-bug-intake/scripts/create-bug-issue.sh \
      --subject "$(printf '%s' "$MAIL_SUBJECT")" \
      --body-file /tmp/proton-report.txt \
+     --session-log /tmp/session.log \
      --reporter "sender@example.com" \
      --source proton \
      --sandbox chad
    ```
 
-5. Reply by email with the created issue URL or duplicate issue URL.
+6. Reply by email with the created issue URL or duplicate issue URL.
 
 ## Break Down And Delegate
 
