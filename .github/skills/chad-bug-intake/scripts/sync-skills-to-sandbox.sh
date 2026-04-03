@@ -71,7 +71,9 @@ for skill in "${skills[@]}"; do
   [ -d "$local_path" ] || fail "Skill directory not found: $local_path"
 
   ssh "$remote_host" "rm -rf '$remote_dir/$skill'"
-  scp -rq "$local_path" "$remote_host:$remote_dir/"
+  # Use tar pipeline instead of scp — sandbox may lack sftp-server
+  tar -C "$repo_root/.github/skills" -cf - "$skill" \
+    | ssh "$remote_host" "tar -C '$remote_dir' -xf -"
   echo "Synced $skill to $remote_host:$remote_dir/$skill"
 done
 

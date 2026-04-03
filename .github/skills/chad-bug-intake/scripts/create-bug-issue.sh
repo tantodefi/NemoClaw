@@ -6,15 +6,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Default fork repo — Supachad files issues here, not on the upstream
+# NVIDIA/NemoClaw repo.  Override with --repo if needed.
+DEFAULT_REPO="tantodefi/NemoClaw"
+
 usage() {
   cat <<'EOF'
 Usage: create-bug-issue.sh --subject TEXT [options]
 
 Options:
-  --repo OWNER/REPO      Target repository. Defaults to the current gh repo.
+  --repo OWNER/REPO      Target repository (default: tantodefi/NemoClaw).
   --subject TEXT         Raw chat or ProtonMail subject. Required.
   --body TEXT            Report body.
   --body-file PATH       Read report body from a file.
+  --session-log PATH     Include a file of session/sandbox logs in the issue.
   --reporter TEXT        Reporter identity or email address.
   --source TEXT          Intake source. Defaults to chat.
   --sandbox TEXT         Sandbox name. Defaults to chad.
@@ -32,6 +37,7 @@ repo=""
 subject=""
 report_body=""
 body_file=""
+session_log_file=""
 reporter="unknown"
 source_name="chat"
 sandbox_name="chad"
@@ -54,6 +60,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --body-file)
       body_file="$2"
+      shift 2
+      ;;
+    --session-log)
+      session_log_file="$2"
       shift 2
       ;;
     --reporter)
@@ -97,10 +107,23 @@ if [ -z "$report_body" ]; then
   report_body="No additional report body was provided."
 fi
 
+# Collect session logs ---------------------------------------------------
+session_log=""
+if [ -n "$session_log_file" ]; then
+  [ -f "$session_log_file" ] || fail "Session log file not found: $session_log_file"
+  session_log="$(tail -200 "$session_log_file")"
+fi
+
+# Auto-collect recent sandbox logs when no explicit session log is given.
+if [ -z "$session_log" ] && command -v nemoclaw >/dev/null 2>&1; then
+  session_log="$(nemoclaw "$sandbox_name" logs 2>/dev/null | tail -100)" || true
+fi
+
 title="$($SCRIPT_DIR/normalize-bug-title.sh "$subject")"
 
 if [ -z "$repo" ]; then
-  repo="$(gh repo view --json nameWithOwner --jq '.nameWithOwner')"
+  # Prefer the local git context; fall back to the fork.
+  repo="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)" || repo="$DEFAULT_REPO"
 fi
 
 available_labels="$(gh label list --repo "$repo" --limit 200 --json name --jq '.[].name')"
@@ -136,8 +159,9 @@ if [ -n "$existing_issue" ]; then
   exit 0
 fi
 
-issue_body="$(cat <<EOF
-## Description
+session_log_display="${session_log:-No session log was captured. Run nemoclaw ${sandbox_name} logs or pass --session-log PATH.}"
+
+issue_body="## Description
 
 Reported via ${source_name} by ${reporter}.
 
@@ -157,23 +181,32 @@ ${report_body}
 - NemoClaw version: unknown
 - OS: unknown
 
+## Session Log
+
+<details>
+<summary>Sandbox / skill session log (auto-collected)</summary>
+
+<pre>
+${session_log_display}
+</pre>
+
+</details>
+
 ## Debug Output
 
-Not yet collected. Follow up with `nemoclaw debug --quick` or attach a debug bundle when reproduction succeeds.
+Not yet collected. Follow up with \`nemoclaw debug --quick\` or attach a debug bundle when reproduction succeeds.
 
-## Logs
+## Source Report
 
-```text
+<pre>
 ${report_body}
-```
+</pre>
 
 ## Agent Intake
 
 - Original subject: ${subject}
 - Normalized title: ${title}
-- Duplicate check: passed
-EOF
- )"
+- Duplicate check: passed"
 
 label_args=()
 for label in bug "status: triage" "state:triage-needed"; do

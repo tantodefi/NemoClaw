@@ -36,7 +36,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -z "$repo" ]; then
-  repo="$(gh repo view --json nameWithOwner --jq '.nameWithOwner')"
+  repo="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)" || repo="tantodefi/NemoClaw"
 fi
 
 labels=(
