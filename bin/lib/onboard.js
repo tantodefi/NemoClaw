@@ -2193,6 +2193,10 @@ async function createSandbox(
   if (protonPass) {
     sandboxEnv.PROTON_PASSWORD = protonPass;
   }
+  const githubToken = getCredential("GITHUB_TOKEN") || process.env.GITHUB_TOKEN;
+  if (githubToken) {
+    sandboxEnv.GITHUB_TOKEN = githubToken;
+  }
   // Run without piping through awk — the pipe masked non-zero exit codes
   // from openshell because bash returns the status of the last pipeline
   // command (awk, always 0) unless pipefail is set. Removing the pipe
@@ -3072,6 +3076,10 @@ async function _setupPolicies(sandboxName) {
   if (getCredential("PROTON_USERNAME") || getCredential("PROTON_PASSWORD")) {
     suggestions.push("proton-calendar");
     console.log("  Auto-detected: PROTON_USERNAME → suggesting proton-calendar preset");
+  }
+  if (getCredential("GITHUB_TOKEN") || process.env.GITHUB_TOKEN) {
+    suggestions.push("github-tools");
+    console.log("  Auto-detected: GITHUB_TOKEN → suggesting github-tools preset");
   }
 
   const allPresets = policies.listPresets();
