@@ -2154,6 +2154,14 @@ async function createSandbox(
   const sandboxEnv = Object.fromEntries(
     Object.entries(process.env).filter(([name]) => !blockedSandboxEnvNames.has(name)),
   );
+  const protonUser = getCredential("PROTON_USERNAME");
+  if (protonUser) {
+    sandboxEnv.PROTON_USERNAME = protonUser;
+  }
+  const protonPass = getCredential("PROTON_PASSWORD");
+  if (protonPass) {
+    sandboxEnv.PROTON_PASSWORD = protonPass;
+  }
   // Run without piping through awk — the pipe masked non-zero exit codes
   // from openshell because bash returns the status of the last pipeline
   // command (awk, always 0) unless pipefail is set. Removing the pipe
@@ -3233,6 +3241,10 @@ async function _setupPolicies(sandboxName) {
   if (getCredential("DISCORD_BOT_TOKEN") || process.env.DISCORD_BOT_TOKEN) {
     suggestions.push("discord");
     console.log("  Auto-detected: DISCORD_BOT_TOKEN → suggesting discord preset");
+  }
+  if (getCredential("PROTON_USERNAME") || getCredential("PROTON_PASSWORD")) {
+    suggestions.push("proton-calendar");
+    console.log("  Auto-detected: PROTON_USERNAME → suggesting proton-calendar preset");
   }
 
   const allPresets = policies.listPresets();

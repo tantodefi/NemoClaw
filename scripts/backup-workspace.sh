@@ -73,6 +73,7 @@ do_backup() {
   fi
 
   info "Backup saved to ${dest}/ (${count} items)"
+  info "Tip: also run 'scripts/backup-host.sh' to back up host-side credentials and config."
 }
 
 do_restore() {

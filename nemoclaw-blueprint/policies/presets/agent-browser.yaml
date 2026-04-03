@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: agent-browser
+  description: "Headless browser automation — broad web access for agent-browser CLI"
+
+network_policies:
+  # ── Agent Browser (thesethrose/agent-browser) ──────────────────
+  # Headless browser that navigates arbitrary user-directed URLs.
+  # Requires wildcard host access because the agent browses any site.
+  #
+  # SECURITY NOTE: This is intentionally the broadest policy in the
+  # system. Binary restrictions are the primary control — only node
+  # and agent-browser processes can use this policy. No curl, wget,
+  # python, or other binaries are allowed, preventing other sandbox
+  # processes from exploiting the broad network access.
+  #
+  # OpenShell rejects bare '*' wildcards. Use '*.tld' patterns for
+  # the most common TLDs the browser will visit. Add more TLD entries
+  # as needed.
+  agent_browser:
+    name: agent_browser
+    endpoints:
+      - host: "*.com"
+        port: 443
+        access: full
+      - host: "*.org"
+        port: 443
+        access: full
+      - host: "*.net"
+        port: 443
+        access: full
+      - host: "*.io"
+        port: 443
+        access: full
+      - host: "*.dev"
+        port: 443
+        access: full
+      - host: "*.ai"
+        port: 443
+        access: full
+      - host: "*.co"
+        port: 443
+        access: full
+      - host: "*.me"
+        port: 443
+        access: full
+      - host: "*.sh"
+        port: 443
+        access: full
+      - host: "*.app"
+        port: 443
+        access: full
+      - host: "*.xyz"
+        port: 443
+        access: full
+      - host: "*.edu"
+        port: 443
+        access: full
+      - host: "*.gov"
+        port: 443
+        access: full
+      - host: "*.com"
+        port: 80
+        access: full
+      - host: "*.org"
+        port: 80
+        access: full
+      - host: "*.net"
+        port: 80
+        access: full
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }
+      - { path: /usr/bin/chromium }
+      - { path: /usr/lib/chromium/chromium }
+      - { path: /usr/local/bin/agent-browser }
+      - { path: "/sandbox/node_modules/.bin/agent-browser" }
+      - { path: "/sandbox/**/node_modules/.bin/agent-browser" }
