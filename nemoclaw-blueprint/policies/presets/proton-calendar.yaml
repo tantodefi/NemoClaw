@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: proton-calendar
+  description: "Proton Calendar skill — Go toolchain install, module fetch, and Proton REST API"
+
+network_policies:
+  # ── Go toolchain download ──────────────────────────────────────
+  # curl/wget https://go.dev/dl/... to install Go runtime.
+  go_install:
+    name: go_install
+    endpoints:
+      - host: go.dev
+        port: 443
+        access: full
+      - host: dl.google.com
+        port: 443
+        access: full
+      - host: golang.org
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+
+  # ── Go module proxy ────────────────────────────────────────────
+  # go mod download, go build, go get
+  go_modules:
+    name: go_modules
+    endpoints:
+      - host: proxy.golang.org
+        port: 443
+        access: full
+      - host: sum.golang.org
+        port: 443
+        access: full
+      - host: storage.googleapis.com
+        port: 443
+        access: full
+    binaries:
+      - { path: "/usr/local/go/bin/go" }
+      - { path: "/sandbox/go/bin/go" }
+      - { path: "/sandbox/**/go" }
+
+  # ── Go module Git sources ──────────────────────────────────────
+  # ProtonMail modules (go-crypto, gopenpgp, go-srp, gluon, etc.)
+  # need direct Git fetches from GitHub/GitLab.
+  go_module_git_sources:
+    name: go_module_git_sources
+    endpoints:
+      - host: github.com
+        port: 443
+        access: full
+      - host: "*.github.com"
+        port: 443
+        access: full
+      - host: gitlab.com
+        port: 443
+        access: full
+      - host: "*.gitlab.com"
+        port: 443
+        access: full
+    binaries:
+      - { path: "/usr/local/go/bin/go" }
+      - { path: "/sandbox/go/bin/go" }
+      - { path: "/sandbox/**/go" }
+      - { path: /usr/bin/git }
+
+  # ── Proton REST API ────────────────────────────────────────────
+  # go-proton-api uses SRP auth + PGP encryption via its own TLS.
+  # access: full (CONNECT tunnel) lets Go manage TLS directly.
+  # AppVersion: web-mail@5.0.36 (works with free Proton accounts).
+  proton_api:
+    name: proton_api
+    endpoints:
+      - host: mail-api.proton.me
+        port: 443
+        access: full
+      - host: mail.proton.me
+        port: 443
+        access: full
+      - host: api.protonmail.ch
+        port: 443
+        access: full
+      - host: account.proton.me
+        port: 443
+        access: full
+    binaries:
+      - { path: "/sandbox/**" }

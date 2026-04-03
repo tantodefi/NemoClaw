@@ -216,3 +216,92 @@ network_policies:
           - allow: { method: GET, path: "/**" }
     binaries:
       - { path: /usr/local/bin/node }
+
+  # ── Go toolchain ─────────────────────────────────────────────────
+  # Download and install Go runtime (curl/wget https://go.dev/dl/...)
+  go_install:
+    name: go_install
+    endpoints:
+      - host: go.dev
+        port: 443
+        access: full
+      - host: dl.google.com
+        port: 443
+        access: full
+      - host: golang.org
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+
+  # ── Go module proxy ──────────────────────────────────────────────
+  # Required for `go mod download`, `go build`, `go get`.
+  # access: full — the Go binary opens TLS connections itself
+  # (not via curl/wget), so it needs CONNECT tunnels through the proxy.
+  go_modules:
+    name: go_modules
+    endpoints:
+      - host: proxy.golang.org
+        port: 443
+        access: full
+      - host: sum.golang.org
+        port: 443
+        access: full
+      - host: storage.googleapis.com
+        port: 443
+        access: full
+    binaries:
+      - { path: "/usr/local/go/bin/go" }
+      - { path: "/sandbox/go/bin/go" }
+      - { path: "/sandbox/**/go" }
+
+  # ── Go module Git sources ────────────────────────────────────────
+  # go-proton-api deps require direct Git fetches from GitHub/GitLab.
+  # ProtonMail modules: go-crypto, gopenpgp, go-srp, gluon, etc.
+  # Also gitlab.com/c0b/go-ordered-json.
+  go_module_git_sources:
+    name: go_module_git_sources
+    endpoints:
+      - host: github.com
+        port: 443
+        access: full
+      - host: "*.github.com"
+        port: 443
+        access: full
+      - host: gitlab.com
+        port: 443
+        access: full
+      - host: "*.gitlab.com"
+        port: 443
+        access: full
+    binaries:
+      - { path: "/usr/local/go/bin/go" }
+      - { path: "/sandbox/go/bin/go" }
+      - { path: "/sandbox/**/go" }
+      - { path: /usr/bin/git }
+
+  # ── Proton API (proton-calendar skill) ─────────────────────────
+  # go-proton-api uses SRP auth + PGP encryption, which requires the Go
+  # HTTP client to manage its own TLS sessions. Use access: full (CONNECT
+  # tunnel) so the proxy passes traffic through without TLS termination.
+  # AppVersion must be web-mail@5.0.36 (free accounts); linux-bridge@*
+  # requires a paid Proton plan.
+  proton_api:
+    name: proton_api
+    endpoints:
+      - host: mail-api.proton.me
+        port: 443
+        access: full
+      - host: mail.proton.me
+        port: 443
+        access: full
+      # Legacy API domain — some go-proton-api versions still resolve here.
+      - host: api.protonmail.ch
+        port: 443
+        access: full
+      - host: account.proton.me
+        port: 443
+        access: full
+    binaries:
+      - { path: "/sandbox/**" }

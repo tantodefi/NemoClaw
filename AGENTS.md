@@ -85,6 +85,7 @@ Security-sensitive code paths require extra test coverage.
 - Edit under `docs/` (never `.agents/skills/nemoclaw-*/*.md`)
 - Regenerate skills: `python scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw`
 - Preview: `make docs-live`
+- Put hand-authored workflow skills under `.github/skills/`; reserve `.agents/skills/docs/` for generated doc skills only
 
 ### Gotchas
 

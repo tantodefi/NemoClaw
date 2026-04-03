@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: github-tools
+  description: "Expanded GitHub access for gh CLI, gh-issues skill, and git operations"
+
+network_policies:
+  # ── GitHub tools ───────────────────────────────────────────────
+  # The base github policy only allows gh + git binaries. The gh-issues
+  # skill uses curl and node (spawns sub-agents). This preset adds curl
+  # and node binaries to GitHub endpoints plus upload/download hosts
+  # needed for release assets and large objects.
+  github_tools:
+    name: github_tools
+    endpoints:
+      - host: github.com
+        port: 443
+        access: full
+      - host: api.github.com
+        port: 443
+        access: full
+      - host: uploads.github.com
+        port: 443
+        access: full
+      - host: objects.githubusercontent.com
+        port: 443
+        access: full
+      - host: raw.githubusercontent.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/local/bin/gh }
+      - { path: /usr/bin/gh }
+      - { path: "/sandbox/gh" }
+      - { path: "/sandbox/.local/bin/gh" }
+      - { path: /usr/bin/git }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }

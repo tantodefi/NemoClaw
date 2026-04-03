@@ -62,6 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2=6.1.0-3 \
         iptables=1.8.9-2 \
         libcap2-bin=1:2.66-4+deb12u2+b2 \
+        chromium=146.0.7680.177-1~deb12u1 \
     && rm -rf /var/lib/apt/lists/*
 
 # gosu for privilege separation (gateway vs sandbox user).
@@ -121,3 +122,18 @@ RUN mkdir -p /sandbox/.openclaw-data/agents/main/agent \
 # When bumping the openclaw version, rebuild this base image.
 RUN npm install -g openclaw@2026.3.11 \
     && pip3 install --no-cache-dir --break-system-packages "pyyaml==6.0.3"
+
+# gh CLI for GitHub automation skills.
+# hadolint ignore=DL4006
+RUN arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+        amd64) gh_arch="linux_amd64" ;; \
+        arm64) gh_arch="linux_arm64" ;; \
+        *) echo "Unsupported architecture for gh: $arch" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/cli/cli/releases/download/v2.74.0/gh_2.74.0_${gh_arch}.tar.gz" \
+       | tar xz --strip-components=2 -C /usr/local/bin "gh_2.74.0_${gh_arch}/bin/gh" \
+    && gh --version
+
+# agent-browser needs a Chromium path. Set env so it auto-detects.
+ENV CHROME_PATH=/usr/bin/chromium

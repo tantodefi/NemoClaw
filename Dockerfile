@@ -27,6 +27,15 @@ RUN (apt-get remove --purge -y gcc gcc-12 g++ g++-12 cpp cpp-12 make \
     && apt-get autoremove --purge -y \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Chromium for agent-browser if not already present in base image.
+# Once the GHCR base image includes chromium, this layer becomes a no-op.
+RUN if ! command -v chromium >/dev/null 2>&1; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends chromium \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+ENV CHROME_PATH=/usr/bin/chromium
+
 # Copy built plugin and blueprint into the sandbox
 COPY --from=builder /opt/nemoclaw/dist/ /opt/nemoclaw/dist/
 COPY nemoclaw/openclaw.plugin.json /opt/nemoclaw/
@@ -108,7 +117,14 @@ providers = { \
 config = { \
     'agents': {'defaults': {'model': {'primary': primary_model_ref}}}, \
     'models': {'mode': 'merge', 'providers': providers}, \
-    'channels': {'defaults': {'configWrites': False}}, \
+    'channels': {'defaults': {}}, \
+    'browser': { \
+        'enabled': True, \
+        'executablePath': '/usr/bin/chromium', \
+        'headless': True, \
+        'noSandbox': True, \
+        'defaultProfile': 'openclaw', \
+    }, \
     'gateway': { \
         'mode': 'local', \
         'controlUi': { \
