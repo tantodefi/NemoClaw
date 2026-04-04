@@ -341,18 +341,128 @@ launchctl load ~/Library/LaunchAgents/com.nemoclaw.backup-host.plist
 
 ---
 
-## 8. Quick Reference Card
+## 8. Upstream Sync & Fork-to-Sandbox Flow
+
+NemoClaw is maintained as a fork of `NVIDIA/NemoClaw`. Changes flow through
+three stages: **upstream repo → local fork → sandbox image**.
+
+### 8.1 The Propagation Chain
 
 ```text
-┌────────────────────────────────────────────────────────────────────┐
-│  BEFORE YOU DO THIS...          RUN THIS FIRST                     │
-├────────────────────────────────────────────────────────────────────┤
-│  nemoclaw onboard --force       backup-host.sh                     │
-│                                 backup-workspace.sh backup <name>  │
-│  openshell sandbox destroy      backup-workspace.sh backup <name>  │
-│  git clean / git reset --hard   git stash && backup-host.sh        │
-│  Cluster reset / Brev teardown  both backup scripts                │
-│  Edit a policy preset           git add + git commit first         │
-│  Rotate API keys                backup-host.sh then update creds   │
-└────────────────────────────────────────────────────────────────────┘
+NVIDIA/NemoClaw (upstream/main)
+        │
+        │  git fetch upstream && git rebase upstream/main
+        ▼
+tantodefi/NemoClaw (origin/chad-dev)   ← your fork
+        │
+        │  nemoclaw onboard --recreate-sandbox
+        │  (Docker build → image push → pod restart)
+        ▼
+OpenShell Sandbox (running pod)
+        │
+        │  setup-skills.sh (SSH post-creation)
+        ▼
+Live Agent (cron jobs, email checks, skills)
+```
+
+### 8.2 Syncing Upstream Changes
+
+Run this when NVIDIA publishes new releases or fixes:
+
+```bash
+cd ~/.nemoclaw/source
+
+# 1. Safety net — always create before rebase
+git branch chad-dev-backup-$(date +%Y%m%d) && git tag pre-rebase-$(date +%Y%m%d)
+
+# 2. Fetch and rebase
+git fetch upstream
+git rebase upstream/main
+
+# 3. Resolve any conflicts, then push
+git push origin chad-dev --force-with-lease
+```
+
+**Revert** if the rebase introduces problems:
+```bash
+git reset --hard pre-rebase-YYYYMMDD
+git push origin chad-dev --force-with-lease
+```
+
+**Note:** Use `--force-with-lease` (not `--force`) — it refuses to push if
+someone else pushed to `chad-dev` since your last fetch.
+
+### 8.3 What Requires a Full Rebuild vs. Hot-Sync
+
+| Change type | Propagation | Command |
+|-------------|-------------|---------|
+| Plugin code (`nemoclaw/src/`) | **Full image rebuild** | `nemoclaw onboard --recreate-sandbox` |
+| Blueprint / base policies | **Full image rebuild** | `nemoclaw onboard --recreate-sandbox` |
+| Startup script (`nemoclaw-start.sh`) | **Full image rebuild** | `nemoclaw onboard --recreate-sandbox` |
+| `openclaw.json` (inference config) | **Immutable** — baked at build | Rebuild required |
+| Skill tools (proton-tool, pi, etc.) | **SSH re-run** (no rebuild) | Re-run `setup-skills.sh` via sandbox connect |
+| Skill definitions (SKILL.md, EMAIL-POLICY.md) | **SSH upload** (no rebuild) | `openshell sandbox upload <name> <local> <remote>` |
+| Policy presets | **CLI apply** (no rebuild) | `nemoclaw <name> policy-add` |
+| Inference provider / model | **Gateway-level** (no rebuild) | `openshell inference set` |
+
+### 8.4 Recommended Dev Workflow
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  DAILY: iterate on skills                                    │
+│  1. Edit skill files locally (SKILL.md, EMAIL-POLICY.md)     │
+│  2. Upload to sandbox: openshell sandbox upload ...           │
+│  3. Test via cron run or manual /nemoclaw command             │
+│  4. git commit once stable                                   │
+├─────────────────────────────────────────────────────────────┤
+│  WEEKLY: sync upstream + rebuild                             │
+│  1. bash scripts/backup-host.sh                              │
+│  2. bash scripts/backup-workspace.sh backup <name>           │
+│  3. git fetch upstream && git rebase upstream/main            │
+│  4. git push origin chad-dev --force-with-lease              │
+│  5. nemoclaw onboard --recreate-sandbox (if plugin changed)  │
+│  6. Re-apply custom policies                                 │
+├─────────────────────────────────────────────────────────────┤
+│  BEFORE adding collaborators (e.g., supachad)                │
+│  1. Switch shared branches to merge (no rebase)              │
+│  2. Protect chad-dev from force-push in GitHub settings      │
+│  3. Create feature branches for individual work              │
+│  4. PR into chad-dev for code review                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 8.5 Multi-Contributor Flow (Future: supachad)
+
+When a second contributor joins:
+
+1. **Invite** via GitHub → Settings → Collaborators
+2. **Branch strategy:** `chad-dev` becomes the shared integration branch.
+   Create feature branches (`feat/proton-calendar-v2`, `fix/cron-rate-limit`)
+   and PR into `chad-dev`.
+3. **No force-push** on shared branches — use `git merge upstream/main`
+   instead of rebase.
+4. **Sandbox isolation:** Each contributor runs their own sandbox.
+   Sandbox images are built from the branch they check out.
+5. **Credential separation:** Each contributor maintains their own
+   `~/.nemoclaw/credentials.json`. Never commit credentials to the repo.
+
+---
+
+## 9. Quick Reference Card
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│  BEFORE YOU DO THIS...            RUN THIS FIRST                     │
+├──────────────────────────────────────────────────────────────────────┤
+│  nemoclaw onboard --force         backup-host.sh                     │
+│                                   backup-workspace.sh backup <name>  │
+│  openshell sandbox destroy        backup-workspace.sh backup <name>  │
+│  git clean / git reset --hard     git stash && backup-host.sh        │
+│  Cluster reset / Brev teardown    both backup scripts                │
+│  Edit a policy preset             git add + git commit first         │
+│  Rotate API keys                  backup-host.sh then update creds   │
+│  git rebase upstream/main         git branch backup-$(date +%Y%m%d)  │
+│                                   git tag pre-rebase-$(date +%Y%m%d) │
+│  Add collaborator to fork         Switch to merge workflow (no force)│
+└──────────────────────────────────────────────────────────────────────┘
 ```
