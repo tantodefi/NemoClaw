@@ -1,15 +1,15 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
-
 // proton-tool: CLI wrapper around go-proton-api for Proton Mail/Calendar
 package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/mail"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -19,9 +19,66 @@ import (
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 )
 
+// sessionFile is the default path for cached auth tokens.
+// Avoids SRP logins on every invocation, preventing Proton 429 rate limits.
+var sessionFile = "/sandbox/.proton-session.json"
+
+type savedSession struct {
+	UID          string `json:"uid"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	SavedAt      int64  `json:"saved_at"`
+}
+
+func init() {
+	if v := os.Getenv("PROTON_SESSION_FILE"); v != "" {
+		sessionFile = v
+	}
+}
+
+func saveSession(auth proton.Auth) {
+	s := savedSession{
+		UID:          auth.UID,
+		AccessToken:  auth.AccessToken,
+		RefreshToken: auth.RefreshToken,
+		SavedAt:      time.Now().Unix(),
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(sessionFile)
+	os.MkdirAll(dir, 0700)
+	os.WriteFile(sessionFile, data, 0600)
+}
+
+func loadSession() (*savedSession, error) {
+	data, err := os.ReadFile(sessionFile)
+	if err != nil {
+		return nil, err
+	}
+	var s savedSession
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, err
+	}
+	if s.UID == "" || s.RefreshToken == "" {
+		return nil, fmt.Errorf("incomplete session")
+	}
+	// Discard sessions older than 24 hours — force a fresh SRP login.
+	if time.Now().Unix()-s.SavedAt > 86400 {
+		return nil, fmt.Errorf("session expired")
+	}
+	return &s, nil
+}
+
+func clearSession() {
+	os.Remove(sessionFile)
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, "proton-tool - Proton Mail and Calendar CLI\n\n")
 	fmt.Fprintf(os.Stderr, "Usage:\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool logout           Clear cached session tokens\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool whoami           Show authenticated user info\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool calendars        List all calendars\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool events           List events from default calendar\n")
@@ -46,6 +103,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "\nEnvironment:\n")
 	fmt.Fprintf(os.Stderr, "  PROTON_USERNAME   Proton account email\n")
 	fmt.Fprintf(os.Stderr, "  PROTON_PASSWORD   Proton account password\n")
+	fmt.Fprintf(os.Stderr, "  PROTON_SESSION_FILE  Path to session cache (default: /sandbox/.proton-session.json)\n")
 	os.Exit(1)
 }
 
@@ -67,6 +125,19 @@ func login(ctx context.Context) (*proton.Manager, *proton.Client) {
 		proton.WithAppVersion("web-mail@5.0.36"),
 	)
 
+	// Try to restore session from cached tokens (uses /auth/v4/refresh,
+	// which is NOT subject to the same rate limit as SRP /auth/v4).
+	if sess, err := loadSession(); err == nil {
+		c, auth, err := m.NewClientWithRefresh(ctx, sess.UID, sess.RefreshToken)
+		if err == nil {
+			saveSession(auth)
+			return m, c
+		}
+		fmt.Fprintf(os.Stderr, "Session refresh failed, falling back to SRP login: %v\n", err)
+		clearSession()
+	}
+
+	// Full SRP login — this is rate-limited by Proton to ~10/hour.
 	c, auth, err := m.NewClientWithLogin(ctx, username, []byte(password))
 	if err != nil {
 		fatal("login failed", err)
@@ -78,6 +149,9 @@ func login(ctx context.Context) (*proton.Manager, *proton.Client) {
 		m.Close()
 		os.Exit(1)
 	}
+
+	// Cache the session for subsequent invocations.
+	saveSession(auth)
 
 	return m, c
 }
@@ -124,15 +198,52 @@ func cmdCalendars(ctx context.Context) {
 	}
 
 	for i, cal := range calendars {
+		calType := "normal"
+		if cal.Type == proton.CalendarTypeSubscribed {
+			calType = "subscribed"
+		}
 		fmt.Printf("[%d] ID: %s\n", i+1, cal.ID)
 		fmt.Printf("    Name:        %s\n", cal.Name)
 		fmt.Printf("    Description: %s\n", cal.Description)
 		fmt.Printf("    Color:       %s\n", cal.Color)
+		fmt.Printf("    Type:        %s\n", calType)
+		fmt.Printf("    Display:     %v\n", bool(cal.Display))
+
+		members, err := c.GetCalendarMembers(ctx, cal.ID)
+		if err == nil && len(members) > 0 {
+			fmt.Printf("    Members:\n")
+			for _, mem := range members {
+				fmt.Printf("      - %s (permissions: %d, color: %s)\n", mem.Email, mem.Permissions, mem.Color)
+			}
+		}
 		fmt.Println()
 	}
 }
 
+// calendarEventPageSize is the max page size accepted by the Proton Calendar
+// API. The go-proton-api library defaults to 150 (maxPageSize) which the
+// Calendar endpoint rejects with "Invalid page size parameter" (code 2021).
+const calendarEventPageSize = 100
+
+func getAllCalendarEvents(ctx context.Context, c *proton.Client, calendarID string, filter url.Values) ([]proton.CalendarEvent, error) {
+	var all []proton.CalendarEvent
+	page := 0
+	for {
+		events, err := c.GetCalendarEvents(ctx, calendarID, page, calendarEventPageSize, filter)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, events...)
+		if len(events) < calendarEventPageSize {
+			break
+		}
+		page++
+	}
+	return all, nil
+}
+
 func cmdEvents(ctx context.Context, args []string) {
+	password := []byte(os.Getenv("PROTON_PASSWORD"))
 	m, c := login(ctx)
 	defer c.Close()
 	defer m.Close()
@@ -164,7 +275,7 @@ func cmdEvents(ctx context.Context, args []string) {
 	filter.Set("Start", strconv.FormatInt(now.Unix(), 10))
 	filter.Set("End", strconv.FormatInt(end.Unix(), 10))
 
-	events, err := c.GetAllCalendarEvents(ctx, calendarID, filter)
+	events, err := getAllCalendarEvents(ctx, c, calendarID, filter)
 	if err != nil {
 		fatal("get events", err)
 	}
@@ -174,11 +285,28 @@ func cmdEvents(ctx context.Context, args []string) {
 		return
 	}
 
+	// Unlock keys for event decryption.
+	_, _, addrKR := unlockKeys(ctx, c, password)
+	calKR := unlockCalendarKeys(ctx, c, calendarID, addrKR)
+
 	fmt.Printf("Found %d events:\n\n", len(events))
 	for i, ev := range events {
 		start := time.Unix(ev.StartTime, 0).UTC()
 		evEnd := time.Unix(ev.EndTime, 0).UTC()
+
+		// Decrypt shared event data (contains SUMMARY, DESCRIPTION, LOCATION).
+		summary, description, location := decryptSharedEvent(ev, calKR)
+
 		fmt.Printf("[%d] Event ID: %s\n", i+1, ev.ID)
+		if summary != "" {
+			fmt.Printf("    Summary:   %s\n", summary)
+		}
+		if location != "" {
+			fmt.Printf("    Location:  %s\n", location)
+		}
+		if description != "" {
+			fmt.Printf("    Desc:      %s\n", description)
+		}
 		fmt.Printf("    UID:       %s\n", ev.UID)
 		fmt.Printf("    Start:     %s\n", start.Format(time.RFC3339))
 		fmt.Printf("    End:       %s\n", evEnd.Format(time.RFC3339))
@@ -190,6 +318,144 @@ func cmdEvents(ctx context.Context, args []string) {
 		}
 		fmt.Println()
 	}
+}
+
+// unlockCalendarKeys decrypts the calendar passphrase and uses it to unlock
+// the calendar's private keys, returning a keyring suitable for decrypting
+// event data.
+func unlockCalendarKeys(ctx context.Context, c *proton.Client, calendarID string, addrKR *crypto.KeyRing) *crypto.KeyRing {
+	members, err := c.GetCalendarMembers(ctx, calendarID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not get calendar members: %v\n", err)
+		return nil
+	}
+
+	passphrase, err := c.GetCalendarPassphrase(ctx, calendarID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not get calendar passphrase: %v\n", err)
+		return nil
+	}
+
+	// Try each member until we find one we can decrypt (our own membership).
+	var rawPassphrase []byte
+	for _, mem := range members {
+		rawPassphrase, err = passphrase.Decrypt(mem.ID, addrKR)
+		if err == nil {
+			break
+		}
+	}
+	if rawPassphrase == nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not decrypt calendar passphrase (not a member?)\n")
+		return nil
+	}
+
+	calKeys, err := c.GetCalendarKeys(ctx, calendarID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not get calendar keys: %v\n", err)
+		return nil
+	}
+
+	calKR, err := calKeys.Unlock(rawPassphrase)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not unlock calendar keys: %v\n", err)
+		return nil
+	}
+
+	return calKR
+}
+
+// decryptSharedEvent decrypts the SharedEvents parts of a CalendarEvent and
+// extracts SUMMARY, DESCRIPTION, and LOCATION from the iCalendar VEVENT data.
+func decryptSharedEvent(ev proton.CalendarEvent, calKR *crypto.KeyRing) (summary, description, location string) {
+	if calKR == nil || len(ev.SharedEvents) == 0 {
+		return
+	}
+
+	// Decode the shared key packet (used as the symmetric key packet for all
+	// SharedEvents parts on this event).
+	var kp []byte
+	if ev.SharedKeyPacket != "" {
+		var err error
+		kp, err = base64.StdEncoding.DecodeString(ev.SharedKeyPacket)
+		if err != nil {
+			return
+		}
+	}
+
+	for _, part := range ev.SharedEvents {
+		decrypted := decryptEventPart(part, calKR, kp)
+		if decrypted == "" {
+			continue
+		}
+		// Parse iCalendar properties from the decrypted VEVENT fragment.
+		if v := icalProp(decrypted, "SUMMARY"); v != "" && summary == "" {
+			summary = v
+		}
+		if v := icalProp(decrypted, "DESCRIPTION"); v != "" && description == "" {
+			description = v
+		}
+		if v := icalProp(decrypted, "LOCATION"); v != "" && location == "" {
+			location = v
+		}
+	}
+	return
+}
+
+// decryptEventPart decrypts a single CalendarEventPart and returns the
+// plaintext. Returns "" on any error.
+func decryptEventPart(part proton.CalendarEventPart, calKR *crypto.KeyRing, kp []byte) string {
+	if part.Type&proton.CalendarEventTypeEncrypted != 0 {
+		var enc *crypto.PGPMessage
+
+		if kp != nil {
+			raw, err := base64.StdEncoding.DecodeString(part.Data)
+			if err != nil {
+				return ""
+			}
+			enc = crypto.NewPGPSplitMessage(kp, raw).GetPGPMessage()
+		} else {
+			var err error
+			enc, err = crypto.NewPGPMessageFromArmored(part.Data)
+			if err != nil {
+				return ""
+			}
+		}
+
+		dec, err := calKR.Decrypt(enc, nil, crypto.GetUnixTime())
+		if err != nil {
+			return ""
+		}
+		return dec.GetString()
+	}
+
+	// Clear-text part.
+	return part.Data
+}
+
+// icalProp extracts a property value from an iCalendar text blob.
+// Handles simple "KEY:value" lines and folded lines (continuation with
+// leading space/tab). Also handles parameters like "KEY;PARAM=X:value".
+func icalProp(ical, key string) string {
+	// Unfold: iCalendar continuation lines start with a space or tab.
+	ical = strings.ReplaceAll(ical, "\r\n ", "")
+	ical = strings.ReplaceAll(ical, "\r\n\t", "")
+	ical = strings.ReplaceAll(ical, "\n ", "")
+	ical = strings.ReplaceAll(ical, "\n\t", "")
+
+	for _, line := range strings.Split(ical, "\n") {
+		line = strings.TrimRight(line, "\r")
+		// Match "KEY:value" or "KEY;params:value"
+		if strings.HasPrefix(line, key+":") {
+			return line[len(key)+1:]
+		}
+		if strings.HasPrefix(line, key+";") {
+			idx := strings.Index(line, ":")
+			if idx >= 0 {
+				return line[idx+1:]
+			}
+		}
+	}
+	return ""
 }
 
 func cmdMail(ctx context.Context, args []string) {
@@ -250,7 +516,7 @@ func cmdSent(ctx context.Context, args []string) {
 	days, _ := strconv.Atoi(daysStr)
 
 	filter := proton.MessageFilter{
-		LabelID: "2",
+		LabelID: "2", // Sent label
 	}
 
 	messages, err := c.GetMessageMetadata(ctx, filter)
@@ -263,6 +529,7 @@ func cmdSent(ctx context.Context, args []string) {
 		return
 	}
 
+	// Filter by recency if --days was given
 	if days > 0 {
 		cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)
 		var filtered []proton.MessageMetadata
@@ -308,6 +575,7 @@ func cmdCountMail(ctx context.Context) {
 	fmt.Printf("Total messages: %d\n", count)
 }
 
+// unlockKeys returns the address keyring for the primary send address.
 func unlockKeys(ctx context.Context, c *proton.Client, password []byte) (
 	user proton.User,
 	addr proton.Address,
@@ -396,6 +664,7 @@ func cmdReadMail(ctx context.Context, args []string) {
 		fatal("decrypt message", err)
 	}
 
+	// Auto-mark as read
 	if bool(msg.Unread) {
 		if err := c.MarkMessagesRead(ctx, msgID); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to mark as read: %v\n", err)
@@ -592,6 +861,9 @@ func main() {
 	args := os.Args[2:]
 
 	switch cmd {
+	case "logout":
+		clearSession()
+		fmt.Println("Session cleared.")
 	case "whoami":
 		cmdWhoami(ctx)
 	case "calendars":
