@@ -113,6 +113,17 @@ func fatal(msg string, err error) {
 }
 
 func login(ctx context.Context) (*proton.Manager, *proton.Client) {
+	return loginWithScope(ctx, false)
+}
+
+// loginFull performs a full SRP login, bypassing session cache.
+// Use for commands that need key decryption (events, read-mail, send-mail)
+// since refreshed tokens have insufficient scope for /core/v4/keys/salts.
+func loginFull(ctx context.Context) (*proton.Manager, *proton.Client) {
+	return loginWithScope(ctx, true)
+}
+
+func loginWithScope(ctx context.Context, needFullScope bool) (*proton.Manager, *proton.Client) {
 	username := os.Getenv("PROTON_USERNAME")
 	password := os.Getenv("PROTON_PASSWORD")
 	if username == "" || password == "" {
@@ -127,14 +138,18 @@ func login(ctx context.Context) (*proton.Manager, *proton.Client) {
 
 	// Try to restore session from cached tokens (uses /auth/v4/refresh,
 	// which is NOT subject to the same rate limit as SRP /auth/v4).
-	if sess, err := loadSession(); err == nil {
-		c, auth, err := m.NewClientWithRefresh(ctx, sess.UID, sess.RefreshToken)
-		if err == nil {
-			saveSession(auth)
-			return m, c
+	// Skip for commands needing full scope (key decryption) — refresh
+	// tokens return limited scope that can't access /core/v4/keys/salts.
+	if !needFullScope {
+		if sess, err := loadSession(); err == nil {
+			c, auth, err := m.NewClientWithRefresh(ctx, sess.UID, sess.RefreshToken)
+			if err == nil {
+				saveSession(auth)
+				return m, c
+			}
+			fmt.Fprintf(os.Stderr, "Session refresh failed, falling back to SRP login: %v\n", err)
+			clearSession()
 		}
-		fmt.Fprintf(os.Stderr, "Session refresh failed, falling back to SRP login: %v\n", err)
-		clearSession()
 	}
 
 	// Full SRP login — this is rate-limited by Proton to ~10/hour.
@@ -244,7 +259,7 @@ func getAllCalendarEvents(ctx context.Context, c *proton.Client, calendarID stri
 
 func cmdEvents(ctx context.Context, args []string) {
 	password := []byte(os.Getenv("PROTON_PASSWORD"))
-	m, c := login(ctx)
+	m, c := loginFull(ctx)
 	defer c.Close()
 	defer m.Close()
 
@@ -648,7 +663,7 @@ func cmdReadMail(ctx context.Context, args []string) {
 	}
 
 	password := []byte(os.Getenv("PROTON_PASSWORD"))
-	m, c := login(ctx)
+	m, c := loginFull(ctx)
 	defer c.Close()
 	defer m.Close()
 
@@ -755,7 +770,7 @@ func cmdSendMail(ctx context.Context, args []string) {
 	ccList := parseAddressList(ccStr)
 
 	password := []byte(os.Getenv("PROTON_PASSWORD"))
-	m, c := login(ctx)
+	m, c := loginFull(ctx)
 	defer c.Close()
 	defer m.Close()
 
