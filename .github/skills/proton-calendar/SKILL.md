@@ -23,77 +23,33 @@ imports the library and exposes useful commands.
 
 | Requirement | Notes |
 |---|---|
-| Go >= 1.26.1 | `go version` to check |
 | Proton account | With Mail + Calendar access |
 | `PROTON_USERNAME` | Set via env or `~/.nemoclaw/credentials.json` |
 | `PROTON_PASSWORD` | Set via env or `~/.nemoclaw/credentials.json` |
-| Network policy | `proton_api`, `go_modules`, `go_module_git_sources`, `go_install` |
+| Network policy | `proton_api` only (runtime) |
+| `proton-tool` binary | Pre-built by developer and deployed to `/usr/local/bin/proton-tool` |
 
-## Installation
+> **Go is a build-time concern, not a runtime one.** The `go_modules`,
+> `go_module_git_sources`, and `go_install` policies are only needed when
+> building `proton-tool` from source. Chad's sandbox does not need them.
+> Build on the host (or a dev sandbox with those policies), then deploy the
+> compiled binary as described below.
 
-Run the install script from the skill directory:
+## Build & Deploy (developer task, not agent task)
 
-```bash
-cd /sandbox/.openclaw-data/workspace/skills/proton-calendar
-bash scripts/install-go.sh    # Installs Go 1.26.1 if missing
-bash scripts/build.sh         # Builds proton-tool binary
-```
-
-After building, the binary is at `./proton-tool`.
-
-### Install Go (if needed)
-
-The sandbox may not have Go pre-installed. The `scripts/install-go.sh` script:
-
-1. Downloads Go 1.26.1 to `/sandbox/go1.26.1` (NOT `/sandbox/go` — that
-   path is fingerprinted by OpenShell and overwriting it causes binary
-   integrity violations).
-2. Sets `GOROOT`, `GOPATH`, `GOCACHE` and updates `PATH`.
-
-**Critical:** Do NOT extract Go to `/sandbox/go`. OpenShell fingerprints
-binaries at sandbox creation. Replacing `/sandbox/go/bin/go` will cause
-every network request from go to be denied with "binary integrity violation".
-
-### Build the tool
-
-```bash
-bash scripts/build.sh
-```
-
-This runs `go mod download` then `go build` in `cmd/proton-tool/`.
+See [BUILD.md](BUILD.md) for full instructions on building `proton-tool` and
+deploying the binary to Chad's sandbox. The agent does not build the tool —
+only the compiled binary at `/usr/local/bin/proton-tool` is needed at runtime.
 
 ### Stable path
 
-After building, copy the binary to `/sandbox/proton-tool` so all docs and
-cron jobs use a single stable path:
+`proton-tool` is baked into the sandbox image at `/usr/local/bin/proton-tool`
+by the Dockerfile's `proton-builder` stage. It is present after every sandbox
+build — no deploy step is needed.
 
-```bash
-cp /sandbox/.openclaw-data/skills/proton-calendar/proton-tool /sandbox/proton-tool
-chmod +x /sandbox/proton-tool
-```
-
-**Important:** Use `cp`, not `ln -sf`. The OpenShell proxy glob
-(`/sandbox/**` in the network policy) does not match binaries under
-dotfile directories like `.openclaw-data/`. A symlink is also
-insufficient because the proxy resolves to the real path. A real copy
-at `/sandbox/proton-tool` matches the glob and is allowed through.
-
-**Binary fingerprinting:** The OpenShell proxy fingerprints each binary
-path on first network use. If you rebuild and overwrite the same path,
-the hash changes and the proxy blocks it with `403 Forbidden`. Always
-copy to a **new** path (increment the version suffix) and update the
-symlink:
-
-```bash
-# After rebuilding:
-cp /sandbox/.openclaw-data/skills/proton-calendar/proton-tool /sandbox/proton-tool-vN
-chmod +x /sandbox/proton-tool-vN
-rm /sandbox/proton-tool
-ln -sf /sandbox/proton-tool-vN /sandbox/proton-tool
-```
-
-All commands below use `/sandbox/proton-tool`. After rebuilding the skill,
-re-run the `cp` command above to deploy the new version.
+To update the binary, change the source in
+`.github/skills/proton-calendar/cmd/proton-tool/` and rebuild the sandbox
+image. The Dockerfile will recompile and install the new binary automatically.
 
 ## Usage
 
@@ -121,7 +77,7 @@ for k,v in c.items():
 ### List Calendars
 
 ```bash
-/sandbox/proton-tool calendars
+/usr/local/bin/proton-tool calendars
 ```
 
 Shows all calendars (owned and shared), including type (normal/subscribed),
@@ -130,7 +86,7 @@ color, display status, and members with their email and permissions.
 ### List Calendar Events
 
 ```bash
-/sandbox/proton-tool events --calendar-id=<ID> --days=7
+/usr/local/bin/proton-tool events --calendar-id=<ID> --days=7
 ```
 
 Decrypts event details (title, description, location) using the calendar's
@@ -145,13 +101,13 @@ encryption keys. Falls back to metadata-only output if decryption fails
 ### List Mail (Inbox)
 
 ```bash
-/sandbox/proton-tool mail --limit=10
+/usr/local/bin/proton-tool mail --limit=10
 ```
 
 ### List Sent Messages
 
 ```bash
-./proton-tool sent --limit=15 --days=3
+/usr/local/bin/proton-tool sent --limit=15 --days=3
 ```
 
 Lists recent messages from the Sent folder. Use `--days=N` to filter to the
@@ -161,31 +117,62 @@ without pulling the entire sent history).
 ### Read a Message (decrypts body, auto-marks read)
 
 ```bash
-/sandbox/proton-tool read-mail --id=MSGID
+/usr/local/bin/proton-tool read-mail --id=MSGID
 ```
 
 ### Mark Messages as Read
 
 ```bash
-/sandbox/proton-tool mark-read --id=MSGID1,MSGID2,MSGID3
+/usr/local/bin/proton-tool mark-read --id=MSGID1,MSGID2,MSGID3
 ```
 
-### Send an Email
+### Reply to a Message
 
 ```bash
-/sandbox/proton-tool send-mail --to=user@example.com --subject="Hello" --body="Message text"
+/usr/local/bin/proton-tool reply-mail --id=MSGID --body="Reply text"
 ```
+
+Constructs a proper threaded reply using the Proton `ParentID` + `ReplyAction`
+API. The subject is automatically prefixed with `Re:` if not already present.
+Recipients are set to the original sender. Use `--all` to reply-all (original
+To recipients are CC'd).
+
+```bash
+/usr/local/bin/proton-tool reply-mail --id=MSGID --all --body="Reply to all"
+```
+
+### Move Messages to Trash
+
+```bash
+/usr/local/bin/proton-tool trash-mail --id=MSGID1,MSGID2
+```
+
+### Send a New Email
+
+```bash
+/usr/local/bin/proton-tool send-mail --to=user@example.com --subject="Hello" --body="Message text"
+```
+
+### List Custom Labels and Folders
+
+```bash
+/usr/local/bin/proton-tool labels
+```
+
+Shows user-created labels and folders with their IDs. The standard system
+labels (Inbox, Sent, Trash, Spam, Archive) are not listed here — they have
+fixed IDs: Inbox=0, AllSent=2, Trash=3, Spam=4, Archive=6.
 
 ### Get User Info
 
 ```bash
-/sandbox/proton-tool whoami
+/usr/local/bin/proton-tool whoami
 ```
 
 ### Clear Cached Session
 
 ```bash
-/sandbox/proton-tool logout
+/usr/local/bin/proton-tool logout
 ```
 
 Clears the cached auth tokens at `/sandbox/.proton-session.json`. The next
@@ -212,10 +199,15 @@ openclaw cron add \
   --name "email-check" \
   --cron "*/30 * * * *" \
   --session isolated \
-  --message "Check email now. Follow the EMAIL-POLICY.md rules strictly. STEPS: 1. First read memory/$(date -u +%Y-%m-%d).md for any Pending Follow-ups and Awaiting Responses from previous runs. Act on follow-ups first. 2. Run: /sandbox/proton-tool mail --limit=20 3. For each unread message from admin users, run: /sandbox/proton-tool read-mail --id=MSGID (this auto-marks as read). If it replies to an Awaiting Response thread, clear that entry. 4. For newsletters/spam/non-admin unread: /sandbox/proton-tool mark-read --id=MSGID1,MSGID2 to clean them up 5. Run: /sandbox/proton-tool sent --limit=15 --days=3 to scan recent sent messages. Cross-reference with inbox to find threads still awaiting a reply. Update Awaiting Responses in today's log. 6. Respond per EMAIL-POLICY.md rules. Check cooldowns and daily cap before sending. NEVER send follow-up nudges automatically. 7. Log everything to memory/$(date -u +%Y-%m-%d).md including Awaiting Responses and Pending Follow-ups sections for next run" \
+  --message 'Check email now. Follow the EMAIL-POLICY.md rules strictly. STEPS: 1. Compute today'"'"'s UTC date (YYYY-MM-DD) and read memory/<today>.md for any Pending Follow-ups and Awaiting Responses from previous runs. Act on follow-ups first. 2. Run: /usr/local/bin/proton-tool mail --limit=20 3. For each unread message from admin users, run: /usr/local/bin/proton-tool read-mail --id=MSGID (this auto-marks as read). If it replies to an Awaiting Response thread, clear that entry. 4. For newsletters/spam/non-admin unread: /usr/local/bin/proton-tool mark-read --id=MSGID1,MSGID2 to clean them up 5. Run: /usr/local/bin/proton-tool sent --limit=15 --days=3 to scan recent sent messages. Cross-reference with inbox to find threads still awaiting a reply. Update Awaiting Responses in today'"'"'s log. 6. Respond per EMAIL-POLICY.md rules. Check cooldowns and daily cap before sending. NEVER send follow-up nudges automatically. 7. Log everything to memory/<today>.md including Awaiting Responses and Pending Follow-ups sections for next run.' \
   --announce \
   --channel last
 ```
+
+> **Why single quotes?** The `--message` flag is wrapped in single quotes so
+> the shell does **not** expand `$(date ...)` at registration time. The agent
+> computes today's UTC date (`YYYY-MM-DD`) dynamically each time the cron fires,
+> matching the `memory/YYYY-MM-DD.md` convention in EMAIL-POLICY.md.
 
 ## Proton REST API Reference
 

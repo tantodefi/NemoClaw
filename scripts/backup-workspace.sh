@@ -5,6 +5,7 @@
 set -euo pipefail
 
 WORKSPACE_PATH="/sandbox/.openclaw/workspace"
+SKILLS_PATH="/sandbox/.openclaw-data/skills"
 BACKUP_BASE="${HOME}/.nemoclaw/backups"
 FILES=(SOUL.md USER.md IDENTITY.md AGENTS.md MEMORY.md)
 DIRS=(memory)
@@ -72,6 +73,14 @@ do_backup() {
     fi
   done
 
+  # Capture cron manifest via openclaw cron list (best-effort)
+  # (proton-tool is baked into the image — no binary backup needed)
+  if command -v nemoclaw >/dev/null 2>&1; then
+    nemoclaw "$sandbox" exec -- openclaw cron list > "${dest}/cron-manifest.txt" 2>/dev/null \
+      && { count=$((count + 1)); info "Backed up cron manifest"; } \
+      || warn "Skipped cron manifest (openclaw cron list failed)"
+  fi
+
   if [ "$count" -eq 0 ]; then
     rmdir "$dest" 2>/dev/null || true
     fail "No files were backed up. Check that the sandbox '${sandbox}' exists and has workspace files."
@@ -79,6 +88,7 @@ do_backup() {
 
   info "Backup saved to ${dest}/ (${count} items)"
   info "Tip: also run 'scripts/backup-host.sh' to back up host-side credentials and config."
+  info "Tip: after a reset, run 'scripts/chad-setup.sh ${sandbox}' to fully restore."
 }
 
 do_restore() {

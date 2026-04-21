@@ -11,8 +11,20 @@
 # to all FROM directives. Can be overridden via --build-arg.
 ARG BASE_IMAGE=ghcr.io/nvidia/nemoclaw/sandbox-base:latest
 
-# Stage 1: Build TypeScript plugin from source
-FROM node:22-slim@sha256:4f77a690f2f8946ab16fe1e791a3ac0667ae1c3575c3e4d0d4589e9ed5bfaf3d AS builder
+# Stage 1a: Build proton-tool (Go CLI for Proton Mail/Calendar)
+# Compiled here so the runtime image carries the binary without needing
+# Go network policies or a separate deploy step after sandbox creation.
+# Output: /build/proton-tool (statically linked, no CGO)
+FROM golang:1.26.1 AS proton-builder
+WORKDIR /build
+COPY .github/skills/proton-calendar/cmd/proton-tool/go.mod \
+     .github/skills/proton-calendar/cmd/proton-tool/go.sum ./
+RUN go mod download
+COPY .github/skills/proton-calendar/cmd/proton-tool/main.go ./
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o proton-tool .
+
+# Stage 1b: Build TypeScript plugin from source
+FROM node:22-slim@sha256:db9a3a15e8e8e2adbaf1e1c3d93dfb04c2e294bdd027490addb2391b8e61cc6a AS builder
 ENV NPM_CONFIG_AUDIT=false \
     NPM_CONFIG_FUND=false \
     NPM_CONFIG_UPDATE_NOTIFIER=false
@@ -39,6 +51,46 @@ RUN if ! command -v chromium >/dev/null 2>&1; then \
     fi
 ENV CHROME_PATH=/usr/bin/chromium
 
+# Install gh CLI if not already present in base image.
+# Older GHCR base images predate the gh layer in Dockerfile.base, so we
+# install a pinned release tarball here. Once the base image is refreshed
+# this layer becomes a no-op.
+RUN if ! command -v gh >/dev/null 2>&1; then \
+        arch="$(dpkg --print-architecture)" \
+        && case "$arch" in \
+             amd64) gh_arch="linux_amd64" ;; \
+             arm64) gh_arch="linux_arm64" ;; \
+             *) echo "Unsupported architecture for gh: $arch" >&2; exit 1 ;; \
+           esac \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends ca-certificates curl \
+        && curl -fsSL "https://github.com/cli/cli/releases/download/v2.74.0/gh_2.74.0_${gh_arch}.tar.gz" \
+           | tar xz --strip-components=2 -C /usr/local/bin "gh_2.74.0_${gh_arch}/bin/gh" \
+        && gh --version \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Install bun runtime and gbrain CLI.
+# bun is the package manager/runtime gbrain requires; we install it system-wide
+# so the sandbox user can run `gbrain` without any PATH manipulation.
+# Brain data lives in /sandbox/.openclaw-data/gbrain/ (writable, persisted by
+# OpenShell across container restarts alongside workspace and credentials).
+# GBRAIN_DIR is set here so gbrain init/serve/query all resolve the same path.
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash \
+    && bun --version \
+    && bun install -g gbrain \
+    && gbrain --version
+
+ENV GBRAIN_DIR=/sandbox/.openclaw-data/gbrain
+
+# Install proton-tool binary (built in proton-builder stage).
+# Placed in /usr/local/bin so the OpenShell network policy can reference
+# a stable, specific path rather than the /sandbox/** glob.
+COPY --from=proton-builder /build/proton-tool /usr/local/bin/proton-tool
+RUN chmod 755 /usr/local/bin/proton-tool
 
 # Copy built plugin and blueprint into the sandbox
 COPY --from=builder /opt/nemoclaw/dist/ /opt/nemoclaw/dist/
@@ -161,6 +213,56 @@ RUN mkdir -p /sandbox/.nemoclaw/blueprints/0.1.0 \
 # Copy startup script
 COPY scripts/nemoclaw-start.sh /usr/local/bin/nemoclaw-start
 RUN chmod 755 /usr/local/bin/nemoclaw-start
+
+# Copy Chad lifecycle helpers (backup, restore, source clone).
+# These are invoked by the workspace-backup cron and by chad-setup.sh over
+# ssh. Baking them into the image means they survive sandbox resets without
+# any post-create deploy step. They read GITHUB_TOKEN from
+# /sandbox/.nemoclaw/credentials.json at runtime.
+COPY scripts/chad-backup-to-github.sh /usr/local/bin/chad-backup-to-github
+COPY scripts/chad-restore-from-github.sh /usr/local/bin/chad-restore-from-github
+COPY scripts/chad-clone-source.sh /usr/local/bin/chad-clone-source
+# State dump + bug reporting. chad-report-bug is pinned in the
+# chad-bug-report network policy preset (write-scoped GH egress), and
+# chad-dump-state is referenced by the self-improve/issue-triage loops
+# in the chad-orchestrator skill.
+COPY scripts/chad-dump-state.sh /usr/local/bin/chad-dump-state
+COPY scripts/chad-report-bug.sh /usr/local/bin/chad-report-bug
+RUN chmod 755 /usr/local/bin/chad-backup-to-github \
+             /usr/local/bin/chad-restore-from-github \
+             /usr/local/bin/chad-clone-source \
+             /usr/local/bin/chad-dump-state \
+             /usr/local/bin/chad-report-bug
+
+# Copy Chad orchestrator helpers (sub-agent contract) and bake a
+# read-only canonical copy of the kind manifests under /opt.
+# chad-spawn prefers the synced-from-host copy at
+# /sandbox/.openclaw-data/skills/chad-orchestrator when present (so
+# sync-skills-to-sandbox.sh keeps working) and falls back to /opt.
+# See .github/skills/chad-orchestrator/SKILL.md for the contract.
+COPY .github/skills/chad-orchestrator/scripts/chad-spawn.sh         /usr/local/bin/chad-spawn
+COPY .github/skills/chad-orchestrator/scripts/chad-budget.sh        /usr/local/bin/chad-budget
+COPY .github/skills/chad-orchestrator/scripts/chad-route.sh         /usr/local/bin/chad-route
+COPY .github/skills/chad-orchestrator/scripts/chad-collect.sh       /usr/local/bin/chad-collect
+COPY .github/skills/chad-orchestrator/scripts/chad-intake.sh        /usr/local/bin/chad-intake
+COPY .github/skills/chad-orchestrator/scripts/chad-spawn-status.sh  /usr/local/bin/chad-spawn-status
+COPY .github/skills/chad-orchestrator/scripts/chad-self-improve.sh  /usr/local/bin/chad-self-improve
+COPY .github/skills/chad-orchestrator/scripts/chad-issue-triage.sh  /usr/local/bin/chad-issue-triage
+COPY .github/skills/chad-orchestrator/kinds/ /opt/chad-orchestrator/kinds/
+RUN chmod 755 /usr/local/bin/chad-spawn \
+             /usr/local/bin/chad-budget \
+             /usr/local/bin/chad-route \
+             /usr/local/bin/chad-collect \
+             /usr/local/bin/chad-intake \
+             /usr/local/bin/chad-spawn-status \
+             /usr/local/bin/chad-self-improve \
+             /usr/local/bin/chad-issue-triage \
+    && chmod 755 /opt/chad-orchestrator \
+    && chmod -R a+r /opt/chad-orchestrator/kinds \
+    && mkdir -p /sandbox/.openclaw-data/subagents \
+                /sandbox/.openclaw-data/queue \
+    && chown -R sandbox:sandbox /sandbox/.openclaw-data/subagents \
+                                 /sandbox/.openclaw-data/queue
 
 # Build args for config that varies per deployment.
 # nemoclaw onboard passes these at image build time.
@@ -305,6 +407,13 @@ os.chmod(path, 0o600)"
 RUN openclaw doctor --fix > /dev/null 2>&1 || true \
     && openclaw plugins install /opt/nemoclaw > /dev/null 2>&1 || true
 
+# Initialise the gbrain schema in the writable data directory.
+# This writes the PGLite schema to /sandbox/.openclaw-data/gbrain/ at build
+# time so the first runtime start does not pay migration cost. The brain is
+# empty here; actual pages are written by chad-setup.sh (restore from
+# chad-state) or accumulated at runtime via the gbrain MCP server.
+RUN gbrain init --engine pglite 2>/dev/null || true
+
 # Lock openclaw.json via DAC: chown to root so the sandbox user cannot modify
 # it at runtime.  This works regardless of Landlock enforcement status.
 # The Landlock policy (/sandbox/.openclaw in read_only) provides defense-in-depth
@@ -326,10 +435,12 @@ RUN mkdir -p /sandbox/.openclaw-data/logs \
         /sandbox/.openclaw-data/credentials \
         /sandbox/.openclaw-data/sandbox \
         /sandbox/.openclaw-data/media \
+        /sandbox/.openclaw-data/gbrain \
     && chown sandbox:sandbox /sandbox/.openclaw-data/logs \
         /sandbox/.openclaw-data/credentials \
         /sandbox/.openclaw-data/sandbox \
         /sandbox/.openclaw-data/media \
+        /sandbox/.openclaw-data/gbrain \
     && for dir in logs credentials sandbox media; do \
         if [ -L "/sandbox/.openclaw/$dir" ]; then true; \
         elif [ -e "/sandbox/.openclaw/$dir" ]; then \

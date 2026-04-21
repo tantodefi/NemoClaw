@@ -11,19 +11,23 @@
 
 | Command | Path |
 |---------|------|
-| List inbox | `/sandbox/proton-tool mail --limit=20` |
-| List sent | `/sandbox/proton-tool sent --limit=15 --days=3` |
-| Read message | `/sandbox/proton-tool read-mail --id=MSGID` |
-| Mark as read | `/sandbox/proton-tool mark-read --id=MSGID1,MSGID2` |
-| Send email | `/sandbox/proton-tool send-mail --to=ADDR --subject=TEXT --body=TEXT` |
-| Count messages | `/sandbox/proton-tool count-mail` |
-| List calendars | `/sandbox/proton-tool calendars` |
-| List events | `/sandbox/proton-tool events --days=7` |
+| List inbox | `/usr/local/bin/proton-tool mail --limit=20` |
+| List sent | `/usr/local/bin/proton-tool sent --limit=15 --days=3` |
+| Read message | `/usr/local/bin/proton-tool read-mail --id=MSGID` |
+| Mark as read | `/usr/local/bin/proton-tool mark-read --id=MSGID1,MSGID2` |
+| Reply to message | `/usr/local/bin/proton-tool reply-mail --id=MSGID --body=TEXT` |
+| Reply all | `/usr/local/bin/proton-tool reply-mail --id=MSGID --all --body=TEXT` |
+| Send new email | `/usr/local/bin/proton-tool send-mail --to=ADDR --subject=TEXT --body=TEXT` |
+| Trash messages | `/usr/local/bin/proton-tool trash-mail --id=MSGID1,MSGID2` |
+| Count per label | `/usr/local/bin/proton-tool count-mail` |
+| List calendars | `/usr/local/bin/proton-tool calendars` |
+| List events | `/usr/local/bin/proton-tool events --days=7` |
+| Past events | `/usr/local/bin/proton-tool events --past=7 --days=0` |
 
-> **Stable path:** `/sandbox/proton-tool` is a copy of the latest build
+> **Stable path:** `/usr/local/bin/proton-tool` is a copy of the latest build
 > from `/sandbox/.openclaw-data/skills/proton-calendar/proton-tool`.
 > After rebuilding (`bash scripts/build.sh`), run:
-> `cp /sandbox/.openclaw-data/skills/proton-calendar/proton-tool /sandbox/proton-tool`
+> `cp /sandbox/.openclaw-data/skills/proton-calendar/proton-tool /usr/local/bin/proton-tool`
 > Do **not** use a symlink — the proxy blocks binaries under `.openclaw-data/`.
 
 ## Admin users (respond to these)
@@ -60,7 +64,7 @@ Everything else is **non-admin** and subject to the anti-spam rules below.
 4. **Bulk mark-read:** All newsletters, marketing, automated notifications,
    and unrecognised senders must be marked read in a single batch call:
    ```
-   /sandbox/proton-tool mark-read --id=ID1,ID2,ID3
+   /usr/local/bin/proton-tool mark-read --id=ID1,ID2,ID3
    ```
 5. **No draft creation** for non-admin mail. Do not start composing replies
    that will never be sent — it wastes API calls and leaves orphan drafts.
@@ -110,7 +114,7 @@ conversations the agent is waiting on.
 
 ### How it works
 
-1. Run `/sandbox/proton-tool sent --limit=15 --days=3` to list recent
+1. Run `/usr/local/bin/proton-tool sent --limit=15 --days=3` to list recent
    outbound messages.
 2. For each sent message to an admin user, check whether a reply has arrived
    in the inbox (match by subject thread — look for `Re:` prefix or same
@@ -149,22 +153,22 @@ Each **30-minute** cron execution must follow these steps in order:
    and `Awaiting Responses` from previous runs. Act on follow-ups first.
 2. **List inbox:**
    ```
-   /sandbox/proton-tool mail --limit=20
+   /usr/local/bin/proton-tool mail --limit=20
    ```
 3. **For each unread message from an admin user:**
    ```
-   /sandbox/proton-tool read-mail --id=MSGID
+   /usr/local/bin/proton-tool read-mail --id=MSGID
    ```
    (This auto-marks the message as read.)
    If the message is a reply to something in `Awaiting Responses`, clear
    that entry — the thread is now active again.
 4. **For newsletters / spam / non-admin unread:** batch mark-read:
    ```
-   /sandbox/proton-tool mark-read --id=MSGID1,MSGID2
+   /usr/local/bin/proton-tool mark-read --id=MSGID1,MSGID2
    ```
 5. **Scan sent messages for context recovery:**
    ```
-   /sandbox/proton-tool sent --limit=15 --days=3
+   /usr/local/bin/proton-tool sent --limit=15 --days=3
    ```
    Cross-reference with inbox to identify threads still awaiting a reply.
    Update `Awaiting Responses` in today's log.

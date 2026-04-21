@@ -260,6 +260,44 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/node }
 
+  # ── WhatsApp ─────────────────────────────────────────────────────
+  # WhatsApp Web protocol uses persistent WebSocket connections and
+  # geo-distributed CDN media nodes — all require CONNECT tunnels
+  # (access: full) to avoid HTTP idle timeout drops. See #409.
+  # Auth is session-based (creds.json mounted at runtime), not a bot token.
+  whatsapp:
+    name: whatsapp
+    endpoints:
+      - host: web.whatsapp.com
+        port: 443
+        access: full
+      - host: "*.web.whatsapp.com"
+        port: 443
+        access: full
+      - host: mmg.whatsapp.net
+        port: 443
+        access: full
+      - host: "*.fna.whatsapp.net"
+        port: 443
+        access: full
+      - host: v.whatsapp.net
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: static.whatsapp.net
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/node }
+
   # ── Go toolchain ─────────────────────────────────────────────────
   # Download and install Go runtime (curl/wget https://go.dev/dl/...)
   go_install:

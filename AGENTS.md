@@ -26,6 +26,23 @@ This repo ships agent skills under `.agents/skills/`, organized into three audie
 | `test/e2e/` | Bash/JS | End-to-end tests (Brev cloud instances) |
 | `docs/` | Markdown (MyST) | User-facing docs (Sphinx) |
 
+## Memory & Workflow Stack
+
+This project uses a three-layer memory/workflow system. Before searching the web or asking questions, use these first:
+
+| Layer | Tool | What it does |
+|-------|------|-------------|
+| **GBrain** | `gbrain query "<question>"` or MCP `mcp_gbrain_search` | Hybrid vector+graph search over the knowledge brain. Brain-first before any external API. |
+| **GStack** | `/gstack-review`, `/gstack-qa`, `/gstack-ship`, etc. | Structured workflow roles (CEO, QA, design, release). Skills at `~/.claude/skills/gstack/`. |
+| **claude-mem** | MCP `mcp__plugin_claude-mem_mcp-search__search` | Cross-session memory index for conversation context. |
+
+**Always-on:** Read `~/.nemoclaw/reference-skills/gbrain/signal-detector/SKILL.md` — fires on every message to capture entities and ideas into the brain automatically.
+
+**Skill routing:** See `~/.nemoclaw/reference-skills/RESOLVER.md` for the full dispatch table across all four skill layers (gbrain, gstack, nemoclaw, openshell).
+
+**Subagent brain access:** All subagents share the same brain at `~/.gbrain/brain.pglite` via the `gbrain` MCP server. Include this instruction when spawning subagents:
+> "You have access to the gbrain MCP server. Search the brain before any web search. Write important findings back with mcp_gbrain_put_page."
+
 ## Quick Reference
 
 | Task | Command |

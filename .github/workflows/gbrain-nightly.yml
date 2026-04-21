@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GBrain nightly dream cycle: sync, embed, extract graph, consolidate memory.
+# Runs at 3am UTC daily. Free compute on GitHub-hosted runners.
+
+name: GBrain Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_embed:
+        description: 'Skip embedding step (faster, useful for graph-only runs)'
+        type: boolean
+        default: false
+
+jobs:
+  dream-cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install GBrain
+        run: |
+          git clone https://github.com/garrytan/gbrain.git ~/gbrain
+          cd ~/gbrain && bun install && bun link
+          gbrain --version
+
+      - name: Restore brain database
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.gbrain
+          key: gbrain-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            gbrain-${{ github.ref_name }}-
+            gbrain-
+
+      - name: Init brain (idempotent)
+        run: gbrain init
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Embed stale pages
+        if: ${{ !inputs.skip_embed }}
+        run: gbrain embed --stale
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Extract knowledge graph
+        run: gbrain extract links --source db
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Extract timeline
+        run: gbrain extract timeline --source db
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Health check
+        run: gbrain doctor --json
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Save brain database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.gbrain
+          key: gbrain-${{ github.ref_name }}-${{ github.run_id }}

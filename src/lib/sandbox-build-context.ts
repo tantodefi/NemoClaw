@@ -19,6 +19,10 @@ function stageLegacySandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
   });
   fs.cpSync(path.join(rootDir, "scripts"), path.join(buildCtx, "scripts"), { recursive: true });
   fs.rmSync(path.join(buildCtx, "nemoclaw", "node_modules"), { recursive: true, force: true });
+  // proton-tool Go source — needed by the proton-builder Dockerfile stage
+  const protonToolSrc = path.join(rootDir, ".github", "skills", "proton-calendar", "cmd", "proton-tool");
+  const protonToolDst = path.join(buildCtx, ".github", "skills", "proton-calendar", "cmd", "proton-tool");
+  fs.cpSync(protonToolSrc, protonToolDst, { recursive: true });
   return {
     buildCtx,
     stagedDockerfile: path.join(buildCtx, "Dockerfile"),
@@ -59,10 +63,31 @@ function stageOptimizedSandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
   });
 
   fs.mkdirSync(stagedScriptsDir, { recursive: true });
-  fs.copyFileSync(
-    path.join(rootDir, "scripts", "nemoclaw-start.sh"),
-    path.join(stagedScriptsDir, "nemoclaw-start.sh"),
-  );
+  for (const scriptName of [
+    "nemoclaw-start.sh",
+    "generate-openclaw-config.py",
+    "chad-backup-to-github.sh",
+    "chad-restore-from-github.sh",
+    "chad-clone-source.sh",
+    "chad-dump-state.sh",
+    "chad-report-bug.sh",
+  ]) {
+    fs.copyFileSync(
+      path.join(rootDir, "scripts", scriptName),
+      path.join(stagedScriptsDir, scriptName),
+    );
+  }
+
+  // proton-tool Go source — needed by the proton-builder Dockerfile stage
+  const protonToolSrc = path.join(rootDir, ".github", "skills", "proton-calendar", "cmd", "proton-tool");
+  const protonToolDst = path.join(buildCtx, ".github", "skills", "proton-calendar", "cmd", "proton-tool");
+  fs.cpSync(protonToolSrc, protonToolDst, { recursive: true });
+
+  // chad-orchestrator scripts + kinds — baked into image as canonical fallback
+  const orchestratorSrc = path.join(rootDir, ".github", "skills", "chad-orchestrator");
+  const orchestratorDst = path.join(buildCtx, ".github", "skills", "chad-orchestrator");
+  fs.cpSync(path.join(orchestratorSrc, "scripts"), path.join(orchestratorDst, "scripts"), { recursive: true });
+  fs.cpSync(path.join(orchestratorSrc, "kinds"), path.join(orchestratorDst, "kinds"), { recursive: true });
 
   return { buildCtx, stagedDockerfile };
 }

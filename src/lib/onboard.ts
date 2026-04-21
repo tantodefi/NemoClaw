@@ -4546,6 +4546,23 @@ const MESSAGING_CHANNELS = [
     appTokenHelp: "Slack API → Your Apps → Basic Information → App-Level Tokens (xapp-...).",
     appTokenLabel: "Slack App Token (Socket Mode)",
   },
+  {
+    // WhatsApp uses session credentials (creds.json) rather than a static bot token.
+    // The account must be paired outside the container with:
+    //   docker run --rm -it ghcr.io/nvidia/nemoclaw/sandbox-base:latest \
+    //     openclaw channels login --channel whatsapp
+    // Then mount the creds.json read-only at container start:
+    //   -v /path/to/creds.json:/sandbox/.openclaw-data/credentials/whatsapp/main/creds.json:ro
+    name: "whatsapp",
+    envKey: null,
+    credType: "creds-mount",
+    description: "WhatsApp messaging (requires pre-paired creds.json mount)",
+    help: "WhatsApp uses session credentials, not a bot token. Pair the account first:\n  docker run --rm -it ghcr.io/nvidia/nemoclaw/sandbox-base:latest openclaw channels login --channel whatsapp\nThen mount the creds.json at sandbox start (see docs).",
+    label: null,
+    userIdEnvKey: "WHATSAPP_ALLOWED_IDS",
+    userIdHelp: "Enter E.164 phone number(s) to allowlist (e.g. +14155552671). Comma-separate multiple.",
+    userIdLabel: "WhatsApp phone number(s) to allowlist",
+  },
 ];
 
 // Curl exit codes that indicate a network-level failure (not a token problem).
@@ -4611,7 +4628,7 @@ async function setupMessagingChannels() {
 
   // Non-interactive: skip prompt, tokens come from env/credentials
   if (isNonInteractive() || process.env.NEMOCLAW_NON_INTERACTIVE === "1") {
-    const found = MESSAGING_CHANNELS.filter((c) => getMessagingToken(c.envKey)).map((c) => c.name);
+    const found = MESSAGING_CHANNELS.filter((c) => isChannelConfigured(c)).map((c) => c.name);
     if (found.length > 0) {
       note(`  [non-interactive] Messaging tokens detected: ${found.join(", ")}`);
       if (found.includes("telegram")) {
@@ -4624,9 +4641,9 @@ async function setupMessagingChannels() {
   }
 
   // Single-keypress toggle selector — pre-select channels that already have tokens.
-  // Press 1/2/3 to instantly toggle a channel; press Enter to continue.
+  // Press 1/2/3/4 to instantly toggle a channel; press Enter to continue.
   const enabled = new Set(
-    MESSAGING_CHANNELS.filter((c) => getMessagingToken(c.envKey)).map((c) => c.name),
+    MESSAGING_CHANNELS.filter((c) => isChannelConfigured(c)).map((c) => c.name),
   );
 
   const output = process.stderr;
@@ -4643,7 +4660,7 @@ async function setupMessagingChannels() {
     output.write("  Available messaging channels:\n");
     MESSAGING_CHANNELS.forEach((ch, i) => {
       const marker = enabled.has(ch.name) ? "●" : "○";
-      const status = getMessagingToken(ch.envKey) ? " (configured)" : "";
+      const status = isChannelConfigured(ch) ? " (configured)" : "";
       output.write(`    [${i + 1}] ${marker} ${ch.name} — ${ch.description}${status}\n`);
     });
     output.write("\n");
@@ -4723,7 +4740,14 @@ async function setupMessagingChannels() {
       console.log(`  Unknown channel: ${name}`);
       continue;
     }
-    if (getMessagingToken(ch.envKey)) {
+    if (ch.credType === "creds-mount") {
+      // No static token — auth is via creds.json mounted read-only at runtime.
+      process.env[`NEMOCLAW_${ch.name.toUpperCase()}_ENABLED`] = "1";
+      console.log(`  ✓ ${ch.name} — enabled`);
+      console.log(
+        `    Mount creds.json at: /sandbox/.openclaw-data/credentials/${ch.name}/main/creds.json`,
+      );
+    } else if (getMessagingToken(ch.envKey)) {
       console.log(`  ✓ ${ch.name} — already configured`);
     } else {
       console.log("");

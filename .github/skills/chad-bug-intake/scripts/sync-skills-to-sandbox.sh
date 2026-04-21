@@ -70,10 +70,33 @@ for skill in "${skills[@]}"; do
   local_path="$repo_root/.github/skills/$skill"
   [ -d "$local_path" ] || fail "Skill directory not found: $local_path"
 
-  ssh "$remote_host" "rm -rf '$remote_dir/$skill'"
-  # Use tar pipeline instead of scp — sandbox may lack sftp-server
+  # Atomic swap: extract into a tempdir next to the live skill, then
+  # mv the live copy out and the new copy in. If tar or ssh die mid-
+  # stream, the live skill is untouched so chad-spawn.sh still finds a
+  # valid kinds/ tree. Previously the `rm -rf; tar xf -` sequence left
+  # a half-populated skill dir if extraction failed.
+  # Use tar pipeline instead of scp — sandbox may lack sftp-server.
   tar -C "$repo_root/.github/skills" -cf - "$skill" \
-    | ssh "$remote_host" "tar -C '$remote_dir' -xf -"
+    | ssh "$remote_host" "
+        set -e
+        staging=\"\$(mktemp -d '$remote_dir/.sync-$skill.XXXXXX')\"
+        trap 'rm -rf \"\$staging\"' EXIT
+        tar -C \"\$staging\" -xf -
+        old=\"\$(mktemp -d '$remote_dir/.old-$skill.XXXXXX')\"
+        if [ -e '$remote_dir/$skill' ]; then
+          mv '$remote_dir/$skill' \"\$old/$skill\"
+        fi
+        if mv \"\$staging/$skill\" '$remote_dir/$skill'; then
+          rm -rf \"\$old\"
+        else
+          # Roll back to the previous version if the swap failed.
+          if [ -e \"\$old/$skill\" ]; then
+            mv \"\$old/$skill\" '$remote_dir/$skill'
+          fi
+          rm -rf \"\$old\"
+          exit 1
+        fi
+      "
   echo "Synced $skill to $remote_host:$remote_dir/$skill"
 done
 

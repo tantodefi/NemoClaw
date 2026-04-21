@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GBrain knowledge brain — allows the sandbox agent to call the gbrain MCP
+# server running on the host and reach OpenAI/Anthropic APIs for embeddings
+# and query expansion.
+
+preset:
+  name: gbrain
+  description: "GBrain knowledge brain — host MCP server + OpenAI embeddings + Anthropic query expansion."
+
+network_policies:
+  gbrain_host_mcp:
+    name: gbrain_host_mcp
+    description: "Reach gbrain MCP server on the host via the host-gateway loopback"
+    endpoints:
+      - host: "host.docker.internal"
+        port: 0
+        protocol: rest
+        enforcement: monitor
+        rules:
+          - allow: { method: POST, path: "/mcp/**" }
+          - allow: { method: GET,  path: "/health" }
+
+  gbrain_openai_embeddings:
+    name: gbrain_openai_embeddings
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/v1/embeddings" }
+
+  gbrain_anthropic_expansion:
+    name: gbrain_anthropic_expansion
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/v1/messages" }

@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GBrain weekly maintenance: doctor, orphan detection, skill health check.
+# Runs Monday 6am UTC. Free compute on GitHub-hosted runners.
+
+name: GBrain Weekly Maintenance
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install GBrain
+        run: |
+          git clone https://github.com/garrytan/gbrain.git ~/gbrain
+          cd ~/gbrain && bun install && bun link
+
+      - name: Restore brain database
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.gbrain
+          key: gbrain-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            gbrain-${{ github.ref_name }}-
+            gbrain-
+
+      - name: Init brain (idempotent)
+        run: gbrain init
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Full embed refresh
+        run: gbrain embed --stale
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Doctor check
+        run: gbrain doctor --json
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Orphan detection
+        run: gbrain orphans --json
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        continue-on-error: true
+
+      - name: Auto-fix dry run
+        run: gbrain doctor --fix --dry-run
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        continue-on-error: true
+
+      - name: Save brain database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.gbrain
+          key: gbrain-${{ github.ref_name }}-${{ github.run_id }}

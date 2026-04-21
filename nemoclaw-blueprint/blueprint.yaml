@@ -68,6 +68,25 @@ components:
         credential_default: "dummy"
         timeout_secs: 180
 
+  plugins:
+    gbrain:
+      repo: "https://github.com/garrytan/gbrain.git"
+      install_path: "/sandbox/.gbrain-plugin"
+      mcp_server:
+        command: "gbrain"
+        args: ["serve"]
+        env:
+          GBRAIN_DIR: "/sandbox/.gbrain"
+      skills_path: "skills/"
+      description: "Personal knowledge brain with hybrid vector+graph search"
+
+    gstack:
+      repo: "https://github.com/garrytan/gstack.git"
+      install_path: "/sandbox/.gstack-plugin"
+      binary: "browse/dist/browse"
+      skills_path: ".agents/skills/"
+      description: "Workflow skills and persistent browser daemon"
+
   policy:
     base: "sandboxes/openclaw/policy.yaml"
     additions:

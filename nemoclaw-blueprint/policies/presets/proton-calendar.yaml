@@ -87,4 +87,4 @@ network_policies:
         port: 443
         access: full
     binaries:
-      - { path: "/sandbox/**" }
+      - { path: "/usr/local/bin/proton-tool" }
