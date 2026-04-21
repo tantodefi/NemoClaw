@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-bug-report preset — write-scoped GitHub egress.
+#
+# The `chad-report-bug` helper is the only binary that is allowed to
+# POST to api.github.com for issue creation and PATCH to update issues
+# it previously filed. Everything else Chad does with `gh` stays
+# read-only (see subagent-researcher / subagent-reviewer presets).
+#
+# Scope is deliberately narrow:
+#   - api.github.com  (POST /repos/*/issues, PATCH /repos/*/issues/*)
+#   - api.github.com  (POST /repos/*/issues/*/comments for follow-ups)
+#   - api.github.com  (GET  /repos/*/issues/*      for dedupe/backoff)
+#   - uploads.github.com (POST /repos/*/releases/*/assets — for
+#                         attaching the state-dump tarball to a release
+#                         when the issue body would exceed 65K chars)
+#
+# We do NOT grant access to:
+#   - api.github.com/repos/*/pulls        (bot-created PRs live behind
+#                                          chad-self-improve proposals)
+#   - api.github.com/repos/*/actions/*    (no CI tampering)
+#   - github.com/*                        (no browser-flow scraping)
+#
+# The binary is pinned so nothing else in the sandbox can forge a
+# write request by dropping a payload into a file chad-report-bug
+# happens to read. Any new write-scoped helper gets its own preset.
+
+preset:
+  name: chad-bug-report
+  description: "Write-scoped GitHub egress for the chad-report-bug helper. Creates/updates issues only."
+
+network_policies:
+  chad_bug_report:
+    name: chad_bug_report
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          # Dedupe / backoff reads
+          - allow: { method: GET,   path: "/repos/*/*/issues" }
+          - allow: { method: GET,   path: "/repos/*/*/issues/*" }
+          - allow: { method: GET,   path: "/repos/*/*/issues/*/comments" }
+          - allow: { method: GET,   path: "/repos/*/*/labels" }
+          # Issue create + update
+          - allow: { method: POST,  path: "/repos/*/*/issues" }
+          - allow: { method: PATCH, path: "/repos/*/*/issues/*" }
+          # Follow-up comments on previously-filed issues
+          - allow: { method: POST,  path: "/repos/*/*/issues/*/comments" }
+          # Label management — for "state-attached" / "chad-filed" tags
+          - allow: { method: POST,  path: "/repos/*/*/issues/*/labels" }
+      - host: uploads.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          # Large state dumps attached as release assets when the body
+          # would exceed GitHub's 65K-char issue limit.
+          - allow: { method: POST, path: "/repos/*/*/releases/*/assets*" }
+    binaries:
+      - { path: /usr/local/bin/chad-report-bug }
+      - { path: /usr/local/bin/gh }
+      - { path: /usr/bin/gh }

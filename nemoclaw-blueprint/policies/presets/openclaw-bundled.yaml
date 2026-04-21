@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Bundled OpenClaw skills egress preset.
+#
+# OpenClaw ships a set of "bundled" skills that come with the CLI:
+#   - clawhub          (plugin discovery + install)
+#   - coding-agent     (delegates to pi / claude)
+#   - gog              (Google Workspace CLI — see presets/google-workspace.yaml)
+#   - session-logs     (local-only — no network access needed)
+#   - summarize        (runs through openclaw agent against NVIDIA inference)
+#   - openclaw-bundled (the meta-skill that bootstraps the others)
+#
+# Each of these is `enable: true` in the baked openclaw.json (see
+# scripts/generate-openclaw-config.py). This preset covers the *network*
+# side: the three endpoints the bundled skills phone home to, pinned to
+# the openclaw + node binaries. It is a thin wrapper around the
+# `clawhub`, `openclaw_api`, and `openclaw_docs` policies that already
+# live in openclaw-sandbox.yaml — exposing them as a single
+# `nemoclaw policy apply --preset openclaw-bundled` target makes the
+# bundled skill set portable to new deployments.
+#
+# NOT covered by this preset:
+#   - `gog`            → use `presets/google-workspace.yaml`
+#   - `coding-agent`   → use `presets/pi-agent.yaml`
+#   - Anthropic egress → covered by the base `claude_code` policy
+#
+# Ref: nemoclaw-blueprint/policies/openclaw-sandbox.yaml lines 119–160
+
+preset:
+  name: openclaw-bundled
+  description: "Network egress for the OpenClaw-bundled skills (clawhub, openclaw_api, openclaw_docs)."
+
+network_policies:
+  bundled_clawhub:
+    name: bundled_clawhub
+    endpoints:
+      - host: clawhub.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+
+  bundled_openclaw_api:
+    name: bundled_openclaw_api
+    endpoints:
+      - host: openclaw.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+
+  bundled_openclaw_docs:
+    name: bundled_openclaw_docs
+    endpoints:
+      - host: docs.openclaw.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }

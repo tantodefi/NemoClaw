@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: reviewer
+# Egress scope: NVIDIA inference + GitHub read paths (for fetching PR
+# diffs and checking statuses). The reviewer may *read* PRs but cannot
+# post reviews or comments — writing verdicts back to GitHub is the
+# parent agent's job.
+
+preset:
+  name: subagent-reviewer
+  description: "Read-only reviewer sub-agent — NVIDIA inference and gh PR reads. No writes to GitHub."
+
+network_policies:
+  subagent_reviewer_nvidia:
+    name: subagent_reviewer_nvidia
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+
+  # GET-only GitHub so the reviewer can fetch diffs but not comment.
+  subagent_reviewer_github:
+    name: subagent_reviewer_github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+      - host: raw.githubusercontent.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/gh }
+      - { path: /usr/bin/gh }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }

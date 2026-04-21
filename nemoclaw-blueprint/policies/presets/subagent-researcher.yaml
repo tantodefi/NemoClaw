@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: researcher
+# Egress scope: NVIDIA inference (for claude/openclaw), GitHub (for gh
+# lookups), and the openclaw control plane. No git push, no registry,
+# no messaging. The researcher is read-only by contract.
+
+preset:
+  name: subagent-researcher
+  description: "Read-only research sub-agent — NVIDIA inference, gh search, openclaw/clawhub. No writes."
+
+network_policies:
+  subagent_researcher_nvidia:
+    name: subagent_researcher_nvidia
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+
+  subagent_researcher_github:
+    name: subagent_researcher_github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        access: full
+      - host: github.com
+        port: 443
+        access: full
+      - host: raw.githubusercontent.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/local/bin/gh }
+      - { path: /usr/bin/gh }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }

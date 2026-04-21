@@ -132,6 +132,17 @@ if [ -d "${WORKSPACE}/memory" ]; then
   done < <(find "${WORKSPACE}/memory" -type f -print0)
 fi
 
+# Sub-agent queue and budget — push the task ledger and token budget so the
+# orchestration state survives sandbox resets alongside memory.
+QUEUE_FILE="${CHAD_QUEUE_FILE:-/sandbox/.openclaw-data/queue/tasks.jsonl}"
+BUDGET_FILE="${CHAD_BUDGET_FILE:-/sandbox/.openclaw-data/budget.json}"
+if [ -f "$QUEUE_FILE" ]; then
+  push_file "$QUEUE_FILE" "queue/tasks.jsonl"
+fi
+if [ -f "$BUDGET_FILE" ]; then
+  push_file "$BUDGET_FILE" "queue/budget.json"
+fi
+
 # GBrain export — dump all pages as NDJSON and push to brain/ in the state repo.
 # gbrain export writes one JSON object per line (page id, content, metadata).
 # Kept separate from workspace/ so the restore script can re-import selectively.

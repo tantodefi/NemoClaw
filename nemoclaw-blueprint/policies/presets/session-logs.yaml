@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Session logs skill preset.
+#
+# session-logs is the OpenClaw-bundled skill that reads the gateway's
+# session log index and lets an agent query "what did I do in session X".
+# It is strictly local: the skill binary reads
+# /sandbox/.openclaw-data/gateway/sessions/*.jsonl and writes snippets
+# back to the caller. It never touches the network.
+#
+# This preset exists so `nemoclaw policy apply --preset session-logs`
+# registers an explicit (empty) network scope for the skill, which
+# lets `openclaw skills check` flip session-logs from "disabled (no
+# policy)" to "enabled (no-network scope)".
+#
+# If you ever add a remote log sink (e.g. grafana loki), add a new
+# network policy under `session_logs_sink` — do NOT expand this one
+# since the local-only guarantee is documented in the skill contract.
+
+preset:
+  name: session-logs
+  description: "Local-only session-logs skill — no network egress; declares the skill binary as known to the L7 gateway."
+
+network_policies:
+  session_logs_local:
+    name: session_logs_local
+    # No endpoints block — this is an explicit no-network policy.
+    # The gateway treats a policy with zero endpoints as "binary is
+    # known but has no egress", which satisfies the skill-eligibility
+    # check without opening any holes.
+    endpoints: []
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }

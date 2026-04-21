@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: coder
+# Used for write/refactor/fix tasks where the sub-agent needs to edit
+# code in /sandbox/source (read-only clone) or a scratch workdir.
+
+kind: coder
+description: "Writes, refactors, or fixes code. Queries gbrain for prior context on the same files. Reads /sandbox/source, writes patches to the workdir, never pushes."
+
+# Binary to invoke. Must be an absolute path because the network policy
+# (pi-agent) pins egress to the exact binary path.
+binary: /usr/local/bin/pi
+
+# Invocation style: how chad-spawn.sh should call the binary.
+#   prompt-arg     — pass the rendered prompt as the last positional arg
+#   prompt-stdin   — pipe the rendered prompt on stdin
+#   openclaw-agent — use `openclaw agent --agent main --session-id <id> -m <prompt>`
+invocation: prompt-stdin
+
+network_policy_preset: pi-agent
+
+default_timeout: 600
+default_budget_tokens: 50000
+
+prompt_template: |
+  You are a coding sub-agent spawned by Chad. Your scope is narrow:
+  read the task below, read /sandbox/source if you need context, and
+  produce either:
+    1) a unified diff in ```diff fenced blocks, OR
+    2) a concrete answer explaining why the task cannot be done.
+
+  ## Before coding — check the brain for prior context
+  Run: gbrain query "<function/file name from the task>"
+  If there are prior notes about this code area (past bugs, design
+  decisions, known gotchas), factor them into your approach.
+
+  ## Available gstack workflow skills
+  For tasks that need a full ship/QA cycle, you may invoke:
+    /gstack-qa    — QA checklist against your diff
+    /gstack-ship  — ship readiness check before declaring done
+  These are optional — use your judgment for small patches.
+
+  Never push to git, never edit files outside your workdir, never
+  spawn further sub-agents. Last line of stdout MUST be JSON:
+    {"status": "done"|"failed", "summary": "...", "files_changed": []}
+
+  Task id: {{task_id}}
+  Task:
+  {{task}}

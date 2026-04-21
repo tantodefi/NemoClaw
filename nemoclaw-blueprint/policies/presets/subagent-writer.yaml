@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: writer
+# Egress scope: NVIDIA inference only. The writer produces drafts in
+# its workdir — it does not send mail, post comments, or create PRs.
+# Publishing is always the parent agent's responsibility.
+
+preset:
+  name: subagent-writer
+  description: "Draft-only writer sub-agent — NVIDIA inference only. Never publishes."
+
+network_policies:
+  subagent_writer_nvidia:
+    name: subagent_writer_nvidia
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }

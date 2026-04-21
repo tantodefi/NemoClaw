@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Summarize skill preset.
+#
+# `summarize` is the OpenClaw-bundled skill that compresses a chunk of
+# text or a memory file into a shorter summary. Under the hood it calls
+# `openclaw agent --local -m "summarize: ..."` which routes through the
+# baked NVIDIA inference endpoint defined in openclaw.json.
+#
+# Because summarize runs under the `openclaw` binary, it inherits the
+# base `nvidia` policy from openclaw-sandbox.yaml automatically. This
+# preset exists purely to declare the skill as "enabled" to the L7
+# gateway — it shares the same endpoints as the base nvidia policy so
+# applying it is idempotent.
+
+preset:
+  name: summarize
+  description: "Summarize skill — NVIDIA inference via the openclaw agent local gateway."
+
+network_policies:
+  summarize_nvidia:
+    name: summarize_nvidia
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
