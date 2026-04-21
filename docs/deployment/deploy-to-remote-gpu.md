@@ -83,7 +83,7 @@ $ nemoclaw deploy <instance-name>
 SSH to the instance and run the OpenShell TUI to monitor activity and approve network requests:
 
 ```console
-$ ssh <instance-name> 'cd /home/ubuntu/nemoclaw && set -a && . .env && set +a && openshell term'
+$ ssh <instance-name> 'cd ~/nemoclaw && set -a && . .env && set +a && openshell term'
 ```
 
 ## Verify Inference
@@ -119,6 +119,22 @@ set on a headless host, the compatibility wrapper prints a warning.
 If you disable device auth for a remote deployment, any device that can reach the dashboard origin can connect without pairing.
 Avoid this on internet-reachable or shared-network deployments.
 :::
+
+## Proxy Configuration
+
+NemoClaw routes sandbox traffic through a gateway proxy that defaults to `10.200.0.1:3128`.
+If your network requires a different proxy, set `NEMOCLAW_PROXY_HOST` and `NEMOCLAW_PROXY_PORT` before onboarding:
+
+```console
+$ export NEMOCLAW_PROXY_HOST=proxy.example.com
+$ export NEMOCLAW_PROXY_PORT=8080
+$ nemoclaw onboard
+```
+
+These values are baked into the sandbox image at build time.
+Only alphanumeric characters, dots, hyphens, and colons are accepted for the host.
+The port must be numeric (0-65535).
+Changing the proxy after onboarding requires re-running `nemoclaw onboard`.
 
 ## GPU Configuration
 
