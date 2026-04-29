@@ -1,0 +1,195 @@
+{
+  "$schema": "./task-profiles.schema.json",
+  "_comment": "Per-task budget profiles. Each profile names a model (resolved via model-registry.json) and the runtime guardrails for that task. Wrappers and chad-setup.sh consume this; chad-budget-audit compares actual telemetry against it.",
+  "_modelInheritance": "Profiles that omit \"model\" inherit model-registry.json:defaults.primary (moonshotai/kimi-k2.5). Profiles MUST set \"model\" explicitly when (a) they want a non-default upstream (premium-* and *-premium profiles point at claude-* models) or (b) the routing layer should not fall back. Consumers that read profile['model'] should `or` against the registry default.",
+  "_last_verified": "2026-04-29",
+
+  "profiles": {
+    "email-check": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 2048,
+      "timeoutSeconds": 120,
+      "thinking": "off",
+      "minBudgetTokens": 30000,
+      "schedule": "0 2,6-23 * * *",
+      "reason": "Wrapper invocation only — agent calls chad-email-check-cron and confirms a summary line. Recent canary: 90s, 133 output tokens. 2048-out cap is 5x p95 measured; 120s timeout is ~30% headroom over p95 90s. minBudget=30k matches chad-mail-check internal gate. thinking=off here is LOAD-BEARING: the cron-payload runs K2.5 with the openclaw `Bash` tool to invoke the wrapper, and K2.5+tools+reasoning has a known multi-turn regression that explodes to 550k tokens. The intelligence happens in `phase2` below (single-turn, no tools — safe). Inherits model from registry default.",
+      "phase2": {
+        "_comment": "Optional single-turn LLM draft pass kicked off by the cron WRAPPER (not the cron payload). chad-phase2-draft-replies is called once with no MCP and no tools — K2.5-safe by construction even with thinking on, because there are no tool calls to round-trip. Drafts append to today's memory under '### Draft replies' and are NEVER auto-sent.",
+        "model": "moonshotai/kimi-k2.5",
+        "thinking": "high",
+        "maxOutputTokens": 4096,
+        "timeoutSeconds": 90,
+        "minBudgetTokens": 50000,
+        "maxItems": 8,
+        "usePremium": true,
+        "premiumModel": "claude-sonnet-4-6"
+      }
+    },
+
+    "workspace-backup": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 60,
+      "thinking": "off",
+      "minBudgetTokens": 5000,
+      "schedule": "0 */6 * * *",
+      "reason": "Wrapper detaches the slow git push; cron payload only confirms 'workspace-backup detached'. Anything more than that is a regression. minBudget low because the wrapper itself is shell-only — the cron payload's token spend is the agent's ack. Inherits model from registry default."
+    },
+
+    "gbrain-dream": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 60,
+      "thinking": "off",
+      "minBudgetTokens": 10000,
+      "schedule": "30 3 * * *",
+      "reason": "Same shape as workspace-backup — wrapper detaches embed/extract; agent acks 'gbrain dream complete'. 10k minBudget reserves room for the subsequent wakes that depend on a fresh brain. Inherits model from registry default."
+    },
+
+    "issue-triage": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 60,
+      "thinking": "off",
+      "minBudgetTokens": 140000,
+      "schedule": "0 10 * * *",
+      "reason": "Wrapper enforces budget gate then detaches sub-agents. The cron-payload agent only acks the detach. Heavy minBudget=140k because the *detached* sub-agents (researcher/coder per issue) need ~70k each — gating happens at the wrapper, not here. thinking=off LOAD-BEARING for the same reason as email-check (K2.5+tools regression). Phase 2 below runs the single-turn draft pass with thinking on. Inherits model from registry default.",
+      "phase2": {
+        "_comment": "Single-turn LLM draft of triage decisions (skip / comment-draft / close-stale) for the top-N open issues. Runs BEFORE the heavy detach. Drafts append under '### Issue triage drafts' and are NEVER posted. K2.5-safe (no tools).",
+        "model": "moonshotai/kimi-k2.5",
+        "thinking": "high",
+        "maxOutputTokens": 4096,
+        "timeoutSeconds": 90,
+        "minBudgetTokens": 60000,
+        "maxItems": 8,
+        "usePremium": true,
+        "premiumModel": "claude-sonnet-4-6"
+      }
+    },
+
+    "self-improve": {
+      "kind": "cron-direct-invocation",
+      "maxOutputTokens": 4096,
+      "timeoutSeconds": 300,
+      "thinking": "off",
+      "minBudgetTokens": 50000,
+      "schedule": "0 3 * * 0",
+      "reason": "Agent runs chad-self-improve --days 7 directly and pastes its stdout into memory under '## Self-improvement'. Larger output budget (4k) than other crons because the proposals get echoed; longer timeout (300s) because the helper itself does some analysis. Inherits model from registry default."
+    },
+
+    "chad-budget-audit": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 60,
+      "thinking": "off",
+      "minBudgetTokens": 5000,
+      "schedule": "0 4 * * 1",
+      "reason": "Weekly Monday 04:00 UTC — wrapper computes p95 telemetry per task and writes a markdown recommendation report to memory/feedback-proposals.md. Agent only confirms the wrapper printed a summary. Pure shell+python work, minimal token cost. Inherits model from registry default."
+    },
+
+    "issue-triage-researcher-subagent": {
+      "kind": "subagent-direct",
+      "model": "moonshotai/kimi-k2.5",
+      "maxOutputTokens": 16384,
+      "timeoutSeconds": 600,
+      "thinking": "high",
+      "minBudgetTokens": 70000,
+      "reason": "Per-issue research sub-agent spawned by chad-issue-triage. Reads issue + comments, searches code, writes findings. Bumped to thinking=high — triage benefits from deep multi-step reasoning, and the K2.5 multi-turn regression doesn't apply here because each subagent runs as a fresh single-purpose session (not the openclaw cron payload)."
+    },
+
+    "issue-triage-coder-subagent": {
+      "kind": "subagent-direct",
+      "model": "moonshotai/kimi-k2.5",
+      "maxOutputTokens": 32768,
+      "timeoutSeconds": 900,
+      "thinking": "high",
+      "minBudgetTokens": 70000,
+      "reason": "Per-issue coding sub-agent. Generates patches; uses the full upstream output cap because diffs can be large. thinking=high because patch correctness benefits more from reasoning than from raw output budget. Highest cron-side budget — guarded by chad-issue-triage's --top N cap."
+    },
+
+    "chad-bug-intake-orchestrator": {
+      "kind": "subagent-direct",
+      "model": "moonshotai/kimi-k2.5",
+      "maxOutputTokens": 16384,
+      "timeoutSeconds": 600,
+      "thinking": "high",
+      "minBudgetTokens": 80000,
+      "reason": "Multi-step bug triage orchestration: classify, deduplicate against existing issues, draft new issue body if needed. thinking=high because dedup decisions are the load-bearing part — false positives create issue spam, false negatives create duplicate work."
+    },
+
+    "content-generation": {
+      "kind": "subagent-direct",
+      "model": "moonshotai/kimi-k2.5",
+      "maxOutputTokens": 32768,
+      "timeoutSeconds": 900,
+      "thinking": "high",
+      "minBudgetTokens": 100000,
+      "reason": "Long-form prose generation (TJ Cooke article requests, weekly content). Uses full upstream output cap. thinking=high because article quality is the explicit goal of this profile — the premium variant exists for exactly this reason. minBudget high because article drafts can chain multiple writing turns."
+    },
+
+    "github-worker-job": {
+      "kind": "outsourced-anthropic",
+      "model": "claude-opus-4-7",
+      "maxOutputTokens": 32768,
+      "timeoutSeconds": 1200,
+      "thinking": "high",
+      "minBudgetTokens": 0,
+      "reason": "Hits Anthropic API directly via chad-dispatch — does NOT consume chad-budget. Daily cap is enforced by Anthropic billing. thinking=high — Opus jobs are reserved for cases where Sonnet's draft was unsatisfying, so we want maximum reasoning depth. Use for jobs that exceed gateway capacity or need vision."
+    },
+
+    "premium-default": {
+      "kind": "premium-on-demand",
+      "model": "claude-sonnet-4-6",
+      "maxOutputTokens": 8192,
+      "timeoutSeconds": 300,
+      "thinking": "high",
+      "minBudgetTokens": 0,
+      "requiresAuthContext": true,
+      "reason": "Default profile when /premium or chad-premium is invoked without --opus. Sonnet gives frontier reasoning at ~3x lower cost than Opus. thinking=high — the user invoked premium *because* they want better reasoning, leaving thinking on default would defeat the purpose."
+    },
+
+    "premium-opus": {
+      "kind": "premium-on-demand",
+      "model": "claude-opus-4-7",
+      "maxOutputTokens": 16384,
+      "timeoutSeconds": 600,
+      "thinking": "high",
+      "minBudgetTokens": 0,
+      "requiresAuthContext": true,
+      "reason": "Profile when chad-premium --opus is invoked. Reserved for tasks that explicitly need Opus-level depth (long-form refactors, multi-step planning, vision). thinking=high for the same reason as premium-default — opus is the explicit ask for maximum reasoning."
+    },
+
+    "content-generation-premium": {
+      "kind": "subagent-direct-premium",
+      "model": "claude-sonnet-4-6",
+      "maxOutputTokens": 32768,
+      "timeoutSeconds": 900,
+      "thinking": "high",
+      "minBudgetTokens": 0,
+      "requiresAuthContext": true,
+      "reason": "Premium variant of content-generation. Used when an inbound email from tantodefi@proton.me requests an article or when /premium write … is invoked. thinking=high so Sonnet can plan structure across long-form drafts before generating prose."
+    },
+
+    "issue-triage-coder-subagent-premium": {
+      "kind": "subagent-direct-premium",
+      "model": "claude-sonnet-4-6",
+      "maxOutputTokens": 32768,
+      "timeoutSeconds": 900,
+      "thinking": "high",
+      "minBudgetTokens": 0,
+      "requiresAuthContext": true,
+      "reason": "Premium variant of issue-triage-coder. Used when an issue mentions @supachad — wrapper attaches AuthContext and the coder subagent picks this profile instead of the default kimi-k2.5 one. thinking=high because patches that go through this path are the higher-stakes ones (explicit human escalation)."
+    },
+
+    "chad-bug-intake-premium": {
+      "kind": "subagent-direct-premium",
+      "model": "claude-sonnet-4-6",
+      "maxOutputTokens": 16384,
+      "timeoutSeconds": 600,
+      "thinking": "high",
+      "minBudgetTokens": 0,
+      "requiresAuthContext": true,
+      "reason": "Premium variant of chad-bug-intake-orchestrator. Used when an inbound bug report email is from tantodefi@proton.me. thinking=high because dedup decisions across the full open-issue corpus are exactly the kind of multi-step reasoning Sonnet wins at."
+    }
+  }
+}

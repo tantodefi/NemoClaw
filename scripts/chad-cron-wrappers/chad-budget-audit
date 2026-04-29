@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-budget-audit — Compare cron telemetry against task-profiles.json
+# and emit a recommendation report.
+#
+# For each cron in `openclaw cron list --json`:
+#   1. Pull last N runs via `openclaw cron runs --id <id> --limit N --json`
+#   2. Compute p95 inputTokens/outputTokens/durationMs and error rate
+#   3. Compare against the matching profile in task-profiles.json
+#   4. Flag findings when actual p95 ≤ 33% of budget (over-provisioned),
+#      max observed ≥ 90% of budget (under-provisioned, truncation risk),
+#      or error rate > 10%.
+#
+# Output: appended to today's memory file under "## Budget audit — <ts>"
+# AND mirrored into memory/feedback-proposals.md (latest first).
+#
+# Registered as a weekly cron by chad-setup.sh (Mon 04:00 UTC).
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+PROFILES_FILE="${CHAD_PROFILES_FILE:-/usr/local/share/chad/task-profiles.json}"
+LIMIT="${CHAD_AUDIT_LIMIT:-50}"
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+PROPOSALS_FILE="${CHAD_PROPOSALS_FILE:-/sandbox/.openclaw-data/memory/feedback-proposals.md}"
+PREMIUM_LEDGER="${CHAD_PREMIUM_AUDIT_FILE:-/tmp/chad-premium.jsonl}"
+TS="$(date -u +%FT%TZ)"
+
+if [ ! -r "$PROFILES_FILE" ]; then
+  {
+    echo ""
+    echo "## Budget audit skipped — ${TS}"
+    echo "task-profiles.json not found at ${PROFILES_FILE}"
+  } >> "$MEMORY_FILE"
+  echo "skipped: profiles file missing"
+  exit 0
+fi
+
+CRONS_JSON="$(openclaw cron list --json 2>/dev/null || echo '[]')"
+if [ -z "$CRONS_JSON" ] || [ "$CRONS_JSON" = "[]" ]; then
+  echo "no crons registered"
+  exit 0
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+echo "$CRONS_JSON" > "$TMP/crons.json"
+
+CRONS_FILE="$TMP/crons.json" \
+LIMIT="$LIMIT" \
+PROFILES_FILE="$PROFILES_FILE" \
+TS="$TS" \
+MEMORY_FILE="$MEMORY_FILE" \
+PROPOSALS_FILE="$PROPOSALS_FILE" \
+PREMIUM_LEDGER="$PREMIUM_LEDGER" \
+python3 <<'PY'
+import json, os, subprocess, statistics
+from collections import defaultdict
+
+crons_file = os.environ["CRONS_FILE"]
+limit = int(os.environ["LIMIT"])
+profiles_file = os.environ["PROFILES_FILE"]
+ts = os.environ["TS"]
+memory_file = os.environ["MEMORY_FILE"]
+proposals_file = os.environ["PROPOSALS_FILE"]
+premium_ledger = os.environ["PREMIUM_LEDGER"]
+
+profiles = json.load(open(profiles_file)).get("profiles", {})
+raw = json.load(open(crons_file))
+# `openclaw cron list --json` returns {"jobs":[...]}; older builds may use
+# {"items":[...]} or a bare list — accept all three.
+if isinstance(raw, list):
+    crons = raw
+else:
+    crons = raw.get("jobs") or raw.get("items") or []
+
+def p95(xs):
+    if not xs: return 0
+    s = sorted(xs)
+    k = (len(s) - 1) * 0.95
+    f = int(k); c = min(f + 1, len(s) - 1)
+    return int(s[f] if f == c else s[f] + (s[c] - s[f]) * (k - f))
+
+findings = []
+rows = []
+for cron in crons:
+    name = cron.get("name") or ""
+    cid = cron.get("id") or ""
+    if not cid:
+        continue
+    try:
+        # `openclaw cron runs` always emits JSON ({"entries":[...]} envelope);
+        # there is no --json flag. Tested on openclaw 2026.4.2.
+        out = subprocess.check_output(
+            ["openclaw", "cron", "runs", "--id", cid, "--limit", str(limit)],
+            stderr=subprocess.DEVNULL, text=True, timeout=30,
+        )
+        runs = json.loads(out)
+    except Exception as exc:
+        findings.append(f"- **{name}**: could not fetch runs ({exc!r})")
+        continue
+    if isinstance(runs, list):
+        items = runs
+    else:
+        items = runs.get("entries") or runs.get("items") or runs.get("jobs") or []
+    # Only "finished" actions carry status/duration/usage.
+    items = [r for r in items if r.get("action") == "finished" or r.get("status")]
+    in_toks, out_toks, durs, statuses = [], [], [], []
+    for r in items:
+        u = r.get("usage") or {}
+        # Server emits snake_case (input_tokens); accept camelCase too.
+        v = u.get("input_tokens", u.get("inputTokens"))
+        if v is not None: in_toks.append(int(v))
+        v = u.get("output_tokens", u.get("outputTokens"))
+        if v is not None: out_toks.append(int(v))
+        if (v := r.get("durationMs")) is not None: durs.append(int(v))
+        statuses.append(r.get("status") or "")
+    n = len(items)
+    profile = profiles.get(name, {})
+    pin, pout, pdur = p95(in_toks), p95(out_toks), p95(durs)
+    err_pct = int(round(100 * sum(1 for s in statuses if s not in ("ok","completed","success")) / n)) if n else 0
+    rows.append((name, n, pin, pout, pdur // 1000, err_pct, profile.get("kind","—")))
+    if n == 0:
+        continue
+    if not profile:
+        findings.append(f"- **{name}**: no profile in task-profiles.json — add one or rename to match")
+        continue
+    max_out = int(profile.get("maxOutputTokens") or 0)
+    timeout_ms = int(profile.get("timeoutSeconds") or 0) * 1000
+    if max_out and pout and pout * 3 < max_out:
+        findings.append(
+            f"- **{name}**: maxOutputTokens={max_out} but p95 out is {pout} "
+            f"(< 33% used) — consider tightening to ~{max(pout * 2, 256)}"
+        )
+    if max_out and out_toks and max(out_toks) >= int(max_out * 0.9):
+        findings.append(
+            f"- **{name}**: maxOutputTokens={max_out} but max observed is {max(out_toks)} "
+            f"(≥ 90% used) — risk of truncation, raise"
+        )
+    if timeout_ms and pdur and pdur * 3 < timeout_ms:
+        findings.append(
+            f"- **{name}**: timeoutSeconds={timeout_ms//1000}s but p95 dur is "
+            f"{pdur//1000}s (< 33% used) — consider tightening"
+        )
+    if timeout_ms and durs and max(durs) >= int(timeout_ms * 0.9):
+        findings.append(
+            f"- **{name}**: timeoutSeconds={timeout_ms//1000}s but max dur is "
+            f"{max(durs)//1000}s (≥ 90% used) — risk of timeout"
+        )
+    if n >= 10 and err_pct > 10:
+        findings.append(f"- **{name}**: error rate {err_pct}% over last {n} runs — investigate")
+
+lines = [
+    f"\n## Budget audit — {ts}",
+    "",
+    "### Telemetry summary (last %d runs per cron)" % limit,
+    "| cron | runs | p95 in | p95 out | p95 dur (s) | err% | kind |",
+    "|------|-----:|-------:|--------:|------------:|-----:|------|",
+]
+for name, n, pin, pout, pdur_s, err, kind in rows:
+    lines.append(f"| {name} | {n} | {pin} | {pout} | {pdur_s} | {err} | {kind} |")
+lines.append("")
+
+# Premium spend — read /tmp/chad-premium.jsonl (one JSON per Anthropic call)
+# and roll up by model × source. Skip silently if no ledger yet.
+premium_rows = []
+premium_total_in = 0
+premium_total_out = 0
+if os.path.isfile(premium_ledger):
+    by_key = defaultdict(lambda: {"calls": 0, "in": 0, "out": 0, "p95_lat": []})
+    for raw in open(premium_ledger):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        key = (entry.get("model", "?"), entry.get("source") or "?", entry.get("identity") or "—")
+        bucket = by_key[key]
+        bucket["calls"] += 1
+        bucket["in"] += int(entry.get("in_tokens") or 0)
+        bucket["out"] += int(entry.get("out_tokens") or 0)
+        if (lat := entry.get("latency_ms")) is not None:
+            bucket["p95_lat"].append(int(lat))
+    for (model, source, identity), v in sorted(by_key.items(), key=lambda kv: -kv[1]["calls"]):
+        premium_total_in += v["in"]
+        premium_total_out += v["out"]
+        premium_rows.append((model, source, identity, v["calls"], v["in"], v["out"], p95(v["p95_lat"])))
+
+lines.append("### Premium spend (Anthropic)")
+if premium_rows:
+    lines.append("| model | source | identity | calls | in | out | p95 lat (ms) |")
+    lines.append("|-------|--------|----------|------:|---:|----:|-------------:|")
+    for model, source, identity, calls, tin, tout, lat in premium_rows:
+        lines.append(f"| {model} | {source} | {identity} | {calls} | {tin} | {tout} | {lat} |")
+    lines.append(f"| **total** |  |  |  | **{premium_total_in}** | **{premium_total_out}** |  |")
+else:
+    lines.append("- No premium calls recorded (ledger empty or absent).")
+lines.append("")
+
+lines.append("### Recommendations")
+lines.extend(findings if findings else ["- All crons within budget envelope."])
+
+block = "\n".join(lines) + "\n"
+with open(memory_file, "a") as f:
+    f.write(block)
+
+os.makedirs(os.path.dirname(proposals_file), exist_ok=True)
+prev = open(proposals_file).read() if os.path.exists(proposals_file) else ""
+header = "# Feedback proposals\n\n_Auto-generated by chad-budget-audit. Latest first._\n"
+new_block = "\n## " + ts + "\n" + "\n".join(lines[2:]) + "\n"
+if prev.startswith("# Feedback proposals"):
+    body = prev.split("\n", 3)[-1] if prev.count("\n") >= 3 else ""
+    out = header + new_block + ("\n" + body if body else "")
+else:
+    out = header + new_block + ("\n" + prev if prev else "")
+open(proposals_file, "w").write(out)
+
+print(f"budget-audit: {len(findings)} findings, {len(rows)} crons, "
+      f"{len(premium_rows)} premium model×source rows, appended to {memory_file}")
+PY

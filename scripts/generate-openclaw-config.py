@@ -20,6 +20,29 @@ def _b64json(env_key: str, default_b64: str) -> object:
     return json.loads(base64.b64decode(raw).decode("utf-8"))
 
 
+def _registry_defaults(model_id: str) -> dict:
+    """Pull contextWindow / maxOutputTokens / reasoningSafe for a model from
+    scripts/model-registry.json. Returns {} on any error so the caller falls
+    back to env-var defaults — the registry is best-effort, not required."""
+    candidates = [
+        os.environ.get("NEMOCLAW_MODEL_REGISTRY"),
+        "/usr/local/share/chad/model-registry.json",
+        os.path.join(os.path.dirname(__file__), "model-registry.json"),
+    ]
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                reg = json.load(f)
+            entry = reg.get("models", {}).get(model_id, {})
+            if entry:
+                return entry
+        except Exception:
+            continue
+    return {}
+
+
 def main() -> None:
     model = os.environ["NEMOCLAW_MODEL"]
     chat_ui_url = os.environ["CHAT_UI_URL"]
@@ -72,14 +95,27 @@ def main() -> None:
     disable_device_auth = os.environ.get("NEMOCLAW_DISABLE_DEVICE_AUTH", "") == "1"
     allow_insecure = parsed.scheme == "http"
 
+    # Defaults come from scripts/model-registry.json (single source of truth
+    # for per-model limits). Env vars NEMOCLAW_CONTEXT_WINDOW /
+    # NEMOCLAW_MAX_TOKENS still override — the registry just removes the
+    # need to pass them when running a known model.
+    # NOTE: keep reasoning=False for Kimi-K2.5. Flipping it to True changes
+    # the openclaw harness's tool-call parsing and K2.5 emits tool calls in
+    # a form that doesn't round-trip — runs end up with "Tool  not found"
+    # errors and the agent loops on empty toolUse stops. The registry's
+    # reasoningSafe flag drives this default.
+    reg = _registry_defaults(model)
+    ctx_default = str(reg.get("contextWindow", 262144))
+    max_default = str(reg.get("maxOutputTokens", 32768))
+    reasoning_default = bool(reg.get("reasoningSafe", False))
     model_entry: dict = {
         "id": model,
         "name": primary_model_ref,
-        "reasoning": False,
+        "reasoning": reasoning_default,
         "input": ["text"],
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        "contextWindow": 131072,
-        "maxTokens": 4096,
+        "contextWindow": int(os.environ.get("NEMOCLAW_CONTEXT_WINDOW", ctx_default)),
+        "maxTokens": int(os.environ.get("NEMOCLAW_MAX_TOKENS", max_default)),
     }
     if inference_compat:
         model_entry["compat"] = inference_compat

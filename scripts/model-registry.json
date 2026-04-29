@@ -1,0 +1,81 @@
+{
+  "$schema": "./model-registry.schema.json",
+  "_comment": "Single source of truth for per-model limits. Consumed by generate-openclaw-config.py, Dockerfile defaults, and (future) routing layer. Update here, regenerate downstream artifacts.",
+  "_last_verified": "2026-04-29",
+  "models": {
+    "moonshotai/kimi-k2.5": {
+      "displayName": "Kimi K2.5",
+      "contextWindow": 262144,
+      "maxOutputTokens": 32768,
+      "reasoningSupported": true,
+      "reasoningSafe": false,
+      "reasoningSafeReason": "K2.5 emits tool calls in a format that the openclaw harness can't round-trip when reasoning=true; agent loops on empty toolUse stops. See project_chad_cron_pattern memory.",
+      "providers": ["nvidia-prod-gateway"],
+      "tier": "frontier",
+      "modality": ["text"]
+    },
+    "nvidia/nemotron-3-super-120b-a12b": {
+      "displayName": "Nemotron 3 Super 120B (routing label)",
+      "contextWindow": 131072,
+      "maxOutputTokens": 16384,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["nvidia-prod"],
+      "tier": "frontier",
+      "modality": ["text"],
+      "_note": "Currently used as a routing label only — gateway translates this id to moonshotai/kimi-k2.5 upstream. Keep registry honest about the *label's* native limits in case routing changes."
+    },
+    "google/gemma-3-4b": {
+      "displayName": "Gemma 3 4B (lmstudio fallback)",
+      "contextWindow": 131072,
+      "maxOutputTokens": 8192,
+      "reasoningSupported": false,
+      "reasoningSafe": false,
+      "providers": ["lmstudio"],
+      "tier": "edge",
+      "modality": ["text"],
+      "_note": "Local fallback, Jetson-class. Ceiling for cron tasks running offline."
+    },
+    "claude-opus-4-7": {
+      "displayName": "Claude Opus 4.7",
+      "contextWindow": 200000,
+      "maxOutputTokens": 64000,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["anthropic"],
+      "tier": "frontier",
+      "modality": ["text", "vision"],
+      "requiresAuthContext": true,
+      "_note": "Premium endpoint. Hits Anthropic Messages API directly. Routed via chad-premium-client; access gated by chad-auth-context (dashboard senderId, terminal token, tantodefi@proton.me sender, or @supachad mention)."
+    },
+    "claude-sonnet-4-6": {
+      "displayName": "Claude Sonnet 4.6",
+      "contextWindow": 200000,
+      "maxOutputTokens": 64000,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["anthropic"],
+      "tier": "balanced",
+      "modality": ["text", "vision"],
+      "requiresAuthContext": true,
+      "_note": "Default premium model for /premium and chad-premium. Cheaper than Opus, still frontier-grade reasoning."
+    },
+    "claude-haiku-4-5-20251001": {
+      "displayName": "Claude Haiku 4.5",
+      "contextWindow": 200000,
+      "maxOutputTokens": 64000,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["anthropic"],
+      "tier": "fast",
+      "modality": ["text", "vision"],
+      "requiresAuthContext": true,
+      "_note": "Used by chad-premium-client --probe for cheap connectivity check."
+    }
+  },
+  "defaults": {
+    "primary": "moonshotai/kimi-k2.5",
+    "fallback": "google/gemma-3-4b",
+    "outsource": "claude-opus-4-7"
+  }
+}
