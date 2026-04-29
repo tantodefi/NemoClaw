@@ -13,16 +13,37 @@ host-side config, in-sandbox agent identity, and the source tree itself.
 
 ## 1. Architecture Overview — What Can Be Lost
 
-NemoClaw state is spread across three isolation boundaries:
+NemoClaw state is spread across four isolation boundaries:
 
 | Layer | Location | Persistence | Risk |
 |-------|----------|-------------|------|
 | **Host config** | `~/.nemoclaw/` | Local filesystem | Laptop loss, accidental `rm`, failed onboard |
 | **Sandbox workspace** | `/sandbox/.openclaw/workspace/` inside OpenShell | Ephemeral container storage | Sandbox destroy, re-onboard, cluster reset |
+| **Sandbox runtime state** | `/sandbox/.openclaw-data/` (cron, agents, action-gate, ledger) | Ephemeral container storage | Same as workspace, plus the in-memory gateway list goes stale |
 | **Source tree** | `~/.nemoclaw/source/` (git) | Git repo | Force push, uncommitted changes in `tmp/` |
 
-**The existing `backup-workspace.sh` only covers the sandbox layer.** This
-policy closes the gap for host config and uncommitted work.
+The `backup-workspace.sh` and `chad-backup-to-github.sh` scripts cover the workspace and runtime layers via the [sectioned manifest](../workspace/workspace-files.md#sectioned-manifest). This policy adds host config and uncommitted work on top.
+
+### 1.1 Two GitHub repos, two purposes
+
+Chad uses two distinct GitHub repos with different visibility and contents — do not confuse them:
+
+| Aspect | `tantodefi/NemoClaw` | `tantodefi/chad-state` |
+|---|---|---|
+| Visibility | Public (Apache-2.0 source) | **Private** |
+| Contents | Source code, docs, blueprint, scripts | Workspace markdown, memory, queue, cron jobs, runtime state, gbrain export |
+| Default env var | `CHAD_SOURCE_REPO=tantodefi/NemoClaw` | `CHAD_STATE_REPO=tantodefi/chad-state` |
+| Sandbox path | `/sandbox/source/` (read-only clone via `chad-clone-source`) | `/sandbox/.openclaw/workspace/` + `/sandbox/.openclaw-data/` (restore target) |
+| Push mechanism | `git push` (manual, reviewed) | `gh api PUT` per file (cron-driven, sha-skip) |
+| Pull mechanism | `git clone` (`chad-clone-source`) | `git clone` then `cp -a` (`chad-restore-from-github`) |
+
+**Source code never goes into chad-state, and runtime state never goes into NemoClaw.** Two unrelated lifetimes — versioned source vs. last-write-wins state snapshot.
+
+### 1.2 What the chad-state repo does NOT contain
+
+The manifest's `[exclude]` section deliberately leaves out the device keypair (`identity/`), peer tokens (`devices/`), bearer cache (`credentials/`), per-run logs (`subagents/`, `logs/`), and the raw PGLite brain files (`gbrain/` — the canonical form is the `brain/` markdown export). See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#sectioned-manifest) for the full table and per-path rationale.
+
+If you ever need a *persona checkpoint* that includes operator-role tokens (e.g. to migrate Chad to a new sandbox while preserving authority), do it as a separate, encrypted, passphrase-gated archive — not as part of the routine cron backup.
 
 ---
 

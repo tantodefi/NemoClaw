@@ -288,7 +288,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-phase2-draft-replies; do
+      for wrapper in chad-ensure-today-memory chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -329,6 +329,29 @@ print(json.dumps(out, indent=2))
       # Deploying as a data file (no +x) under /usr/local/share/chad/ keeps
       # /usr/local/bin/ free of non-executables.
       install_to_share_chad "${REPO_ROOT}/scripts/chad-cron-wrappers/_chad-paths.sh"
+
+      # Auto-actions policy: deploy the template (always), then seed the
+      # live policy at /sandbox/.openclaw-data/auto-actions.json *only if
+      # it does not already exist*. Re-running setup must NOT clobber
+      # tantodefi's per-target customisations (e.g. flipping a sender
+      # from auto→draft after a bad reply).
+      install_to_share_chad "${REPO_ROOT}/scripts/chad-cron-wrappers/auto-actions.template.json"
+      if [ -n "$SANDBOX_POD" ]; then
+        docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+          sh -c '
+            mkdir -p /sandbox/.openclaw-data /sandbox/.openclaw-data/state
+            if [ ! -f /sandbox/.openclaw-data/auto-actions.json ]; then
+              cp /usr/local/share/chad/auto-actions.template.json \
+                 /sandbox/.openclaw-data/auto-actions.json
+              echo "auto-actions.json: seeded from template"
+            else
+              echo "auto-actions.json: preserved (already present)"
+            fi
+            chown -R sandbox:sandbox /sandbox/.openclaw-data 2>/dev/null || true
+          ' 2>/dev/null \
+          && info "auto-actions policy seeded/preserved" \
+          || warn "Could not seed auto-actions.json (kubectl exec failed)"
+      fi
     fi
   fi
 else
@@ -574,7 +597,7 @@ if [ "$skip_crons" -eq 0 ]; then
   # mark-read + memory append). Replies and chad-intake routing are deferred
   # to a human or a future agent run while the Kimi-K2.5 multi-turn tool-call
   # regression is unresolved — see project_chad_cron_pattern memory.
-  email_check_message='Run `chad-email-check-cron`. The wrapper sweeps the inbox, batch-marks-read everything that does not need a human reply, and appends a `## Email-check (cron wrapper)` block to today'"'"'s memory file. Confirm it printed `email-check: total=... marked-read=... pending=...`, then exit. Do not draft replies or call chad-intake — the wrapper parks anything that needs a reply under `### Pending replies` for human review.'
+  email_check_message='Run `chad-email-check-cron`. The wrapper sweeps the inbox, batch-marks-read everything that does not need a human reply, drafts replies for admins via the drafter pass, and auto-sends drafts whose sender policy is `auto` in `/sandbox/.openclaw-data/auto-actions.json` (currently tantodefi + tjcooke). Confirm it printed `email-check: total=... marked-read=... pending=... drafts=... drafter=... autosend=...`, then exit. Do not write replies yourself — every memory section (`### Auto-sent replies`, `### Draft replies`, `### Drafts blocked/deferred`) is produced by the wrapper.'
 
   workspace_backup_message='Run `chad-workspace-backup`. The wrapper detaches the slow git push and returns in <1s. Confirm it printed a `workspace-backup detached` line, then exit. Do not poll or follow up — the result lands in todays memory file when the background job finishes.'
 

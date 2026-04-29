@@ -22,7 +22,9 @@ set -euo pipefail
 REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
 BRANCH="${CHAD_STATE_BRANCH:-main}"
 WORKSPACE="${CHAD_WORKSPACE:-/sandbox/.openclaw/workspace}"
+OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
 CREDS="${CHAD_CREDENTIALS:-/sandbox/.nemoclaw/credentials.json}"
+WORKSPACE_FILES_LIST="${CHAD_WORKSPACE_FILES_LIST:-/usr/local/share/chad/chad-workspace-files.txt}"
 
 log()  { echo "[restore] $*"; }
 warn() { echo "[restore] $*" >&2; }
@@ -72,17 +74,73 @@ cp -a "$tmp_dir/state/workspace/." "$WORKSPACE/"
 count="$(find "$tmp_dir/state/workspace" -type f | wc -l | tr -d ' ')"
 log "Restored ${count} files to ${WORKSPACE}"
 
-# Restore queue/tasks.jsonl and budget.json if present.
-QUEUE_FILE="${CHAD_QUEUE_FILE:-/sandbox/.openclaw-data/queue/tasks.jsonl}"
-BUDGET_FILE="${CHAD_BUDGET_FILE:-/sandbox/.openclaw-data/budget.json}"
-if [ -f "$tmp_dir/state/queue/tasks.jsonl" ]; then
-  mkdir -p "$(dirname "$QUEUE_FILE")"
-  cp "$tmp_dir/state/queue/tasks.jsonl" "$QUEUE_FILE"
-  log "Restored task queue ($(wc -l < "$QUEUE_FILE") entries)"
+# Restore [runtime] files and [runtime-dirs] from the manifest. Mirrors
+# what chad-backup-to-github.sh wrote: repo paths preserve their relative
+# dir prefix under /sandbox/.openclaw-data/.
+#
+# Falls back to the original two-file restore (queue/tasks.jsonl + queue/budget.json)
+# if the manifest is missing or has no [runtime] section.
+RUNTIME_FILES=()
+RUNTIME_DIRS=()
+if [ -r "$WORKSPACE_FILES_LIST" ]; then
+  current_section=""
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line//[$'\t\r\n']/}"
+    line="${line## }"; line="${line%% }"
+    [ -z "$line" ] && continue
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      current_section="${BASH_REMATCH[1]}"
+      continue
+    fi
+    case "$current_section" in
+      runtime)      RUNTIME_FILES+=("$line") ;;
+      runtime-dirs) RUNTIME_DIRS+=("${line%/}") ;;
+    esac
+  done < "$WORKSPACE_FILES_LIST"
 fi
-if [ -f "$tmp_dir/state/queue/budget.json" ]; then
-  cp "$tmp_dir/state/queue/budget.json" "$BUDGET_FILE"
-  log "Restored budget.json"
+if [ "${#RUNTIME_FILES[@]}" -eq 0 ]; then
+  RUNTIME_FILES=(queue/tasks.jsonl queue/budget.json)
+fi
+
+mkdir -p "$OPENCLAW_DATA"
+restored_runtime=0
+for f in "${RUNTIME_FILES[@]}"; do
+  src="$tmp_dir/state/${f}"
+  dst="${OPENCLAW_DATA}/${f}"
+  if [ -f "$src" ]; then
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+    restored_runtime=$((restored_runtime + 1))
+    log "Restored ${f}"
+  fi
+done
+
+restored_runtime_dirs=0
+for d in "${RUNTIME_DIRS[@]}"; do
+  src="$tmp_dir/state/${d}"
+  dst="${OPENCLAW_DATA}/${d}"
+  if [ -d "$src" ]; then
+    mkdir -p "$dst"
+    cp -a "$src/." "$dst/"
+    restored_runtime_dirs=$((restored_runtime_dirs + 1))
+    log "Restored ${d}/ (recursive)"
+  fi
+done
+
+[ "$restored_runtime" -gt 0 ] && log "Runtime files restored: $restored_runtime"
+[ "$restored_runtime_dirs" -gt 0 ] && log "Runtime dirs restored: $restored_runtime_dirs"
+
+# Reload cron jobs into the running gateway. Restoring cron/jobs.json to disk
+# is necessary but NOT sufficient — the gateway holds the in-memory list and
+# was already running with an empty list when restore happened. chad-cron-reload
+# diffs the two and re-registers any missing entries.
+if [ -f "${OPENCLAW_DATA}/cron/jobs.json" ] && command -v chad-cron-reload >/dev/null 2>&1; then
+  if chad-cron-reload 2>&1; then
+    log "Cron jobs reloaded into gateway"
+  else
+    warn "chad-cron-reload exited non-zero — cron jobs may not be active until next gateway restart"
+  fi
 fi
 
 # Import brain pages if gbrain is available and brain/ directory has .md files.

@@ -25,7 +25,7 @@ status: published
 Workspace files define your agent's personality, memory, and user context.
 They persist across sandbox restarts but are **permanently deleted** when you run `nemoclaw <name> destroy`.
 
-This guide covers four backup mechanisms; pick the one that matches the failure you're protecting against.
+This guide covers five backup mechanisms; pick the one that matches the failure you're protecting against.
 
 ## Pick the right mechanism
 
@@ -34,11 +34,58 @@ This guide covers four backup mechanisms; pick the one that matches the failure 
 | `nemoclaw <name> snapshot` | Pre-destroy or pre-rebuild snapshot, fastest path | Manual / before destroy | `~/.nemoclaw/rebuild-backups/<name>/` (host) |
 | `scripts/backup-workspace.sh` | Cross-host migration, manifest-gap workaround, explicit file-list | Manual | `~/.nemoclaw/backups/<timestamp>/` (host) |
 | `scripts/backup-host.sh` | Host laptop dies — onboard config, sandbox metadata, draft policies | Manual | `~/.nemoclaw/backups/host/<timestamp>/` (host) |
-| `chad-backup-to-github.sh` (cron, Chad agent only) | Sandbox dies but the host is fine — continuous remote durability | Every 6h | `tantodefi/chad-state` GitHub repo |
+| `chad-backup-to-github.sh` (cron, Chad agent only) | Sandbox dies but the host is fine — continuous remote durability | Every 6h | `tantodefi/chad-state` GitHub repo (private) |
+| `npm run chad:sync` / `scripts/chad-sync.sh` | One-command orchestrator: dump + push + cron audit | Manual / on-demand | Local dump + GitHub state repo |
 
-**Rule of thumb:** for everyday "I'm about to destroy", use `nemoclaw snapshot`. The two `scripts/backup-*.sh` helpers cover layers `snapshot` does not (host config, an explicit file-list for migrations between hosts running different agent manifests). The cron-driven GitHub backup is Chad-specific and runs unattended.
+**Rule of thumb:** for everyday "I'm about to destroy", use `nemoclaw snapshot`. For Chad specifically, `chad-sync` is the single command that wraps the dump, the GitHub push, and a cron-disk-vs-memory audit — use it before any pod reset and any time you've made meaningful changes you want durably stored. The two `scripts/backup-*.sh` helpers cover layers `snapshot` does not (host config, explicit file-list migrations).
 
-The workspace file list backed up by `backup-workspace.sh` and `chad-backup-to-github.sh` is canonical at `scripts/chad-workspace-files.txt` — both scripts read it, so adding `MY-NEW-FILE.md` there makes it automatically round-trip through both.
+The state list backed up by `backup-workspace.sh` and `chad-backup-to-github.sh` is canonical at `scripts/chad-workspace-files.txt`, which uses a [sectioned manifest format](workspace-files.md#sectioned-manifest). Both scripts read it, so adding `MY-NEW-FILE.md` (or a runtime path under `[runtime]`) makes it automatically round-trip through both.
+
+## chad-sync — one-command snapshot orchestrator
+
+`scripts/chad-sync.sh` (also exposed as `npm run chad:sync`) wraps the four moving parts of Chad's persistence pipeline into a single idempotent command:
+
+1. **Local triage dump** — `chad-dump-state` snapshot saved to `~/.nemoclaw/dumps/state-<sandbox>-<timestamp>.md`. Local-only, never pushed; useful for diffing across resets.
+2. **Push to chad-state** — runs `chad-backup-to-github` inside the sandbox, which pushes everything in the manifest's `[workspace]`, `[runtime]`, `[runtime-dirs]` sections plus the gbrain export.
+3. **Cron audit** — compares cron jobs on disk (`cron/jobs.json`) against the gateway's in-memory list. A mismatch is the failure mode that silently dropped six cron jobs after a pod restart; surfacing it inline lets you run `ssh openshell-chad chad-cron-reload` to fix it without hunting.
+4. **Summary** — file counts, dump path, and any errors.
+
+```console
+$ npm run chad:sync
+==> chad-sync starting (sandbox='chad', state-repo='tantodefi/chad-state')
+    ✓ ssh reachable
+==> Capturing local triage dump
+    ✓ dump saved → ~/.nemoclaw/dumps/state-chad-20260429T144500Z.md (218 lines)
+==> Pushing state to tantodefi/chad-state
+    ✓ Pushed 14 files, skipped 11 unchanged, 0 errors
+==> Auditing cron jobs (disk vs gateway memory)
+    ✓ cron jobs: 6 on disk = 6 in gateway
+==> Sync complete
+```
+
+Useful flags:
+
+```console
+$ npm run chad:sync:dry              # show what would run, no remote calls
+$ bash scripts/chad-sync.sh --no-dump  # skip the local dump (faster)
+$ bash scripts/chad-sync.sh --sandbox foo  # target a non-default sandbox name
+```
+
+## Restore: cold boot from chad-state
+
+`chad-setup.sh` runs `chad-restore-from-github` automatically when no local backup is found in `~/.nemoclaw/backups/`. The restore script reads the same sectioned manifest as backup, so anything backed up rounds-trips back: workspace markdown, `memory/`, queue files, runtime state files, and the runtime directories.
+
+After restoring `cron/jobs.json` to disk, the gateway's in-memory list is still empty — restoration to disk is necessary but not sufficient. The script then calls `chad-cron-reload`, which diffs `jobs.json` against `openclaw cron list --json` and re-registers any missing entries via `openclaw cron add`. Without this step, the sandbox boots back up with cron disabled silently.
+
+If you ever observe "0 jobs in gateway, N on disk" without doing a full restore, run the helper directly:
+
+```console
+$ ssh openshell-chad 'chad-cron-reload'
+[cron-reload] added: email-check
+[cron-reload] added: workspace-backup
+…
+[cron-reload] added=6 skipped=0 errors=0
+```
 
 ## When to Back Up
 

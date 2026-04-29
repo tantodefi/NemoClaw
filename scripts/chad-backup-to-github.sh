@@ -25,6 +25,7 @@ set -euo pipefail
 REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
 BRANCH="${CHAD_STATE_BRANCH:-main}"
 WORKSPACE="${CHAD_WORKSPACE:-/sandbox/.openclaw/workspace}"
+OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
 CREDS="${CHAD_CREDENTIALS:-/sandbox/.nemoclaw/credentials.json}"
 
 log()  { echo "[backup] $*"; }
@@ -117,29 +118,58 @@ push_file() {
   fi
 }
 
-# Top-level workspace files. Canonical list at
-# /usr/local/share/chad/chad-workspace-files.txt (deployed by chad-setup.sh
-# from scripts/chad-workspace-files.txt — same file the host-side
-# backup-workspace.sh reads). Falls back to a hardcoded list if missing.
+# Sectioned manifest at /usr/local/share/chad/chad-workspace-files.txt
+# (deployed by chad-setup.sh from scripts/chad-workspace-files.txt — same
+# file the host-side backup-workspace.sh reads).
+#
+# Sections:
+#   [workspace]    files under $WORKSPACE        → repo path workspace/<rel>
+#   [runtime]      files under $OPENCLAW_DATA    → repo path <rel> (preserves dir prefix)
+#   [runtime-dirs] dirs  under $OPENCLAW_DATA    → recursive, repo path <rel>
+#   [exclude]      documentation only, never backed up
+#
+# Forward-compatible: unknown sections are skipped silently.
 WORKSPACE_FILES_LIST="${CHAD_WORKSPACE_FILES_LIST:-/usr/local/share/chad/chad-workspace-files.txt}"
 WORKSPACE_FILES=()
+RUNTIME_FILES=()
+RUNTIME_DIRS=()
 if [ -r "$WORKSPACE_FILES_LIST" ]; then
+  current_section=""
   while IFS= read -r line; do
+    # Strip comments and whitespace.
     line="${line%%#*}"
-    line="${line//[$'\t\r\n ']/}"
-    [ -n "$line" ] && WORKSPACE_FILES+=("$line")
+    line="${line//[$'\t\r\n']/}"
+    line="${line## }"; line="${line%% }"
+    [ -z "$line" ] && continue
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      current_section="${BASH_REMATCH[1]}"
+      continue
+    fi
+    case "$current_section" in
+      workspace)    WORKSPACE_FILES+=("$line") ;;
+      runtime)      RUNTIME_FILES+=("$line") ;;
+      runtime-dirs) RUNTIME_DIRS+=("${line%/}") ;;
+      exclude|"")   : ;;
+      *)            : ;;  # unknown section — forward-compat skip
+    esac
   done < "$WORKSPACE_FILES_LIST"
 fi
+# Defaults if manifest is missing or empty (older deployments).
 if [ "${#WORKSPACE_FILES[@]}" -eq 0 ]; then
   WORKSPACE_FILES=(SOUL.md USER.md IDENTITY.md AGENTS.md MEMORY.md HEARTBEAT.md TOOLS.md EMAIL-POLICY.md)
 fi
+if [ "${#RUNTIME_FILES[@]}" -eq 0 ]; then
+  RUNTIME_FILES=(queue/tasks.jsonl queue/budget.json)
+fi
+
+# [workspace] — push under workspace/<file>
 for f in "${WORKSPACE_FILES[@]}"; do
   if [ -f "${WORKSPACE}/${f}" ]; then
     push_file "${WORKSPACE}/${f}" "workspace/${f}"
   fi
 done
 
-# Memory directory (recursive)
+# Memory directory (recursive). Always backed up, not listed in manifest.
 if [ -d "${WORKSPACE}/memory" ]; then
   while IFS= read -r -d '' file; do
     rel="${file#${WORKSPACE}/}"
@@ -147,16 +177,25 @@ if [ -d "${WORKSPACE}/memory" ]; then
   done < <(find "${WORKSPACE}/memory" -type f -print0)
 fi
 
-# Sub-agent queue and budget — push the task ledger and token budget so the
-# orchestration state survives sandbox resets alongside memory.
-QUEUE_FILE="${CHAD_QUEUE_FILE:-/sandbox/.openclaw-data/queue/tasks.jsonl}"
-BUDGET_FILE="${CHAD_BUDGET_FILE:-/sandbox/.openclaw-data/budget.json}"
-if [ -f "$QUEUE_FILE" ]; then
-  push_file "$QUEUE_FILE" "queue/tasks.jsonl"
-fi
-if [ -f "$BUDGET_FILE" ]; then
-  push_file "$BUDGET_FILE" "queue/budget.json"
-fi
+# [runtime] — push individual files under $OPENCLAW_DATA. Repo path keeps the
+# relative dir prefix (e.g. cron/jobs.json → cron/jobs.json) so the restore
+# script can mirror the structure.
+for f in "${RUNTIME_FILES[@]}"; do
+  if [ -f "${OPENCLAW_DATA}/${f}" ]; then
+    push_file "${OPENCLAW_DATA}/${f}" "${f}"
+  fi
+done
+
+# [runtime-dirs] — recursively push directories under $OPENCLAW_DATA.
+for d in "${RUNTIME_DIRS[@]}"; do
+  src_dir="${OPENCLAW_DATA}/${d}"
+  if [ -d "$src_dir" ]; then
+    while IFS= read -r -d '' file; do
+      rel="${file#${OPENCLAW_DATA}/}"
+      push_file "$file" "${rel}"
+    done < <(find "$src_dir" -type f -print0)
+  fi
+done
 
 # GBrain export — export all pages as markdown and push to brain/ in the state repo.
 # gbrain export writes one .md file per page; we push each via push_file (sha-checked,

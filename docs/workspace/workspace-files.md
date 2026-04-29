@@ -36,6 +36,58 @@ These files live at `/sandbox/.openclaw/workspace/` and are collectively called 
 | `MEMORY.md` | Curated long-term memory distilled from daily notes. |
 | `memory/` | Directory of daily note files (`YYYY-MM-DD.md`) for session continuity. |
 
+### Runtime state (Chad agent)
+
+The Chad agent persists additional orchestration state under `/sandbox/.openclaw-data/`. This is separate from the workspace files above — workspace defines *who Chad is*; runtime state captures *what Chad has scheduled or recently decided*.
+
+| Path | Purpose |
+|---|---|
+| `cron/jobs.json` | Registered cron jobs (email-check, workspace-backup, gbrain-dream, etc.). The gateway reads this at startup; loss of this file silently empties the schedule. |
+| `auto-actions.json` | Action-gate state: per-channel daily counters and the kill-switch. |
+| `exec-approvals.json` | Approved-exec list — decisions made by `chad-action-gate` that persist across restarts. |
+| `queue/tasks.jsonl` | Sub-agent task ledger. |
+| `queue/budget.json` | Token budget across cron tasks. |
+| `agents/`, `flows/`, `hooks/` | Custom agent registrations, workflow definitions, and hook configs added at runtime. |
+
+These are tracked alongside workspace files in the [sectioned manifest](#sectioned-manifest) below so backup tooling round-trips them automatically.
+
+(sectioned-manifest)=
+## Sectioned Manifest
+
+`scripts/chad-workspace-files.txt` is the single source of truth for what backup tooling round-trips. It uses a sectioned format that both `chad-backup-to-github.sh` and `chad-restore-from-github.sh` parse:
+
+```
+[workspace]                  ← persona prose under /sandbox/.openclaw/workspace/
+SOUL.md
+USER.md
+…
+
+[runtime]                    ← orchestration state under /sandbox/.openclaw-data/
+cron/jobs.json
+auto-actions.json
+exec-approvals.json
+queue/tasks.jsonl
+queue/budget.json
+
+[runtime-dirs]               ← recursive directories under /sandbox/.openclaw-data/
+agents/
+flows/
+hooks/
+
+[exclude]                    ← documentation only — never backed up
+identity/                    # device keypair + operator tokens (regenerable, sensitive)
+devices/                     # paired peer tokens
+credentials/                 # bearer token cache
+subagents/, logs/            # ephemeral
+gbrain/                      # PGLite raw — backed up via `gbrain export` instead
+```
+
+Adding new state to track? Append it under `[runtime]` (single file) or `[runtime-dirs]` (recursive directory), then re-run `scripts/chad-setup.sh` to redeploy the manifest. Both backup scripts pick it up on the next invocation — no script edits needed.
+
+### Why `identity/` is in `[exclude]`
+
+The directory `/sandbox/.openclaw-data/identity/` holds the device's Ed25519 signing keypair and operator bearer tokens — not persona data. Persona prose lives in `[workspace]`. Backing up the keypair would (a) leak a long-lived signing key into git history, even in a private repo, and (b) cause identity collisions if two sandboxes restored from the same snapshot. OpenShell regenerates the keypair on first boot via device pairing.
+
 ## Where They Live
 
 All workspace files reside inside the sandbox filesystem:
