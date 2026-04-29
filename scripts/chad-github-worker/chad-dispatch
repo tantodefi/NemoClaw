@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Submit a job to the GitHub Actions worker via the chad-state repo.
+# Runs inside the Chad sandbox (requires gh CLI authenticated as supachad).
+#
+# Usage:
+#   chad-dispatch --kind research --prompt "Summarize X"
+#   chad-dispatch --kind draft --prompt "Write a reply to..." --context "$(cat /tmp/email.txt)"
+#   chad-dispatch --kind triage --prompt "Review these issues" --model claude-haiku-4-5-20251001
+#   chad-dispatch --list          # list recent jobs
+#   chad-dispatch --collect        # collect completed results into today's memory
+
+set -euo pipefail
+
+REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
+MODEL="${CHAD_DISPATCH_MODEL:-claude-haiku-4-5-20251001}"
+MAX_TOKENS="${CHAD_DISPATCH_MAX_TOKENS:-4096}"
+TODAY_UTC=$(date -u +%Y-%m-%d)
+MEMORY_FILE="/sandbox/.openclaw/workspace/memory/${TODAY_UTC}.md"
+
+usage() {
+  echo "Usage: chad-dispatch --kind <kind> --prompt <text> [options]"
+  echo ""
+  echo "Kinds: research | draft | triage | analysis | custom"
+  echo ""
+  echo "Options:"
+  echo "  --kind <kind>         Job kind (required)"
+  echo "  --prompt <text>       Task prompt (required)"
+  echo "  --context <text>      Additional context"
+  echo "  --model <model>       Model override (default: $MODEL)"
+  echo "  --max-tokens <n>      Max output tokens (default: $MAX_TOKENS)"
+  echo "  --list                List recent jobs (pending + completed)"
+  echo "  --collect             Collect completed results into today's memory"
+  exit 1
+}
+
+list_jobs() {
+  echo "=== Pending ==="
+  gh api "repos/${REPO}/contents/jobs/pending" --jq '.[].name' 2>/dev/null | sed 's/.json$//' || echo "(none)"
+  echo ""
+  echo "=== Completed (last 5) ==="
+  gh api "repos/${REPO}/contents/jobs/completed" --jq '.[].name' 2>/dev/null | sort -r | head -5 | sed 's/.json$//' || echo "(none)"
+}
+
+collect_results() {
+  echo "Collecting completed jobs..."
+  completed=$(gh api "repos/${REPO}/contents/jobs/completed" --jq '.[].name' 2>/dev/null | grep -v '^$' || true)
+
+  if [ -z "$completed" ]; then
+    echo "No completed jobs."
+    return
+  fi
+
+  {
+    echo ""
+    echo "## GitHub Worker Results ($(date -u +%H:%M UTC))"
+  } >> "$MEMORY_FILE"
+
+  count=0
+  for filename in $completed; do
+    job_id="${filename%.json}"
+    result=$(gh api "repos/${REPO}/contents/jobs/completed/${filename}" \
+      --jq '.content' | base64 -d | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(f\"### {d['spec']['kind']}: {job_id}\")
+print(f\"Prompt: {d['spec']['prompt'][:120]}\")
+print(f\"Tokens: {d.get('tokens',{}).get('input',0)} in / {d.get('tokens',{}).get('output',0)} out\")
+print()
+print(d['result'])
+print()
+" 2>/dev/null)
+
+    echo "$result" >> "$MEMORY_FILE"
+
+    # Archive to jobs/archived to avoid re-collecting
+    content=$(gh api "repos/${REPO}/contents/jobs/completed/${filename}" --jq '.content')
+    sha=$(gh api "repos/${REPO}/contents/jobs/completed/${filename}" --jq '.sha')
+    gh api "repos/${REPO}/contents/jobs/archived/${filename}" \
+      --method PUT \
+      --field message="chore(jobs): archive ${job_id}" \
+      --field "content=${content}" \
+      --field branch=main > /dev/null 2>&1
+    gh api "repos/${REPO}/contents/jobs/completed/${filename}" \
+      --method DELETE \
+      --field message="chore(jobs): collect ${job_id}" \
+      --field "sha=${sha}" \
+      --field branch=main > /dev/null 2>&1
+
+    count=$((count + 1))
+    echo "  collected: $job_id"
+  done
+
+  echo "Collected $count job(s) into $MEMORY_FILE"
+}
+
+# --- Argument parsing ---
+
+if [ $# -eq 0 ]; then usage; fi
+
+KIND=""
+PROMPT=""
+CONTEXT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kind)       KIND="$2";    shift 2 ;;
+    --prompt)     PROMPT="$2";  shift 2 ;;
+    --context)    CONTEXT="$2"; shift 2 ;;
+    --model)      MODEL="$2";   shift 2 ;;
+    --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
+    --list)       list_jobs; exit 0 ;;
+    --collect)    collect_results; exit 0 ;;
+    *) echo "Unknown option: $1"; usage ;;
+  esac
+done
+
+if [ -z "$KIND" ] || [ -z "$PROMPT" ]; then
+  echo "Error: --kind and --prompt are required"
+  usage
+fi
+
+# --- Submit job ---
+
+JOB_ID="job-${TODAY_UTC}-$(date -u +%H%M%S)-$(openssl rand -hex 3)"
+
+spec=$(python3 -c "
+import json, sys
+spec = {
+    'id': '${JOB_ID}',
+    'kind': '${KIND}',
+    'created_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+    'prompt': sys.argv[1],
+    'context': sys.argv[2],
+    'model': '${MODEL}',
+    'max_tokens': ${MAX_TOKENS}
+}
+print(json.dumps(spec, indent=2))
+" "$PROMPT" "$CONTEXT")
+
+encoded=$(echo "$spec" | base64)
+
+gh api "repos/${REPO}/contents/jobs/pending/${JOB_ID}.json" \
+  --method PUT \
+  --field message="job: submit ${KIND} ${JOB_ID}" \
+  --field "content=${encoded}" \
+  --field branch=main > /dev/null
+
+echo "Dispatched: $JOB_ID"
+echo "Kind:       $KIND"
+echo "Model:      $MODEL"
+echo "Repo:       https://github.com/${REPO}/actions"
+echo ""
+echo "Check status: chad-dispatch --list"
+echo "Collect when done: chad-dispatch --collect"

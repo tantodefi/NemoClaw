@@ -1,0 +1,132 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copy this file to tantodefi/chad-state/.github/workflows/chad-jobs.yml
+#
+# Required GitHub secrets (Settings → Secrets → Actions):
+#   ANTHROPIC_API_KEY   — Claude API key for job processing
+#
+# Optional secrets:
+#   NVIDIA_API_KEY      — for routing heavy jobs to NVIDIA endpoints
+
+name: Chad Job Processor
+
+on:
+  push:
+    paths:
+      - "jobs/pending/*.json"
+  schedule:
+    # Sweep every 30 min in case a push trigger was missed
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for pending jobs
+        id: check
+        run: |
+          count=$(ls jobs/pending/*.json 2>/dev/null | wc -l | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Pending jobs: $count"
+
+      - name: Process jobs
+        if: steps.check.outputs.count > 0
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p jobs/completed jobs/failed
+
+          for job_file in jobs/pending/*.json; do
+            [ -f "$job_file" ] || continue
+            job_id=$(basename "$job_file" .json)
+            echo "--- Processing $job_id ---"
+
+            kind=$(jq -r '.kind' "$job_file")
+            prompt=$(jq -r '.prompt' "$job_file")
+            context=$(jq -r '.context // ""' "$job_file")
+            model=$(jq -r '.model // "claude-haiku-4-5-20251001"' "$job_file")
+            max_tokens=$(jq -r '.max_tokens // 4096' "$job_file")
+
+            # Build full prompt with context
+            full_prompt="$prompt"
+            if [ -n "$context" ] && [ "$context" != "null" ]; then
+              full_prompt="Context:\n$context\n\nTask:\n$prompt"
+            fi
+
+            # Call Anthropic API
+            started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            http_code=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+              https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "$(jq -n \
+                --arg model "$model" \
+                --argjson max_tokens "$max_tokens" \
+                --arg prompt "$full_prompt" \
+                '{model: $model, max_tokens: $max_tokens, messages: [{role: "user", content: $prompt}]}')")
+
+            completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+            if [ "$http_code" = "200" ]; then
+              result_text=$(jq -r '.content[0].text' /tmp/api_response.json)
+              input_tokens=$(jq -r '.usage.input_tokens' /tmp/api_response.json)
+              output_tokens=$(jq -r '.usage.output_tokens' /tmp/api_response.json)
+
+              # Write completed result
+              jq -n \
+                --slurpfile spec "$job_file" \
+                --arg result "$result_text" \
+                --arg started_at "$started_at" \
+                --arg completed_at "$completed_at" \
+                --argjson input_tokens "$input_tokens" \
+                --argjson output_tokens "$output_tokens" \
+                --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                '{
+                  spec: $spec[0],
+                  status: "completed",
+                  started_at: $started_at,
+                  completed_at: $completed_at,
+                  result: $result,
+                  tokens: {input: $input_tokens, output: $output_tokens},
+                  run_url: $run_url
+                }' > "jobs/completed/${job_id}.json"
+
+              rm "$job_file"
+              echo "  ✓ completed ($input_tokens in / $output_tokens out tokens)"
+            else
+              error=$(jq -r '.error.message // "unknown error"' /tmp/api_response.json 2>/dev/null || echo "http $http_code")
+              jq -n \
+                --slurpfile spec "$job_file" \
+                --arg error "$error" \
+                --arg failed_at "$completed_at" \
+                --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                '{
+                  spec: $spec[0],
+                  status: "failed",
+                  failed_at: $failed_at,
+                  error: $error,
+                  run_url: $run_url
+                }' > "jobs/failed/${job_id}.json"
+
+              rm "$job_file"
+              echo "  ✗ failed: $error"
+            fi
+          done
+
+      - name: Commit results
+        if: steps.check.outputs.count > 0
+        run: |
+          git config user.name "supachad"
+          git config user.email "supachad@users.noreply.github.com"
+          git add jobs/
+          git diff --cached --quiet || git commit -m "chore(jobs): process $(ls jobs/completed/ jobs/failed/ 2>/dev/null | wc -l | tr -d ' ') job(s) [skip ci]"
+          git push
