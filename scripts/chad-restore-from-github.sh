@@ -85,19 +85,34 @@ if [ -f "$tmp_dir/state/queue/budget.json" ]; then
   log "Restored budget.json"
 fi
 
-# Import brain pages if gbrain is available and brain/pages.ndjson exists.
-GBRAIN_DIR="${GBRAIN_DIR:-/sandbox/.openclaw-data/gbrain}"
-if [ -f "$tmp_dir/state/brain/pages.ndjson" ] && command -v gbrain >/dev/null 2>&1; then
-  page_count="$(wc -l < "$tmp_dir/state/brain/pages.ndjson" | tr -d ' ')"
-  log "Importing ${page_count} brain pages from chad-state"
-  # gbrain import reads NDJSON from stdin; --skip-existing avoids re-importing
-  # pages that were already in the brain from a partial prior restore.
-  if gbrain import --skip-existing < "$tmp_dir/state/brain/pages.ndjson" 2>/dev/null; then
-    log "Brain import complete"
+# Import brain pages if gbrain is available and brain/ directory has .md files.
+# --no-embed skips re-embedding (embeddings are rebuilt lazily on first query if
+# the inference endpoint is available). Stops gbrain serve if running, imports,
+# then restarts it.
+if [ -d "$tmp_dir/state/brain" ] && command -v gbrain >/dev/null 2>&1; then
+  page_count="$(find "$tmp_dir/state/brain" -name '*.md' | wc -l | tr -d ' ')"
+  if [ "$page_count" -gt 0 ]; then
+    log "Importing ${page_count} brain pages from chad-state"
+    GBRAIN_SERVE_PID="$(pgrep -f 'gbrain.*serve' | head -1 || true)"
+    if [ -n "$GBRAIN_SERVE_PID" ]; then
+      kill "$GBRAIN_SERVE_PID" 2>/dev/null
+      for _ in 1 2 3 4 5; do
+        kill -0 "$GBRAIN_SERVE_PID" 2>/dev/null || break; sleep 1
+      done
+    fi
+    if HOME=/sandbox gbrain import "$tmp_dir/state/brain" --no-embed 2>/dev/null; then
+      log "Brain import complete"
+    else
+      warn "Brain import failed — run 'HOME=/sandbox gbrain import brain/ --no-embed' manually"
+    fi
+    if [ -n "$GBRAIN_SERVE_PID" ]; then
+      HOME=/sandbox nohup gbrain serve >/dev/null 2>&1 &
+      log "gbrain serve restarted"
+    fi
   else
-    warn "Brain import failed — brain may be empty; run 'gbrain init' and retry"
+    log "No brain/*.md files in chad-state — skipping brain restore"
   fi
 else
-  [ ! -f "$tmp_dir/state/brain/pages.ndjson" ] && log "No brain/pages.ndjson in chad-state — skipping brain restore"
-  ! command -v gbrain >/dev/null 2>&1 && warn "gbrain not found — brain restore skipped (image may need rebuild)"
+  [ ! -d "$tmp_dir/state/brain" ] && log "No brain/ in chad-state — skipping brain restore"
+  ! command -v gbrain >/dev/null 2>&1 && warn "gbrain not found — brain restore skipped"
 fi

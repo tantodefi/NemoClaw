@@ -117,8 +117,23 @@ push_file() {
   fi
 }
 
-# Top-level workspace files
-for f in SOUL.md USER.md IDENTITY.md AGENTS.md MEMORY.md; do
+# Top-level workspace files. Canonical list at
+# /usr/local/share/chad/chad-workspace-files.txt (deployed by chad-setup.sh
+# from scripts/chad-workspace-files.txt — same file the host-side
+# backup-workspace.sh reads). Falls back to a hardcoded list if missing.
+WORKSPACE_FILES_LIST="${CHAD_WORKSPACE_FILES_LIST:-/usr/local/share/chad/chad-workspace-files.txt}"
+WORKSPACE_FILES=()
+if [ -r "$WORKSPACE_FILES_LIST" ]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line//[$'\t\r\n ']/}"
+    [ -n "$line" ] && WORKSPACE_FILES+=("$line")
+  done < "$WORKSPACE_FILES_LIST"
+fi
+if [ "${#WORKSPACE_FILES[@]}" -eq 0 ]; then
+  WORKSPACE_FILES=(SOUL.md USER.md IDENTITY.md AGENTS.md MEMORY.md HEARTBEAT.md TOOLS.md EMAIL-POLICY.md)
+fi
+for f in "${WORKSPACE_FILES[@]}"; do
   if [ -f "${WORKSPACE}/${f}" ]; then
     push_file "${WORKSPACE}/${f}" "workspace/${f}"
   fi
@@ -143,20 +158,40 @@ if [ -f "$BUDGET_FILE" ]; then
   push_file "$BUDGET_FILE" "queue/budget.json"
 fi
 
-# GBrain export — dump all pages as NDJSON and push to brain/ in the state repo.
-# gbrain export writes one JSON object per line (page id, content, metadata).
-# Kept separate from workspace/ so the restore script can re-import selectively.
-# Falls back gracefully if gbrain is not installed or the brain is empty.
-GBRAIN_DIR="${GBRAIN_DIR:-/sandbox/.openclaw-data/gbrain}"
-if command -v gbrain >/dev/null 2>&1 && [ -d "$GBRAIN_DIR" ]; then
-  brain_export="$(mktemp /tmp/brain-export-XXXXXX.ndjson)"
-  if gbrain export --format ndjson > "$brain_export" 2>/dev/null && [ -s "$brain_export" ]; then
-    push_file "$brain_export" "brain/pages.ndjson"
-    log "Brain export: $(wc -l < "$brain_export") pages pushed"
-  else
-    log "Brain export: empty or export unavailable — skipped"
+# GBrain export — export all pages as markdown and push to brain/ in the state repo.
+# gbrain export writes one .md file per page; we push each via push_file (sha-checked,
+# so subsequent runs skip unchanged pages). The serve process holds the PGLite lock, so
+# we stop it briefly, export, then restart it.
+GBRAIN_DATA="${GBRAIN_DATA:-/sandbox/.gbrain}"
+GBRAIN_SERVE_PID="$(pgrep -f 'gbrain.*serve' | head -1 || true)"
+if command -v gbrain >/dev/null 2>&1 && [ -d "$GBRAIN_DATA" ]; then
+  brain_export_dir="$(mktemp -d /tmp/brain-export-XXXXXX)"
+  if [ -n "$GBRAIN_SERVE_PID" ]; then
+    kill "$GBRAIN_SERVE_PID" 2>/dev/null
+    # give the process a moment to release the lock
+    for _ in 1 2 3 4 5; do
+      kill -0 "$GBRAIN_SERVE_PID" 2>/dev/null || break
+      sleep 1
+    done
   fi
-  rm -f "$brain_export"
+  if HOME=/sandbox gbrain export --dir "$brain_export_dir" 2>/dev/null; then
+    page_count="$(find "$brain_export_dir" -name '*.md' | wc -l | tr -d ' ')"
+    log "Brain export: $page_count pages"
+    if [ "$page_count" -gt 0 ]; then
+      while IFS= read -r -d '' md_file; do
+        rel="${md_file#${brain_export_dir}/}"
+        push_file "$md_file" "brain/${rel}"
+      done < <(find "$brain_export_dir" -name '*.md' -print0)
+    fi
+  else
+    warn "Brain export failed — skipped"
+  fi
+  rm -rf "$brain_export_dir"
+  # Restart gbrain serve
+  if [ -n "$GBRAIN_SERVE_PID" ]; then
+    HOME=/sandbox nohup gbrain serve >/dev/null 2>&1 &
+    log "gbrain serve restarted (PID $!)"
+  fi
 fi
 
 log "Pushed ${count} files, skipped ${skipped} unchanged, ${errors} errors"

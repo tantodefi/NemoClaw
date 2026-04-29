@@ -7,8 +7,24 @@ set -euo pipefail
 WORKSPACE_PATH="/sandbox/.openclaw/workspace"
 SKILLS_PATH="/sandbox/.openclaw-data/skills"
 BACKUP_BASE="${HOME}/.nemoclaw/backups"
-FILES=(SOUL.md USER.md IDENTITY.md AGENTS.md MEMORY.md)
 DIRS=(memory)
+
+# Workspace file list — canonical source is scripts/chad-workspace-files.txt
+# next to this script. Falls back to a hardcoded list if the file is missing
+# (e.g. running from a partial checkout). Both this script and the in-sandbox
+# chad-backup-to-github.sh read the same file so the lists can never drift.
+FILES_LIST="${BACKUP_FILES_LIST:-$(dirname "$0")/chad-workspace-files.txt}"
+FILES=()
+if [ -r "$FILES_LIST" ]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line//[$'\t\r\n ']/}"
+    [ -n "$line" ] && FILES+=("$line")
+  done < "$FILES_LIST"
+fi
+if [ "${#FILES[@]}" -eq 0 ]; then
+  FILES=(SOUL.md USER.md IDENTITY.md AGENTS.md MEMORY.md HEARTBEAT.md TOOLS.md EMAIL-POLICY.md)
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

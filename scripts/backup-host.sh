@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Back up ~/.nemoclaw/ host-side state (credentials, session, sandboxes, tmp/).
+# Back up ~/.nemoclaw/ host-side state (session, sandboxes, config, tmp/).
 # Companion to backup-workspace.sh which handles in-sandbox files.
 
 set -euo pipefail
@@ -31,7 +31,6 @@ Commands:
 Backup location: ${BACKUP_BASE}/<timestamp>/
 
 Files backed up:
-  credentials.json      API keys and service credentials
   onboard-session.json  Onboard wizard state and progress
   sandboxes.json        Sandbox metadata and policy mappings
   config.json           Inference provider/model/endpoint config
@@ -54,8 +53,8 @@ do_backup() {
 
   local count=0
 
-  # --- Critical config files ---
-  for f in credentials.json onboard-session.json sandboxes.json config.json; do
+  # --- Critical config files (credentials.json excluded — stays localhost-only) ---
+  for f in onboard-session.json sandboxes.json config.json; do
     if [ -f "${NEMOCLAW_HOME}/${f}" ]; then
       cp -p "${NEMOCLAW_HOME}/${f}" "${dest}/"
       count=$((count + 1))
@@ -139,15 +138,12 @@ do_restore() {
 
   local count=0
 
-  for f in credentials.json onboard-session.json sandboxes.json config.json; do
+  for f in onboard-session.json sandboxes.json config.json; do
     if [ -f "${src}/${f}" ]; then
       cp -p "${src}/${f}" "${NEMOCLAW_HOME}/${f}"
       count=$((count + 1))
     fi
   done
-
-  # Fix credentials permissions
-  [ -f "${NEMOCLAW_HOME}/credentials.json" ] && chmod 600 "${NEMOCLAW_HOME}/credentials.json"
 
   if [ -d "${src}/state" ]; then
     cp -rp "${src}/state" "${NEMOCLAW_HOME}/state"

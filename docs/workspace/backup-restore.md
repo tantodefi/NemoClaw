@@ -23,7 +23,20 @@ status: published
 Workspace files define your agent's personality, memory, and user context.
 They persist across sandbox restarts but are **permanently deleted** when you run `nemoclaw <name> destroy`.
 
-This guide covers snapshot commands, manual backup with CLI commands, and an automated script.
+This guide covers four backup mechanisms; pick the one that matches the failure you're protecting against.
+
+## Pick the right mechanism
+
+| Mechanism | Recovery scenario | Cadence | Storage |
+|---|---|---|---|
+| `nemoclaw <name> snapshot` | Pre-destroy or pre-rebuild snapshot, fastest path | Manual / before destroy | `~/.nemoclaw/rebuild-backups/<name>/` (host) |
+| `scripts/backup-workspace.sh` | Cross-host migration, manifest-gap workaround, explicit file-list | Manual | `~/.nemoclaw/backups/<timestamp>/` (host) |
+| `scripts/backup-host.sh` | Host laptop dies — onboard config, sandbox metadata, draft policies | Manual | `~/.nemoclaw/backups/host/<timestamp>/` (host) |
+| `chad-backup-to-github.sh` (cron, Chad agent only) | Sandbox dies but the host is fine — continuous remote durability | Every 6h | `tantodefi/chad-state` GitHub repo |
+
+**Rule of thumb:** for everyday "I'm about to destroy", use `nemoclaw snapshot`. The two `scripts/backup-*.sh` helpers cover layers `snapshot` does not (host config, an explicit file-list for migrations between hosts running different agent manifests). The cron-driven GitHub backup is Chad-specific and runs unattended.
+
+The workspace file list backed up by `backup-workspace.sh` and `chad-backup-to-github.sh` is canonical at `scripts/chad-workspace-files.txt` — both scripts read it, so adding `MY-NEW-FILE.md` there makes it automatically round-trip through both.
 
 ## When to Back Up
 
