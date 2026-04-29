@@ -120,9 +120,11 @@ selectFromList(items, options)
 
 describe("policies", () => {
   describe("listPresets", () => {
-    it("returns all 12 presets", () => {
+    it("returns all bundled presets", () => {
       const presets = policies.listPresets();
-      expect(presets.length).toBe(12);
+      // 12 upstream + chad-* and subagent-* additions; expected list below is
+      // the source of truth, this just guards against accidental drops.
+      expect(presets.length).toBeGreaterThanOrEqual(12);
     });
 
     it("each preset has name and description", () => {
@@ -138,18 +140,33 @@ describe("policies", () => {
         .map((p) => p.name)
         .sort();
       const expected = [
+        "agent-browser",
         "brave",
         "brew",
+        "chad-bug-report",
+        "chad-premium",
         "discord",
+        "gbrain",
         "github",
+        "github-tools",
+        "google-workspace",
         "huggingface",
         "jira",
         "local-inference",
         "npm",
+        "openclaw-bundled",
         "outlook",
+        "pi-agent",
+        "proton-calendar",
         "pypi",
+        "session-logs",
         "slack",
+        "subagent-researcher",
+        "subagent-reviewer",
+        "subagent-writer",
+        "summarize",
         "telegram",
+        "whatsapp",
       ];
       expect(names).toEqual(expected);
     });
@@ -215,10 +232,14 @@ describe("policies", () => {
     });
 
     it("every preset has at least one endpoint", () => {
+      // Exception: presets that declare "endpoints: []" (no-network skills like
+      // session-logs) intentionally have zero hosts; the explicit empty array
+      // registers the binary with the gateway without opening egress.
       for (const p of policies.listPresets()) {
         const content = requirePresetContent(policies.loadPreset(p.name));
+        if (/endpoints:\s*\[\s*\]/.test(content)) continue;
         const hosts = policies.getPresetEndpoints(content);
-        expect(hosts.length > 0).toBeTruthy();
+        expect(hosts.length > 0, `preset ${p.name} has no endpoints`).toBeTruthy();
       }
     });
 

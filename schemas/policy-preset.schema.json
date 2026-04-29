@@ -32,8 +32,8 @@
         "name": { "type": "string" },
         "endpoints": {
           "type": "array",
-          "items": { "$ref": "#/$defs/endpoint" },
-          "minItems": 1
+          "description": "Allowed endpoints. Empty array is an explicit 'no-network' scope (e.g. session-logs).",
+          "items": { "$ref": "#/$defs/endpoint" }
         },
         "binaries": {
           "type": "array",

@@ -10,16 +10,10 @@ preset:
   description: "GBrain knowledge brain — host MCP server + NVIDIA embeddings + Anthropic query expansion."
 
 network_policies:
-  gbrain_host_mcp:
-    name: gbrain_host_mcp
-    endpoints:
-      - host: "host.docker.internal"
-        port: 0
-        protocol: rest
-        enforcement: monitor
-        rules:
-          - allow: { method: POST, path: "/mcp/**" }
-          - allow: { method: GET,  path: "/health" }
+  # Note: gbrain is intentionally NOT registered as an MCP server (see
+  # chad-setup.sh comment around step 3a) — PGLite is single-process and
+  # MCP registration causes lock contention. The main agent uses gbrain
+  # via CLI directly, so no host MCP endpoint policy is needed.
 
   gbrain_nvidia_embeddings:
     name: gbrain_nvidia_embeddings

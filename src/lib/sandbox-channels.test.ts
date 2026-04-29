@@ -12,8 +12,8 @@ import {
 } from "../../dist/lib/sandbox-channels";
 
 describe("sandbox-channels KNOWN_CHANNELS", () => {
-  it("covers telegram, discord, and slack", () => {
-    expect(knownChannelNames()).toEqual(["telegram", "discord", "slack"]);
+  it("covers telegram, discord, slack, and whatsapp", () => {
+    expect(knownChannelNames()).toEqual(["telegram", "discord", "slack", "whatsapp"]);
   });
 
   it("exposes the primary bot-token env var for each channel", () => {
@@ -56,9 +56,13 @@ describe("sandbox-channels getChannelTokenKeys", () => {
 describe("sandbox-channels listChannels", () => {
   it("materialises an array with the name merged into each entry", () => {
     const list = listChannels();
-    expect(list.map((c) => c.name)).toEqual(["telegram", "discord", "slack"]);
+    expect(list.map((c) => c.name)).toEqual(["telegram", "discord", "slack", "whatsapp"]);
     const telegram = list.find((c) => c.name === "telegram");
     expect(telegram?.envKey).toBe("TELEGRAM_BOT_TOKEN");
     expect(telegram?.allowIdsMode).toBe("dm");
+    // whatsapp uses creds-mount, not a static envKey
+    const whatsapp = list.find((c) => c.name === "whatsapp");
+    expect(whatsapp?.envKey).toBeNull();
+    expect(whatsapp?.credType).toBe("creds-mount");
   });
 });

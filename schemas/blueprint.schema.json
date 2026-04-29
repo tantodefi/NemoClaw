@@ -95,6 +95,14 @@
               }
             }
           }
+        },
+        "plugins": {
+          "type": "object",
+          "description": "Optional in-sandbox plugins (gbrain, gstack, etc.) installed during chad-setup.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": true
+          }
         }
       }
     }

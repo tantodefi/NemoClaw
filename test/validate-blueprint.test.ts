@@ -286,11 +286,30 @@ describe("base sandbox policy", () => {
     const np = policy.network_policies;
     expect(np && "github" in np).toBe(false);
 
-    // Belt and braces: also assert no endpoint in any base-policy
-    // entry references github.com or api.github.com, so the
-    // regression can't be smuggled in under a renamed key.
-    const githubHosts = findEndpoints((h) => h === "github.com" || h === "api.github.com");
-    expect(githubHosts).toEqual([]);
+    // Belt and braces: also assert no UNSCOPED endpoint in any
+    // base-policy entry references github.com or api.github.com.
+    // An entry is "unscoped" if its containing policy has no
+    // `binaries:` allowlist — otherwise github.com is reachable only
+    // by the listed binary (e.g. go_module_git_sources scopes
+    // github.com to the go binary for module fetches).
+    const unscopedGithubPolicies: string[] = [];
+    if (np) {
+      for (const [key, value] of Object.entries(np)) {
+        const endpoints = value.endpoints;
+        if (!Array.isArray(endpoints)) continue;
+        const hasGithub = endpoints.some(
+          (ep) =>
+            typeof ep.host === "string" &&
+            (ep.host === "github.com" || ep.host === "api.github.com"),
+        );
+        if (!hasGithub) continue;
+        const binaries = value.binaries;
+        if (!Array.isArray(binaries) || binaries.length === 0) {
+          unscopedGithubPolicies.push(key);
+        }
+      }
+    }
+    expect(unscopedGithubPolicies).toEqual([]);
   });
 
   it("regression #1458: baseline npm_registry must not include npm or node binaries", () => {
