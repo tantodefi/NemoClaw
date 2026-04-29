@@ -1,16 +1,28 @@
-// @ts-nocheck
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-function createBuildContextDir(tmpDir = os.tmpdir()) {
+export interface StagedBuildContext {
+  buildCtx: string;
+  stagedDockerfile: string;
+}
+
+export interface BuildContextStats {
+  fileCount: number;
+  totalBytes: number;
+}
+
+function createBuildContextDir(tmpDir: string = os.tmpdir()): string {
   return fs.mkdtempSync(path.join(tmpDir, "nemoclaw-build-"));
 }
 
-function stageLegacySandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
+function stageLegacySandboxBuildContext(
+  rootDir: string,
+  tmpDir: string = os.tmpdir(),
+): StagedBuildContext {
   const buildCtx = createBuildContextDir(tmpDir);
   fs.copyFileSync(path.join(rootDir, "Dockerfile"), path.join(buildCtx, "Dockerfile"));
   fs.cpSync(path.join(rootDir, "nemoclaw"), path.join(buildCtx, "nemoclaw"), { recursive: true });
@@ -23,13 +35,17 @@ function stageLegacySandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
   const protonToolSrc = path.join(rootDir, ".github", "skills", "proton-calendar", "cmd", "proton-tool");
   const protonToolDst = path.join(buildCtx, ".github", "skills", "proton-calendar", "cmd", "proton-tool");
   fs.cpSync(protonToolSrc, protonToolDst, { recursive: true });
+
   return {
     buildCtx,
     stagedDockerfile: path.join(buildCtx, "Dockerfile"),
   };
 }
 
-function stageOptimizedSandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
+function stageOptimizedSandboxBuildContext(
+  rootDir: string,
+  tmpDir: string = os.tmpdir(),
+): StagedBuildContext {
   const buildCtx = createBuildContextDir(tmpDir);
   const stagedDockerfile = path.join(buildCtx, "Dockerfile");
   const sourceNemoclawDir = path.join(rootDir, "nemoclaw");
@@ -41,13 +57,13 @@ function stageOptimizedSandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
   fs.copyFileSync(path.join(rootDir, "Dockerfile"), stagedDockerfile);
 
   fs.mkdirSync(stagedNemoclawDir, { recursive: true });
-  for (const file of [
+  for (const fileName of [
     "package.json",
     "package-lock.json",
     "tsconfig.json",
     "openclaw.plugin.json",
   ]) {
-    fs.copyFileSync(path.join(sourceNemoclawDir, file), path.join(stagedNemoclawDir, file));
+    fs.copyFileSync(path.join(sourceNemoclawDir, fileName), path.join(stagedNemoclawDir, fileName));
   }
   fs.cpSync(path.join(sourceNemoclawDir, "src"), path.join(stagedNemoclawDir, "src"), {
     recursive: true,
@@ -63,9 +79,24 @@ function stageOptimizedSandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
   });
 
   fs.mkdirSync(stagedScriptsDir, { recursive: true });
-  for (const scriptName of [
-    "nemoclaw-start.sh",
-    "generate-openclaw-config.py",
+  fs.copyFileSync(
+    path.join(rootDir, "scripts", "nemoclaw-start.sh"),
+    path.join(stagedScriptsDir, "nemoclaw-start.sh"),
+  );
+  // Shared sandbox initialisation library sourced by the entrypoint (#2277)
+  fs.mkdirSync(path.join(stagedScriptsDir, "lib"), { recursive: true });
+  fs.copyFileSync(
+    path.join(rootDir, "scripts", "lib", "sandbox-init.sh"),
+    path.join(stagedScriptsDir, "lib", "sandbox-init.sh"),
+  );
+  // OpenClaw config generator extracted in #2449 (fixed in #2565)
+  fs.copyFileSync(
+    path.join(rootDir, "scripts", "generate-openclaw-config.py"),
+    path.join(stagedScriptsDir, "generate-openclaw-config.py"),
+  );
+  // chad-specific scripts baked into image so the sandbox can self-restore
+  // and report bugs without needing the host repo mounted.
+  for (const chadScript of [
     "chad-backup-to-github.sh",
     "chad-restore-from-github.sh",
     "chad-clone-source.sh",
@@ -73,8 +104,8 @@ function stageOptimizedSandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
     "chad-report-bug.sh",
   ]) {
     fs.copyFileSync(
-      path.join(rootDir, "scripts", scriptName),
-      path.join(stagedScriptsDir, scriptName),
+      path.join(rootDir, "scripts", chadScript),
+      path.join(stagedScriptsDir, chadScript),
     );
   }
 
@@ -92,11 +123,11 @@ function stageOptimizedSandboxBuildContext(rootDir, tmpDir = os.tmpdir()) {
   return { buildCtx, stagedDockerfile };
 }
 
-function collectBuildContextStats(dir) {
+function collectBuildContextStats(dir: string): BuildContextStats {
   let fileCount = 0;
   let totalBytes = 0;
 
-  function walk(currentDir) {
+  function walk(currentDir: string): void {
     for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
       const entryPath = path.join(currentDir, entry.name);
       if (entry.isDirectory()) {

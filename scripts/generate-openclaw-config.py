@@ -1,31 +1,64 @@
+#!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""Generate openclaw.json from environment variables.
 
-"""Generate ~/.openclaw/openclaw.json from build-time environment variables.
+Called at Docker image build time (RUN layer) after ARG→ENV promotion.
+Reads all configuration from os.environ — never from string interpolation
+in Dockerfile source. See: C-2 security model.
 
-Invoked from the Dockerfile's final RUN step. All inputs come from env vars
-(never from string interpolation) to avoid code-injection via Docker build
-args — see Dockerfile comment at the ENV NEMOCLAW_* line.
+Usage:
+    python3 scripts/generate-openclaw-config.py            # Generate config
+
+Environment variables:
+    CHAT_UI_URL                         Dashboard URL (default: http://127.0.0.1:18789)
+    NEMOCLAW_MODEL                      Model identifier
+    NEMOCLAW_PROVIDER_KEY               Provider key for model config
+    NEMOCLAW_PRIMARY_MODEL_REF          Primary model reference
+    NEMOCLAW_INFERENCE_BASE_URL         Inference endpoint
+    NEMOCLAW_INFERENCE_API              Inference API type
+    NEMOCLAW_INFERENCE_INPUTS           Comma-separated model inputs (default: text)
+    NEMOCLAW_CONTEXT_WINDOW             Context window size (default: 131072)
+    NEMOCLAW_MAX_TOKENS                 Max tokens (default: 4096)
+    NEMOCLAW_REASONING                  Enable reasoning (default: false)
+    NEMOCLAW_AGENT_TIMEOUT              Per-request timeout seconds (default: 600)
+    NEMOCLAW_INFERENCE_COMPAT_B64       Base64-encoded inference compat JSON
+    NEMOCLAW_MESSAGING_CHANNELS_B64     Base64-encoded channel list
+    NEMOCLAW_MESSAGING_ALLOWED_IDS_B64  Base64-encoded allowed IDs map
+    NEMOCLAW_DISCORD_GUILDS_B64         Base64-encoded Discord guild config
+    NEMOCLAW_DISABLE_DEVICE_AUTH        Set to "1" to force-disable device auth
+    NEMOCLAW_PROXY_HOST                 Egress proxy host (default: 10.200.0.1)
+    NEMOCLAW_PROXY_PORT                 Egress proxy port (default: 3128)
+    NEMOCLAW_WEB_SEARCH_ENABLED         Set to "1" to enable web search tools
 """
+
+from __future__ import annotations
 
 import base64
 import json
 import os
-import secrets
+import re
 from urllib.parse import urlparse
 
 
-def _b64json(env_key: str, default_b64: str) -> object:
-    raw = os.environ.get(env_key, default_b64) or default_b64
-    return json.loads(base64.b64decode(raw).decode("utf-8"))
+def is_loopback(hostname: str) -> bool:
+    """Check if a hostname is a loopback address.
+
+    Mirrors isLoopbackHostname() from src/lib/url-utils.ts.
+    Returns True for localhost, ::1, and 127.x.x.x addresses.
+    """
+    normalized = (hostname or "").strip().lower().strip("[]")
+    if normalized == "localhost" or normalized == "::1":
+        return True
+    return bool(re.match(r"^127(?:\.\d{1,3}){3}$", normalized))
 
 
-def _registry_defaults(model_id: str) -> dict:
+def _registry_defaults(model_id: str, env: dict) -> dict:
     """Pull contextWindow / maxOutputTokens / reasoningSafe for a model from
     scripts/model-registry.json. Returns {} on any error so the caller falls
     back to env-var defaults — the registry is best-effort, not required."""
     candidates = [
-        os.environ.get("NEMOCLAW_MODEL_REGISTRY"),
+        env.get("NEMOCLAW_MODEL_REGISTRY"),
         "/usr/local/share/chad/model-registry.json",
         os.path.join(os.path.dirname(__file__), "model-registry.json"),
     ]
@@ -43,100 +76,165 @@ def _registry_defaults(model_id: str) -> dict:
     return {}
 
 
-def main() -> None:
-    model = os.environ["NEMOCLAW_MODEL"]
-    chat_ui_url = os.environ["CHAT_UI_URL"]
-    provider_key = os.environ["NEMOCLAW_PROVIDER_KEY"]
-    primary_model_ref = os.environ["NEMOCLAW_PRIMARY_MODEL_REF"]
-    inference_base_url = os.environ["NEMOCLAW_INFERENCE_BASE_URL"]
-    inference_api = os.environ["NEMOCLAW_INFERENCE_API"]
+def build_config(env: dict | None = None) -> dict:
+    """Build the complete openclaw config dict from environment variables.
 
-    inference_compat = _b64json("NEMOCLAW_INFERENCE_COMPAT_B64", "e30=")
-    web_config = _b64json("NEMOCLAW_WEB_CONFIG_B64", "e30=")
-    msg_channels = _b64json("NEMOCLAW_MESSAGING_CHANNELS_B64", "W10=")
-    allowed_ids = _b64json("NEMOCLAW_MESSAGING_ALLOWED_IDS_B64", "e30=")
+    Args:
+        env: Dict of environment variables. Defaults to os.environ.
 
-    token_keys = {"discord": "token", "telegram": "botToken", "slack": "botToken"}
-    env_keys = {
+    Returns:
+        Complete config dict ready to be written as JSON.
+    """
+    if env is None:
+        env = dict(os.environ)
+
+    # Treat empty-string env vars as unset so the documented defaults still
+    # apply when callers pass an explicit "" (e.g. `docker build --build-arg
+    # CHAT_UI_URL=`).
+    proxy_host = env.get("NEMOCLAW_PROXY_HOST") or "10.200.0.1"
+    proxy_port = env.get("NEMOCLAW_PROXY_PORT") or "3128"
+    proxy_url = f"http://{proxy_host}:{proxy_port}"
+    model = env["NEMOCLAW_MODEL"]
+    chat_ui_url = env.get("CHAT_UI_URL") or "http://127.0.0.1:18789"
+    provider_key = env["NEMOCLAW_PROVIDER_KEY"]
+    primary_model_ref = env["NEMOCLAW_PRIMARY_MODEL_REF"]
+    inference_base_url = env["NEMOCLAW_INFERENCE_BASE_URL"]
+    inference_api = env["NEMOCLAW_INFERENCE_API"]
+    # Defaults come from scripts/model-registry.json (single source of truth
+    # for per-model limits). Env vars NEMOCLAW_CONTEXT_WINDOW / NEMOCLAW_MAX_TOKENS
+    # / NEMOCLAW_REASONING still override — the registry just removes the need
+    # to pass them when running a known model.
+    # NOTE: keep reasoning=False for Kimi-K2.5. Flipping to True changes the
+    # openclaw harness's tool-call parsing; K2.5 emits tool calls in a form
+    # that doesn't round-trip — runs end up with "Tool  not found" errors and
+    # the agent loops on empty toolUse stops. The registry's reasoningSafe
+    # flag drives this default.
+    _reg = _registry_defaults(model, env)
+    _ctx_default = str(_reg.get("contextWindow", 131072))
+    _max_default = str(_reg.get("maxOutputTokens", 4096))
+    _reasoning_default = "true" if _reg.get("reasoningSafe", False) else "false"
+    context_window = int(env.get("NEMOCLAW_CONTEXT_WINDOW") or _ctx_default)
+    max_tokens = int(env.get("NEMOCLAW_MAX_TOKENS") or _max_default)
+    reasoning = (env.get("NEMOCLAW_REASONING") or _reasoning_default) == "true"
+    inference_inputs = [
+        v.strip()
+        for v in env.get("NEMOCLAW_INFERENCE_INPUTS", "text").split(",")
+        if v.strip()
+    ] or ["text"]
+
+    _raw_agent_timeout = env.get("NEMOCLAW_AGENT_TIMEOUT", "600")
+    if not _raw_agent_timeout.isdigit() or int(_raw_agent_timeout) <= 0:
+        raise ValueError("NEMOCLAW_AGENT_TIMEOUT must be a positive integer")
+    agent_timeout = int(_raw_agent_timeout)
+
+    inference_compat = json.loads(
+        base64.b64decode(env["NEMOCLAW_INFERENCE_COMPAT_B64"]).decode("utf-8")
+    )
+
+    msg_channels = json.loads(
+        base64.b64decode(
+            env.get("NEMOCLAW_MESSAGING_CHANNELS_B64", "W10=") or "W10="
+        ).decode("utf-8")
+    )
+    _allowed_ids = json.loads(
+        base64.b64decode(
+            env.get("NEMOCLAW_MESSAGING_ALLOWED_IDS_B64", "e30=") or "e30="
+        ).decode("utf-8")
+    )
+    _discord_guilds = json.loads(
+        base64.b64decode(
+            env.get("NEMOCLAW_DISCORD_GUILDS_B64", "e30=") or "e30="
+        ).decode("utf-8")
+    )
+
+    _token_keys = {"discord": "token", "telegram": "botToken", "slack": "botToken"}
+    _env_keys = {
         "discord": "DISCORD_BOT_TOKEN",
         "telegram": "TELEGRAM_BOT_TOKEN",
         "slack": "SLACK_BOT_TOKEN",
     }
 
-    ch_cfg: dict = {}
+    _ch_cfg = {}
     for ch in msg_channels:
-        if ch not in token_keys:
+        if ch not in _token_keys:
             continue
-        account: dict = {
-            token_keys[ch]: f"openshell:resolve:env:{env_keys[ch]}",
+        account = {
+            _token_keys[ch]: f"openshell:resolve:env:{_env_keys[ch]}",
             "enabled": True,
+            "healthMonitor": {"enabled": False},
         }
-        if ch in allowed_ids and allowed_ids[ch]:
+        if ch == "slack":
+            account["appToken"] = "openshell:resolve:env:SLACK_APP_TOKEN"
+        if ch in ("telegram", "discord"):
+            account["proxy"] = proxy_url
+        if ch == "telegram":
+            account["groupPolicy"] = "open"
+        if ch in _allowed_ids and _allowed_ids[ch]:
             account["dmPolicy"] = "allowlist"
-            account["allowFrom"] = allowed_ids[ch]
-        ch_cfg[ch] = {"accounts": {"main": account}}
+            account["allowFrom"] = _allowed_ids[ch]
+        _ch_cfg[ch] = {"accounts": {"default": account}}
 
-    if "whatsapp" in msg_channels:
-        wa_acct: dict = {"enabled": True}
-        if "whatsapp" in allowed_ids and allowed_ids["whatsapp"]:
-            wa_acct["dmPolicy"] = "allowlist"
-            wa_acct["allowFrom"] = allowed_ids["whatsapp"]
-        else:
-            wa_acct["dmPolicy"] = "pairing"
-        ch_cfg["whatsapp"] = {"accounts": {"main": wa_acct}}
+    if "discord" in _ch_cfg and _discord_guilds:
+        _ch_cfg["discord"].update(
+            {"groupPolicy": "allowlist", "guilds": _discord_guilds}
+        )
 
-    parsed = urlparse(chat_ui_url)
-    if parsed.scheme and parsed.netloc:
-        chat_origin = f"{parsed.scheme}://{parsed.netloc}"
-    else:
-        chat_origin = "http://127.0.0.1:18789"
+    # Normalize schemeless URLs before parsing — urlparse("remote-host:18789")
+    # misclassifies hostname as scheme. Mirrors ensureScheme() in dashboard-contract.ts.
+    _normalized_url = chat_ui_url
+    if chat_ui_url and not re.match(r"^[a-z][a-z0-9+.-]*://", chat_ui_url, re.IGNORECASE):
+        _normalized_url = f"http://{chat_ui_url}"
+
+    parsed = urlparse(_normalized_url)
+    chat_origin = (
+        f"{parsed.scheme}://{parsed.netloc}"
+        if parsed.scheme and parsed.netloc
+        else "http://127.0.0.1:18789"
+    )
     origins = list(dict.fromkeys(["http://127.0.0.1:18789", chat_origin]))
 
-    disable_device_auth = os.environ.get("NEMOCLAW_DISABLE_DEVICE_AUTH", "") == "1"
+    # Auto-disable device auth when CHAT_UI_URL is non-loopback — terminal-based
+    # pairing is impossible when the user only has web access (Brev Launchable,
+    # remote deployments). The explicit env var override still works but cannot
+    # re-enable device auth for non-loopback URLs (security default).
+    _is_remote = not is_loopback(parsed.hostname or "")
+    disable_device_auth = (
+        env.get("NEMOCLAW_DISABLE_DEVICE_AUTH", "") == "1"
+        or _is_remote
+    )
     allow_insecure = parsed.scheme == "http"
-
-    # Defaults come from scripts/model-registry.json (single source of truth
-    # for per-model limits). Env vars NEMOCLAW_CONTEXT_WINDOW /
-    # NEMOCLAW_MAX_TOKENS still override — the registry just removes the
-    # need to pass them when running a known model.
-    # NOTE: keep reasoning=False for Kimi-K2.5. Flipping it to True changes
-    # the openclaw harness's tool-call parsing and K2.5 emits tool calls in
-    # a form that doesn't round-trip — runs end up with "Tool  not found"
-    # errors and the agent loops on empty toolUse stops. The registry's
-    # reasoningSafe flag drives this default.
-    reg = _registry_defaults(model)
-    ctx_default = str(reg.get("contextWindow", 262144))
-    max_default = str(reg.get("maxOutputTokens", 32768))
-    reasoning_default = bool(reg.get("reasoningSafe", False))
-    model_entry: dict = {
-        "id": model,
-        "name": primary_model_ref,
-        "reasoning": reasoning_default,
-        "input": ["text"],
-        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        "contextWindow": int(os.environ.get("NEMOCLAW_CONTEXT_WINDOW", ctx_default)),
-        "maxTokens": int(os.environ.get("NEMOCLAW_MAX_TOKENS", max_default)),
-    }
-    if inference_compat:
-        model_entry["compat"] = inference_compat
 
     providers = {
         provider_key: {
             "baseUrl": inference_base_url,
             "apiKey": "unused",
             "api": inference_api,
-            "models": [model_entry],
+            "models": [
+                {
+                    **({"compat": inference_compat} if inference_compat else {}),
+                    "id": model,
+                    "name": primary_model_ref,
+                    "reasoning": reasoning,
+                    "input": inference_inputs,
+                    "cost": {
+                        "input": 0,
+                        "output": 0,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                    },
+                    "contextWindow": context_window,
+                    "maxTokens": max_tokens,
+                }
+            ],
         }
     }
 
-    # Premium side-channel: surface Anthropic Sonnet/Opus/Haiku as a
-    # *secondary* provider when ANTHROPIC_API_KEY is present in the deployed
-    # credentials. Default routing stays on the primary inference gateway;
-    # chad-premium / /premium explicitly select these models. Access is gated
-    # downstream by chad-auth-context — the registry just declares them
-    # available. The L7 proxy resolves the apiKey from
-    # /sandbox/.nemoclaw/credentials.json (deployed by chad-setup.sh).
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    # Premium side-channel: surface Anthropic Sonnet/Opus/Haiku as a *secondary*
+    # provider when ANTHROPIC_API_KEY is present in the deployed credentials.
+    # Default routing stays on the primary inference gateway; chad-premium /
+    # /premium explicitly select these models. Access is gated downstream by
+    # chad-auth-context — the registry just declares them available.
+    if env.get("ANTHROPIC_API_KEY"):
         anthropic_models = [
             ("claude-sonnet-4-6", 200000, 64000),
             ("claude-opus-4-7", 200000, 64000),
@@ -161,40 +259,16 @@ def main() -> None:
             ],
         }
 
-    # Bundled OpenClaw skills (clawhub, coding-agent, gog, session-logs,
-    # summarize) and the three custom sandbox skills (chad-bug-intake,
-    # chad-orchestrator, proton-calendar) are explicitly enabled here.
-    # Without this block, `openclaw skills check` reports them as
-    # "disabled" because the default config ships with an empty allowlist.
-    # Keep the list in sync with chad-readme.md §"Skill enablement".
-    skills_cfg: dict = {
-        "mode": "merge",
-        "load": {
-            "extraDirs": [
-                "/sandbox/.openclaw-data/skills",
-                "/opt/chad-orchestrator",
-            ],
+    config = {
+        "agents": {
+            "defaults": {
+                "model": {"primary": primary_model_ref},
+                "timeoutSeconds": agent_timeout,
+            }
         },
-        "enable": {
-            # OpenClaw-bundled skills
-            "clawhub": True,
-            "coding-agent": True,
-            "gog": True,
-            "session-logs": True,
-            "summarize": True,
-            "openclaw-bundled": True,
-            # Custom sandbox skills (synced by chad-setup.sh)
-            "chad-bug-intake": True,
-            "chad-orchestrator": True,
-            "proton-calendar": True,
-        },
-    }
-
-    config: dict = {
-        "agents": {"defaults": {"model": {"primary": primary_model_ref}}},
         "models": {"mode": "merge", "providers": providers},
-        "skills": skills_cfg,
-        "channels": {"defaults": {"configWrites": False}, **ch_cfg},
+        "channels": {"defaults": {}, **_ch_cfg},
+        "update": {"checkOnStart": False},
         "gateway": {
             "mode": "local",
             "controlUi": {
@@ -203,21 +277,28 @@ def main() -> None:
                 "allowedOrigins": origins,
             },
             "trustedProxies": ["127.0.0.1", "::1"],
-            "auth": {"token": secrets.token_hex(32)},
+            "auth": {"token": ""},
         },
     }
 
-    if web_config.get("provider") == "brave":
-        search_cfg: dict = {"enabled": True, "provider": "brave"}
-        if web_config.get("apiKey", ""):
-            search_cfg["apiKey"] = web_config.get("apiKey", "")
+    if env.get("NEMOCLAW_WEB_SEARCH_ENABLED", "") == "1":
         config["tools"] = {
             "web": {
-                "search": search_cfg,
-                "fetch": {"enabled": bool(web_config.get("fetchEnabled", True))},
+                "search": {
+                    "enabled": True,
+                    "provider": "brave",
+                    "apiKey": "openshell:resolve:env:BRAVE_API_KEY",
+                },
+                "fetch": {"enabled": True},
             }
         }
 
+    return config
+
+
+def main() -> None:
+    """Generate openclaw.json from environment variables."""
+    config = build_config()
     path = os.path.expanduser("~/.openclaw/openclaw.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:

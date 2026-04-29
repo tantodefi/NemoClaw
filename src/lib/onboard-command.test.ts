@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -8,6 +12,14 @@ import {
   runDeprecatedOnboardAliasCommand,
   runOnboardCommand,
 } from "./onboard-command";
+
+function exitWithCode(code: number): never {
+  throw new Error(String(code));
+}
+
+function exitWithPrefixedCode(code: number): never {
+  throw new Error(`exit:${code}`);
+}
 
 describe("onboard command", () => {
   it("parses onboard flags", () => {
@@ -19,19 +31,19 @@ describe("onboard command", () => {
         {
           env: {},
           error: () => {},
-          exit: ((code: number) => {
-            throw new Error(String(code));
-          }) as never,
+          exit: exitWithCode,
         },
       ),
     ).toEqual({
       nonInteractive: true,
       resume: true,
+      fresh: false,
       recreateSandbox: false,
       fromDockerfile: null,
       acceptThirdPartySoftware: true,
       agent: null,
       dangerouslySkipPermissions: false,
+      controlUiPort: null,
     });
   });
 
@@ -44,19 +56,19 @@ describe("onboard command", () => {
         {
           env: { NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1" },
           error: () => {},
-          exit: ((code: number) => {
-            throw new Error(String(code));
-          }) as never,
+          exit: exitWithCode,
         },
       ),
     ).toEqual({
       nonInteractive: false,
       resume: false,
+      fresh: false,
       recreateSandbox: false,
       fromDockerfile: null,
       acceptThirdPartySoftware: true,
       agent: null,
       dangerouslySkipPermissions: false,
+      controlUiPort: null,
     });
   });
 
@@ -69,18 +81,18 @@ describe("onboard command", () => {
       env: {},
       runOnboard,
       error: () => {},
-      exit: ((code: number) => {
-        throw new Error(String(code));
-      }) as never,
+      exit: exitWithCode,
     });
     expect(runOnboard).toHaveBeenCalledWith({
       nonInteractive: false,
       resume: true,
+      fresh: false,
       recreateSandbox: false,
       fromDockerfile: null,
       acceptThirdPartySoftware: false,
       agent: null,
       dangerouslySkipPermissions: false,
+      controlUiPort: null,
     });
   });
 
@@ -95,9 +107,7 @@ describe("onboard command", () => {
       runOnboard,
       log: (message = "") => lines.push(message),
       error: () => {},
-      exit: ((code: number) => {
-        throw new Error(String(code));
-      }) as never,
+      exit: exitWithCode,
     });
     expect(runOnboard).not.toHaveBeenCalled();
     expect(lines.join("\n")).toContain("Usage: nemoclaw onboard");
@@ -107,28 +117,74 @@ describe("onboard command", () => {
   });
 
   it("parses --from <Dockerfile>", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-from-parse-"));
+    const dockerfilePath = path.join(tmpDir, "Custom.Dockerfile");
+    fs.writeFileSync(dockerfilePath, "FROM scratch\n");
+
     expect(
       parseOnboardArgs(
-        ["--resume", "--from", "/tmp/Custom.Dockerfile"],
+        ["--resume", "--from", dockerfilePath],
         "--yes-i-accept-third-party-software",
         "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
         {
           env: {},
           error: () => {},
-          exit: ((code: number) => {
-            throw new Error(String(code));
-          }) as never,
+          exit: exitWithCode,
         },
       ),
     ).toEqual({
       nonInteractive: false,
       resume: true,
+      fresh: false,
       recreateSandbox: false,
-      fromDockerfile: "/tmp/Custom.Dockerfile",
+      fromDockerfile: dockerfilePath,
       acceptThirdPartySoftware: false,
       agent: null,
       dangerouslySkipPermissions: false,
+      controlUiPort: null,
     });
+  });
+
+  it("parses --fresh and surfaces it as fresh=true", () => {
+    expect(
+      parseOnboardArgs(
+        ["--fresh"],
+        "--yes-i-accept-third-party-software",
+        "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+        {
+          env: {},
+          error: () => {},
+          exit: exitWithCode,
+        },
+      ),
+    ).toEqual({
+      nonInteractive: false,
+      resume: false,
+      fresh: true,
+      recreateSandbox: false,
+      fromDockerfile: null,
+      acceptThirdPartySoftware: false,
+      agent: null,
+      dangerouslySkipPermissions: false,
+      controlUiPort: null,
+    });
+  });
+
+  it("rejects --resume and --fresh together", () => {
+    const errors: string[] = [];
+    expect(() =>
+      parseOnboardArgs(
+        ["--resume", "--fresh"],
+        "--yes-i-accept-third-party-software",
+        "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+        {
+          env: {},
+          error: (message = "") => errors.push(message),
+          exit: exitWithPrefixedCode,
+        },
+      ),
+    ).toThrow("exit:1");
+    expect(errors.join("\n")).toContain("--resume and --fresh are mutually exclusive");
   });
 
   it("exits when --from is missing its Dockerfile path", () => {
@@ -140,12 +196,31 @@ describe("onboard command", () => {
         {
           env: {},
           error: () => {},
-          exit: ((code: number) => {
-            throw new Error(`exit:${code}`);
-          }) as never,
+          exit: exitWithPrefixedCode,
         },
       ),
     ).toThrow("exit:1");
+  });
+
+  it("exits before onboarding when --from points to a missing Dockerfile", async () => {
+    const runOnboard = vi.fn(async () => {});
+    const errors: string[] = [];
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-from-missing-"));
+
+    await expect(
+      runOnboardCommand({
+        args: ["--from", path.join(tmpDir, "no-such-dockerfile-2589")],
+        noticeAcceptFlag: "--yes-i-accept-third-party-software",
+        noticeAcceptEnv: "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+        env: {},
+        runOnboard,
+        error: (message = "") => errors.push(message),
+        exit: exitWithPrefixedCode,
+      }),
+    ).rejects.toThrow("exit:1");
+
+    expect(runOnboard).not.toHaveBeenCalled();
+    expect(errors.join("\n")).toContain("--from path not found:");
   });
 
   it("exits with usage on unknown args", () => {
@@ -158,9 +233,7 @@ describe("onboard command", () => {
         {
           env: {},
           error: (message = "") => errors.push(message),
-          exit: ((code: number) => {
-            throw new Error(`exit:${code}`);
-          }) as never,
+          exit: exitWithPrefixedCode,
         },
       ),
     ).toThrow("exit:1");
@@ -178,19 +251,19 @@ describe("onboard command", () => {
           env: {},
           listAgents: () => ["openclaw", "hermes"],
           error: () => {},
-          exit: ((code: number) => {
-            throw new Error(String(code));
-          }) as never,
+          exit: exitWithCode,
         },
       ),
     ).toEqual({
       nonInteractive: false,
       resume: false,
+      fresh: false,
       recreateSandbox: false,
       fromDockerfile: null,
       acceptThirdPartySoftware: false,
       agent: "openclaw",
       dangerouslySkipPermissions: true,
+      controlUiPort: null,
     });
   });
 
@@ -205,14 +278,97 @@ describe("onboard command", () => {
           env: {},
           listAgents: () => ["openclaw", "hermes"],
           error: (message = "") => errors.push(message),
+          exit: exitWithPrefixedCode,
+        },
+      ),
+    ).toThrow("exit:1");
+    expect(errors.join("\n")).toContain("Unknown agent 'bogus'");
+    expect(errors.join("\n")).toContain("Usage: nemoclaw onboard");
+  });
+
+  it("parses --control-ui-port with a valid port", () => {
+    const result = parseOnboardArgs(
+      ["--control-ui-port", "18790"],
+      "--yes-i-accept-third-party-software",
+      "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+      {
+        env: {},
+        error: () => {},
+        exit: ((code: number) => {
+          throw new Error(String(code));
+        }) as never,
+      },
+    );
+    expect(result.controlUiPort).toBe(18790);
+  });
+
+  it("exits when --control-ui-port is missing its value", () => {
+    expect(() =>
+      parseOnboardArgs(
+        ["--control-ui-port"],
+        "--yes-i-accept-third-party-software",
+        "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+        {
+          env: {},
+          error: () => {},
           exit: ((code: number) => {
             throw new Error(`exit:${code}`);
           }) as never,
         },
       ),
     ).toThrow("exit:1");
-    expect(errors.join("\n")).toContain("Unknown agent 'bogus'");
-    expect(errors.join("\n")).toContain("Usage: nemoclaw onboard");
+  });
+
+  it("exits when --control-ui-port value is out of range", () => {
+    const errors: string[] = [];
+    expect(() =>
+      parseOnboardArgs(
+        ["--control-ui-port", "80"],
+        "--yes-i-accept-third-party-software",
+        "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+        {
+          env: {},
+          error: (message = "") => errors.push(message),
+          exit: ((code: number) => {
+            throw new Error(`exit:${code}`);
+          }) as never,
+        },
+      ),
+    ).toThrow("exit:1");
+    expect(errors.join("\n")).toContain("1024-65535");
+  });
+
+  it("--control-ui-port takes precedence over CHAT_UI_URL env", () => {
+    const result = parseOnboardArgs(
+      ["--control-ui-port", "19000"],
+      "--yes-i-accept-third-party-software",
+      "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+      {
+        env: { CHAT_UI_URL: "http://127.0.0.1:18790" },
+        error: () => {},
+        exit: ((code: number) => {
+          throw new Error(String(code));
+        }) as never,
+      },
+    );
+    expect(result.controlUiPort).toBe(19000);
+  });
+
+  it("--help includes --control-ui-port in usage", async () => {
+    const lines: string[] = [];
+    await runOnboardCommand({
+      args: ["--help"],
+      noticeAcceptFlag: "--yes-i-accept-third-party-software",
+      noticeAcceptEnv: "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+      env: {},
+      runOnboard: vi.fn(async () => {}),
+      log: (message = "") => lines.push(message),
+      error: () => {},
+      exit: ((code: number) => {
+        throw new Error(String(code));
+      }) as never,
+    });
+    expect(lines.join("\n")).toContain("--control-ui-port");
   });
 
   it("prints the setup-spark deprecation text before delegating", async () => {
@@ -227,9 +383,7 @@ describe("onboard command", () => {
       runOnboard,
       log: (message = "") => lines.push(message),
       error: () => {},
-      exit: ((code: number) => {
-        throw new Error(String(code));
-      }) as never,
+      exit: exitWithCode,
     });
     expect(lines.join("\n")).toContain("setup-spark` is deprecated");
     expect(lines.join("\n")).toContain("Use `nemoclaw onboard` instead");
@@ -237,11 +391,13 @@ describe("onboard command", () => {
     expect(runOnboard).toHaveBeenCalledWith({
       nonInteractive: false,
       resume: false,
+      fresh: false,
       recreateSandbox: false,
       fromDockerfile: null,
       acceptThirdPartySoftware: false,
       agent: null,
       dangerouslySkipPermissions: false,
+      controlUiPort: null,
     });
   });
 
@@ -257,9 +413,7 @@ describe("onboard command", () => {
       runOnboard,
       log: (message = "") => lines.push(message),
       error: () => {},
-      exit: ((code: number) => {
-        throw new Error(String(code));
-      }) as never,
+      exit: exitWithCode,
     });
     expect(lines.join("\n")).toContain("`nemoclaw setup` is deprecated");
     expect(lines.join("\n")).toContain("Use `nemoclaw onboard` instead");
