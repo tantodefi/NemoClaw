@@ -14,7 +14,7 @@
 #   chad-route --task "some free-text task body" [--default ...]
 #
 # Output:
-#   Echoes one of: coder | researcher | writer | reviewer
+#   Echoes one of: coder | researcher | writer | reviewer | fitness
 #   Exit 0 if a match was found, exit 0 with the default if not.
 #
 # The patterns below are intentionally small — Chad is expected to
@@ -58,6 +58,12 @@ patterns = [
     ("brain", [
         r"\b(remember|recall|what do you know|brain query|knowledge graph|entity|extract entities|store in brain|gbrain|put.?page|what.?know.?about)\b",
         r"\b(summaris?e for memory|add to memory|memory entry|timeline|link entities)\b",
+    ]),
+    ("fitness", [
+        r"\b(squat|deadlift|bench press|overhead press|barbell|powerlifting|novice linear progression)\b",
+        r"\b(starting strength|supple leopard|rippetoe|starrett|hip hinge|brace|thoracic)\b",
+        r"\b(mobility|stretch|warmup|warm.?up|tissue|fascia|foam roll|lacrosse ball)\b",
+        r"\b(lift|lifting|form check|technique|cue|programming|sets?|reps?|load)\b",
     ]),
     ("coder", [
         r"\b(implement|refactor|patch|fix|bug|diff|write code|rewrite|unit test|pytest|vitest|compile|build fail)\b",

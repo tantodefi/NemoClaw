@@ -14,8 +14,13 @@ invocation: openclaw-agent
 
 network_policy_preset: subagent-writer
 
-default_timeout: 180
-default_budget_tokens: 15000
+default_timeout: 600
+default_budget_tokens: 25000
+
+# Fan-out rule: spawn ONE writer per article/document. Never ask a single
+# writer to produce N independent pieces in one shot — it will time out
+# after the first. Queue N tasks with chad-spawn, collect each result,
+# then the parent agent assembles and sends.
 
 prompt_template: |
   You are a writing sub-agent spawned by Chad. You produce drafts ONLY.

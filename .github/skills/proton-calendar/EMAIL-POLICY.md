@@ -18,6 +18,14 @@
 | Reply to message | `/usr/local/bin/proton-tool reply-mail --id=MSGID --body=TEXT` |
 | Reply all | `/usr/local/bin/proton-tool reply-mail --id=MSGID --all --body=TEXT` |
 | Send new email | `/usr/local/bin/proton-tool send-mail --to=ADDR --subject=TEXT --body=TEXT` |
+
+> **`--body` is required.** The sandbox Landlock blocks `/dev/stdin`, so
+> omitting `--body` causes an immediate "permission denied" crash. For
+> multi-line bodies write to a file first:
+> ```bash
+> body=$(cat /tmp/email-body.txt)
+> proton-tool reply-mail --id=MSGID --body="$body"
+> ```
 | Trash messages | `/usr/local/bin/proton-tool trash-mail --id=MSGID1,MSGID2` |
 | Count per label | `/usr/local/bin/proton-tool count-mail` |
 | List calendars | `/usr/local/bin/proton-tool calendars` |
@@ -29,6 +37,25 @@
 > After rebuilding (`bash scripts/build.sh`), run:
 > `cp /sandbox/.openclaw-data/skills/proton-calendar/proton-tool /usr/local/bin/proton-tool`
 > Do **not** use a symlink — the proxy blocks binaries under `.openclaw-data/`.
+
+## Sender-specific routing
+
+### tjcooke@protonmail.com / tjcooke@pm.me — fitness coach
+
+TJ's emails are almost always content creation requests. Apply this routing
+before the generic task-weight rules:
+
+| Request type | Action |
+|---|---|
+| Article / post topics or a content schedule | Weight 4 — acknowledge, then `chad-intake --from proton --message-id MSGID` which will spawn researcher → writer pipeline |
+| Client check-in or programming question | Weight 3 — spawn `fitness` sub-agent for strength/mobility answers from gbrain |
+| Quick question / confirmation | Weight 1–2 — reply inline |
+
+For content requests: the researcher sub-agent collects sources per topic,
+then one writer sub-agent per article produces a draft (fan-out, not all in
+one spawn). Do not attempt to write articles inline in the cron session.
+
+---
 
 ## Admin users (respond to these)
 
@@ -90,10 +117,13 @@ Every admin email gets a weight based on effort required:
 - **Weight 3:** Handle if this is the only pending item. Otherwise add to
   `Pending Follow-ups` in `memory/YYYY-MM-DD.md` and reply with an
   acknowledgment: _"Noted — I'll handle this shortly."_
-- **Weight 4:** Always defer. Add to `Pending Follow-ups` and reply with an
-  acknowledgment including the estimated scope:
-  _"Received. This looks like a [brief description]. I'll work on it and
-  follow up."_
+- **Weight 4:** Always defer. Reply with a short acknowledgment, then route
+  through the orchestrator pipeline — do **not** attempt the work inline:
+  ```bash
+  chad-intake --from proton --message-id MSGID
+  ```
+  `chad-intake` handles task-file creation, budget check, spawn queuing, and
+  memory logging. Inline weight-4 work will be killed by the cron timeout.
 
 ## Acknowledgment protocol
 

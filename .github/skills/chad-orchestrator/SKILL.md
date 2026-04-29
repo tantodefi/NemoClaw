@@ -45,6 +45,7 @@ Kinds currently supported:
 | `researcher` | `/usr/local/bin/claude` | `subagent-researcher` | brain-first | — | Web/gh search, collect facts, produce a report |
 | `writer` | `/usr/local/bin/claude` | `subagent-writer` | brain context | `/gstack-ceo`, `/gstack-ship` | Draft email replies, docs, comments |
 | `reviewer` | `/usr/local/bin/claude` | `subagent-reviewer` | brain context | `/gstack-review` | Audit a diff, run checklist against code |
+| `fitness` | `/usr/local/bin/claude` | `subagent-researcher` | brain-first | — | Strength/mobility questions from Starting Strength + Supple Leopard |
 
 Adding a new kind is one YAML file under `kinds/` plus (optionally) one
 network policy preset under `nemoclaw-blueprint/policies/presets/`.
@@ -85,6 +86,41 @@ relevant skill but leave the choice to the agent:
 **When to skip gstack**: Quick patches, one-line email replies, and PR
 descriptions under 50 lines don't need gstack overhead. The prompt
 templates say "optional" and leave the call to the agent's judgment.
+
+## Fan-Out Pattern (Multiple Similar Items)
+
+When the user asks for N similar outputs (N articles, N reports, N drafts),
+**spawn one agent per item** — never cram all N into a single task.
+
+```bash
+# Correct: 4 writer spawns, one per article
+for topic in "community" "barbell" "micros-macros" "habits"; do
+  chad-spawn --kind writer --task-file /tmp/task-${topic}.json
+done
+
+# Wrong: one writer with "write 4 articles" — times out after #1
+```
+
+Run `chad-collect --today` after each spawn so the result is checkpointed
+in daily memory before the next spawn starts.
+
+## Partial-Completion Recovery
+
+If a spawn batch is interrupted (timeout, crash, budget):
+
+1. Run `chad-collect --today` to flush completed results into memory.
+2. Write remaining tasks to `HEARTBEAT.md` so the next heartbeat picks up:
+
+```markdown
+## Pending spawns (resume next heartbeat)
+- [ ] writer: "Barbell Strength Training article" → /tmp/article-barbell.md
+- [ ] writer: "Micros vs Macros article"          → /tmp/article-micros.md
+- [ ] writer: "Habits article"                     → /tmp/article-habits.md
+- [ ] After all done: reply-mail --id=<MSGID> with all articles
+```
+
+3. Do **not** ask the user what to do. The instruction is still valid —
+   save the checkpoint and continue on the next heartbeat.
 
 ## When To Use This Skill
 

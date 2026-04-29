@@ -341,17 +341,16 @@ case "$manifest_invocation" in
     ;;
   openclaw-agent)
     # Each spawn gets its own session id so contexts don't bleed.
-    # Register gbrain MCP if the binary is available so sub-agents can
-    # call gbrain query/put-page without extra setup.
+    # gbrain MCP is registered persistently in openclaw.json via
+    # `openclaw mcp set gbrain ...` (done during chad-setup). The
+    # --mcp-server flag is not supported in openclaw 2026.4.x.
+    # HOME=/sandbox so openclaw finds its config at /sandbox/.openclaw
+    # regardless of which user kubectl exec runs as.
     prompt_body="$(cat "$prompt_file")"
-    gbrain_args=()
-    if command -v gbrain >/dev/null 2>&1; then
-      gbrain_args=(--mcp-server gbrain gbrain serve)
-    fi
     timeout --kill-after=10 "${timeout_secs}s" \
-      openclaw agent --agent main --local \
+      env HOME=/sandbox \
+      openclaw agent --agent main --timeout "${timeout_secs}" \
         --session-id "sub-${task_id}" \
-        "${gbrain_args[@]}" \
         -m "$prompt_body" \
       > "$stdout_log" 2> "$stderr_log"
     exit_code=$?
