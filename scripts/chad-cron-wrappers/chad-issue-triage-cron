@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-issue-triage-cron — Cron wrapper for chad-issue-triage.
+#
+# Same shape as chad-mail-check / chad-workspace-backup:
+#   1. Ensure today's memory file exists.
+#   2. Budget gate (read budget.json directly — chad-budget has a stale
+#      CHAD_BUDGET_FILE env-var export bug).
+#   3. Detach `chad-issue-triage --top 2` via nohup. The cron agent's
+#      exec call returns in well under a second; the result lands in
+#      today's memory under "## Issue triage" when the run finishes.
+#
+# Sub-agent spawns (researcher/coder) can take several minutes apiece,
+# which would otherwise blow past the model's per-turn inference window.
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+# Pull MIN_BUDGET from scripts/task-profiles.json (single source of truth)
+# with a hardcoded fallback. The 140k floor reserves room for two detached
+# sub-agents at ~70k each (researcher + coder). Override via
+# CHAD_PROFILES_FILE for tests.
+MIN_BUDGET_FALLBACK=140000
+PROFILES_FILE="${CHAD_PROFILES_FILE:-/usr/local/share/chad/task-profiles.json}"
+MIN_BUDGET="$MIN_BUDGET_FALLBACK"
+if [ -r "$PROFILES_FILE" ]; then
+  MIN_BUDGET="$(python3 -c "import json; p=json.load(open('${PROFILES_FILE}')).get('profiles',{}).get('issue-triage',{}); print(p.get('minBudgetTokens', ${MIN_BUDGET_FALLBACK}))" 2>/dev/null || echo "${MIN_BUDGET_FALLBACK}")"
+fi
+TOP_N="${CHAD_TRIAGE_TOP:-2}"
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+TS="$(date -u +%FT%TZ)"
+TS_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG="/tmp/chad-issue-triage-${TS_TAG}.log"
+
+BUDGET_FILE="${CHAD_BUDGET_FILE:-/sandbox/.openclaw-data/budget.json}"
+REMAINING=0
+if [ -f "$BUDGET_FILE" ]; then
+  REMAINING="$(python3 -c "import json; print(json.load(open('${BUDGET_FILE}')).get('remaining_tokens',0))" 2>/dev/null || echo 0)"
+fi
+REMAINING="${REMAINING//[^0-9]/}"
+REMAINING="${REMAINING:-0}"
+
+if [ "$REMAINING" -lt "$MIN_BUDGET" ]; then
+  {
+    echo ""
+    echo "## Issue triage skipped (low budget) — ${TS}"
+    echo "remaining_tokens=${REMAINING} (< ${MIN_BUDGET})"
+  } >> "$MEMORY_FILE"
+  echo "skipped: budget=${REMAINING}"
+  exit 0
+fi
+
+# Premium-eligible mention sweep: check if any of the top-N open issues
+# mention @supachad or @tantodefi in title/body. If so, drop a per-issue
+# AuthContext file so a downstream premium call can resolve the trigger
+# back to a verified github actor. Also caches the gh issue list so the
+# Phase-2 hook below doesn't re-fetch.
+AUTH_CONTEXT_DIR="/sandbox/.openclaw-data/state/auth-context-issue"
+mkdir -p "$AUTH_CONTEXT_DIR"
+PREMIUM_MENTION_RE='@(supachad|tantodefi)\b'
+PREMIUM_HITS=0
+ISSUES_JSON="$(mktemp)"
+PARKED_ISSUES="$(mktemp)"
+trap 'rm -f "$ISSUES_JSON" "$PARKED_ISSUES"' EXIT
+if command -v gh >/dev/null 2>&1; then
+  if gh issue list --state open --limit "$TOP_N" --json number,title,body,author,labels > "$ISSUES_JSON" 2>/dev/null; then
+    PREMIUM_HITS="$(
+      AUTH_CONTEXT_DIR="$AUTH_CONTEXT_DIR" TS="$TS" PATTERN="$PREMIUM_MENTION_RE" \
+      python3 - "$ISSUES_JSON" "$PARKED_ISSUES" <<'PY'
+import json, sys, os, re
+issues_path, parked_path = sys.argv[1], sys.argv[2]
+ctx_dir = os.environ["AUTH_CONTEXT_DIR"]; ts = os.environ["TS"]
+mention_re = re.compile(os.environ["PATTERN"], re.IGNORECASE)
+try:
+    issues = json.load(open(issues_path))
+except Exception:
+    issues = []
+park = []; n = 0
+for issue in issues or []:
+    text = " ".join([issue.get("title") or "", issue.get("body") or ""])
+    m = mention_re.search(text)
+    is_premium = bool(m)
+    actor = (issue.get("author") or {}).get("login") or "unknown"
+    park.append({
+        "idx": issue["number"],
+        "id": str(issue["number"]),
+        "subject": issue.get("title", ""),
+        "from": actor,
+        "body": issue.get("body", "") or "",
+        "flags": ",".join(l.get("name","") for l in (issue.get("labels") or [])),
+        "premium_eligible": is_premium,
+    })
+    if not m:
+        continue
+    out = os.path.join(ctx_dir, f"issue-{issue['number']}.json")
+    with open(out, "w") as f:
+        json.dump({
+            "source": "github",
+            "verifiedIdentity": actor,
+            "allowsPremium": True,
+            "createdAt": ts,
+            "createdBy": "chad-issue-triage-cron",
+            "scope": {"issueNumber": issue["number"], "title": issue.get("title"), "mention": m.group(0)},
+        }, f)
+    n += 1
+with open(parked_path, "w") as f:
+    json.dump({"park": park}, f)
+print(n)
+PY
+    )"
+  fi
+  PREMIUM_HITS="${PREMIUM_HITS//[^0-9]/}"
+  PREMIUM_HITS="${PREMIUM_HITS:-0}"
+fi
+PARK_ISSUE_COUNT=0
+if [ -s "$PARKED_ISSUES" ]; then
+  PARK_ISSUE_COUNT="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("park",[])))' "$PARKED_ISSUES" 2>/dev/null || echo 0)"
+  PARK_ISSUE_COUNT="${PARK_ISSUE_COUNT//[^0-9]/}"
+  PARK_ISSUE_COUNT="${PARK_ISSUE_COUNT:-0}"
+fi
+
+{
+  echo ""
+  echo "## Issue triage — ${TS}"
+  echo "Status: detached (top=${TOP_N})"
+  echo "Log: ${LOG}"
+  echo "Budget remaining: ${REMAINING}"
+  if [ "$PREMIUM_HITS" -gt 0 ]; then
+    echo "Premium-eligible mentions: ${PREMIUM_HITS} 🔐 (auth context dir: ${AUTH_CONTEXT_DIR})"
+  fi
+} >> "$MEMORY_FILE"
+
+# ── Phase 2 — optional single-turn LLM draft pass ────────────────────
+# Runs BEFORE the heavy nohup detach. Drafts a triage decision (skip /
+# comment-draft / close-stale) per issue. NEVER posts; the human reviews
+# the drafts in memory under "### Issue triage drafts (review before
+# posting)" and the existing detached chad-issue-triage continues to do
+# its full researcher/coder work. Failures are non-fatal.
+DRAFT_COUNT=0
+PHASE2_STATUS="not-configured"
+if [ "$PARK_ISSUE_COUNT" -gt 0 ]; then
+  PHASE2_CFG="$(python3 - <<PY
+import json, os
+cfg_path = os.environ.get("CHAD_PROFILES_FILE", "/usr/local/share/chad/task-profiles.json")
+try:
+    p = json.load(open(cfg_path)).get("profiles", {}).get("issue-triage", {})
+    ph = p.get("phase2") or {}
+except Exception:
+    ph = {}
+if not ph:
+    print("")
+else:
+    print(json.dumps({
+        "minBudgetTokens": ph.get("minBudgetTokens", 0),
+        "timeoutSeconds": ph.get("timeoutSeconds", 60),
+        "maxOutputTokens": ph.get("maxOutputTokens", 4096),
+        "usePremium": bool(ph.get("usePremium")),
+        "model": ph.get("model", ""),
+    }))
+PY
+)"
+  if [ -n "$PHASE2_CFG" ] && [ -x /usr/local/bin/chad-phase2-draft-replies ]; then
+    PHASE2_MIN_BUDGET="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("minBudgetTokens",0))')"
+    PHASE2_TIMEOUT="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("timeoutSeconds",60))')"
+    PHASE2_MAX_TOK="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("maxOutputTokens",4096))')"
+    PHASE2_PREMIUM="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(int(bool(json.load(sys.stdin).get("usePremium"))))')"
+    PHASE2_MODEL="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model","") or "")')"
+
+    if [ "$REMAINING" -lt "$PHASE2_MIN_BUDGET" ]; then
+      PHASE2_STATUS="skipped (budget=${REMAINING} < ${PHASE2_MIN_BUDGET})"
+    else
+      PHASE2_OUT="$(mktemp)"
+      PHASE2_ARGS=( --kind issue --timeout "$PHASE2_TIMEOUT" --max-tokens "$PHASE2_MAX_TOK" )
+      [ "$PHASE2_PREMIUM" = "1" ] && PHASE2_ARGS+=( --use-premium )
+      [ -n "$PHASE2_MODEL" ] && PHASE2_ARGS+=( --model "$PHASE2_MODEL" )
+
+      if [ "$PHASE2_PREMIUM" = "1" ] && [ "$PREMIUM_HITS" -gt 0 ]; then
+        FIRST_CTX="$(ls -1 "${AUTH_CONTEXT_DIR}"/issue-*.json 2>/dev/null | head -n 1 || true)"
+        [ -n "$FIRST_CTX" ] && export CHAD_AUTH_CONTEXT_PATH="$FIRST_CTX"
+      fi
+
+      if /usr/local/bin/chad-phase2-draft-replies "$PARKED_ISSUES" "$PHASE2_OUT" \
+            "${PHASE2_ARGS[@]}" 2>/dev/null; then
+        DRAFT_COUNT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len([x for x in d.get("drafts",[]) if x.get("action") in ("draft","comment-draft","close-stale")]))' "$PHASE2_OUT")"
+        DRAFT_ERR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error","") or "")' "$PHASE2_OUT")"
+        if [ -n "$DRAFT_ERR" ]; then
+          PHASE2_STATUS="degraded (${DRAFT_ERR})"
+        else
+          PHASE2_STATUS="ok (drafts=${DRAFT_COUNT})"
+        fi
+        {
+          echo ""
+          echo "### Issue triage drafts (review before posting)"
+          echo "_Phase 2 single-turn pass. NEVER posts. Review then post via gh issue comment / close._"
+          python3 - "$PHASE2_OUT" "$PARKED_ISSUES" <<'PY'
+import json, sys
+out = json.load(open(sys.argv[1]))
+park = {e["id"]: e for e in json.load(open(sys.argv[2])).get("park", [])}
+for d in out.get("drafts", []):
+    e = park.get(d.get("id"))
+    head = f"#{e['idx']} " if e else f"#{d.get('id','?')} "
+    badge = " 🔐 PREMIUM" if d.get("premium") else ""
+    action = d.get("action", "skip")
+    title = e["subject"] if e else ""
+    print(f"\n#### {head}{title}{badge}")
+    if e:
+        print(f"  author: {e['from']}")
+    print(f"  model: {d.get('model','?')}")
+    print(f"  decision: **{action}** — {d.get('reason','')}")
+    if action in ("draft","comment-draft","close-stale") and d.get("draft"):
+        print(f"  draft:\n  > {d['draft'].replace(chr(10), chr(10)+'  > ')}")
+PY
+        } >> "$MEMORY_FILE"
+      else
+        PHASE2_STATUS="failed (helper exit non-zero)"
+      fi
+      rm -f "$PHASE2_OUT"
+    fi
+    {
+      echo ""
+      echo "_phase2: ${PHASE2_STATUS}_"
+    } >> "$MEMORY_FILE"
+  fi
+fi
+
+nohup bash -c "
+  if /usr/local/bin/chad-issue-triage --top '${TOP_N}' > '${LOG}' 2>&1; then
+    {
+      echo ''
+      echo '### Issue triage result — \$(date -u +%FT%TZ) (started ${TS})'
+      echo 'Status: ok'
+      echo ''
+      echo '\`\`\`'
+      tail -60 '${LOG}'
+      echo '\`\`\`'
+    } >> '${MEMORY_FILE}'
+  else
+    rc=\$?
+    {
+      echo ''
+      echo '### Issue triage result — \$(date -u +%FT%TZ) (started ${TS})'
+      echo \"Status: FAILED (exit \${rc})\"
+      echo ''
+      echo '\`\`\`'
+      tail -60 '${LOG}'
+      echo '\`\`\`'
+    } >> '${MEMORY_FILE}'
+  fi
+" >/dev/null 2>&1 < /dev/null &
+disown 2>/dev/null || true
+
+echo "issue-triage: top=${TOP_N} premium=${PREMIUM_HITS} drafts=${DRAFT_COUNT} phase2=${PHASE2_STATUS} detached → ${LOG}"
+exit 0

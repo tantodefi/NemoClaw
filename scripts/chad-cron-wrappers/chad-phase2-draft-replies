@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-phase2-draft-replies — single-turn LLM pass that produces draft
+# reply text for the parked entries surfaced by a Phase-1 wrapper.
+#
+# Usage:
+#   chad-phase2-draft-replies <input.json> <output.json> \
+#       [--kind email|issue] [--use-premium] [--model <id>] \
+#       [--timeout <secs>] [--max-tokens <N>]
+#
+# Input shape:
+#   {"park":[{"idx":int,"subject":str,"from":str,"id":str,
+#             "flags":str,"premium_eligible":bool,"body":str?}, ...]}
+#
+# Output shape (always written, even on failure):
+#   {"drafts":[{"id":str,"action":"draft"|"skip","reason":str,
+#               "draft":str?,"model":str,"premium":bool}, ...],
+#    "error":str?}
+#
+# Why this is safe re: K2.5 multi-turn tool-call regression:
+#   • No MCP servers attached.
+#   • No tools defined.
+#   • Prompt explicitly forbids tool use.
+#   • Reasoning ON is safe specifically because the harness has nothing
+#     to round-trip — the model emits exactly one assistant turn.
+#
+# This wrapper NEVER auto-sends. Drafts go to memory for human review.
+#
+# Routing:
+#   • Local path  (default): `openclaw agent --local` → K2.5 via gateway.
+#   • Premium path (--use-premium AND CHAD_AUTH_CONTEXT_PATH set): pipes
+#     the prompt to `chad-premium-client --stdin --model <model>` so
+#     drafts route through Sonnet/Opus when the parked sender qualifies.
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+INPUT="${1:-}"
+OUTPUT="${2:-}"
+shift 2 2>/dev/null || true
+
+KIND="email"
+USE_PREMIUM=0
+MODEL=""
+TIMEOUT="${CHAD_PHASE2_TIMEOUT:-60}"
+MAX_TOKENS="${CHAD_PHASE2_MAX_TOKENS:-4096}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kind)         KIND="$2"; shift 2 ;;
+    --use-premium)  USE_PREMIUM=1; shift ;;
+    --model)        MODEL="$2"; shift 2 ;;
+    --timeout)      TIMEOUT="$2"; shift 2 ;;
+    --max-tokens)   MAX_TOKENS="$2"; shift 2 ;;
+    *)              shift ;;
+  esac
+done
+
+write_output() {
+  python3 - "$OUTPUT" "$@" <<'PY'
+import json, sys
+out = sys.argv[1]
+payload = json.loads(sys.argv[2])
+with open(out, "w") as f:
+    json.dump(payload, f)
+PY
+}
+
+if [ -z "$INPUT" ] || [ -z "$OUTPUT" ]; then
+  echo "usage: chad-phase2-draft-replies <input.json> <output.json> [opts]" >&2
+  exit 2
+fi
+if [ ! -r "$INPUT" ]; then
+  write_output '{"drafts":[],"error":"input file unreadable"}'
+  exit 0
+fi
+
+# Build the prompt + decide model. Output: PROMPT_FILE, EFFECTIVE_MODEL.
+PROMPT_FILE="$(mktemp)"
+META_FILE="$(mktemp)"
+trap 'rm -f "$PROMPT_FILE" "$META_FILE"' EXIT
+
+INPUT="$INPUT" KIND="$KIND" USE_PREMIUM="$USE_PREMIUM" MODEL="$MODEL" \
+PROMPT_FILE="$PROMPT_FILE" META_FILE="$META_FILE" \
+python3 <<'PY'
+import json, os, sys
+src = json.load(open(os.environ["INPUT"]))
+park = src.get("park") or []
+kind = os.environ["KIND"]
+use_premium = os.environ["USE_PREMIUM"] == "1"
+explicit_model = os.environ.get("MODEL", "").strip()
+
+# Trim each park entry to a token-friendly slice.
+def trim(s, n=600):
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+items = []
+any_premium = False
+for e in park[:int(os.environ.get("CHAD_PHASE2_MAX_ITEMS", "8"))]:
+    items.append({
+        "idx": e.get("idx"),
+        "id": e.get("id", ""),
+        "subject": trim(e.get("subject", ""), 180),
+        "from": trim(e.get("from", ""), 120),
+        "body": trim(e.get("body", ""), 600),
+        "flags": e.get("flags", ""),
+        "premium_eligible": bool(e.get("premium_eligible")),
+    })
+    if e.get("premium_eligible"):
+        any_premium = True
+
+# Decide model. Premium routes through Sonnet by default; explicit --model wins.
+if explicit_model:
+    model = explicit_model
+elif use_premium and any_premium:
+    model = "claude-sonnet-4-6"
+else:
+    model = "moonshotai/kimi-k2.5"
+
+if kind == "issue":
+    persona = (
+        "You are Chad's issue-triage drafter. For each parked GitHub issue, "
+        "decide one of: skip, comment-draft, close-stale. Comment drafts "
+        "should be short (≤120 words), professional, technical."
+    )
+else:
+    persona = (
+        "You are Chad's email reply drafter. For each parked email, decide "
+        "one of: skip, draft. Drafts should be short (≤120 words), warm, "
+        "first-person, and end with a single clear next step or question. "
+        "Skip marketing, automated, or no-action-needed messages."
+    )
+
+rules = (
+    "STRICT RULES:\n"
+    "  • Output exactly ONE valid JSON object on a SINGLE line. No prose. No code fences.\n"
+    "  • Do NOT call any tools. Do NOT request more information.\n"
+    "  • If unsure, use {\"action\":\"skip\",\"reason\":\"insufficient context\"}.\n"
+    "  • Reason must be ≤80 chars. Draft must be ≤120 words.\n"
+)
+
+schema = (
+    'Schema: {"drafts":[{"id":"<msg-id>","action":"draft|skip|'
+    'comment-draft|close-stale","reason":"<why>","draft":"<text-when-applicable>"}, ...]}'
+)
+
+prompt = (
+    persona + "\n\n" + rules + "\n" + schema +
+    "\n\nParked items (JSON):\n" + json.dumps({"park": items}, ensure_ascii=False) +
+    "\n\nReturn ONLY the JSON object. No surrounding text."
+)
+
+with open(os.environ["PROMPT_FILE"], "w") as f:
+    f.write(prompt)
+with open(os.environ["META_FILE"], "w") as f:
+    json.dump({"model": model, "premium": use_premium and any_premium,
+               "items": len(items)}, f)
+PY
+
+EFFECTIVE_MODEL="$(python3 -c "import json,sys; print(json.load(open('$META_FILE'))['model'])")"
+PREMIUM_ROUTING="$(python3 -c "import json,sys; print(int(json.load(open('$META_FILE'))['premium']))")"
+ITEMS="$(python3 -c "import json,sys; print(json.load(open('$META_FILE'))['items'])")"
+
+if [ "$ITEMS" -eq 0 ]; then
+  write_output '{"drafts":[],"error":"no input items"}'
+  exit 0
+fi
+
+RESP_FILE="$(mktemp)"
+ERR_FILE="$(mktemp)"
+trap 'rm -f "$PROMPT_FILE" "$META_FILE" "$RESP_FILE" "$ERR_FILE"' EXIT
+
+# ── Inference call ───────────────────────────────────────────────────
+# Premium path: chad-premium-client (handles AuthContext + audit).
+# Local path: openclaw agent --local with thinking ON, no MCP, no tools.
+if [ "$PREMIUM_ROUTING" -eq 1 ] && [ -x /usr/local/bin/chad-premium-client ]; then
+  if /usr/local/bin/chad-premium-client \
+        --model "$EFFECTIVE_MODEL" \
+        --max-tokens "$MAX_TOKENS" \
+        --timeout "$TIMEOUT" \
+        --stdin \
+        --system "Respond with one valid JSON object on a single line. Do not call tools. Do not use code fences." \
+        < "$PROMPT_FILE" > "$RESP_FILE" 2> "$ERR_FILE"; then
+    INVOKE_STATUS="ok"
+  else
+    INVOKE_STATUS="failed"
+  fi
+else
+  # openclaw agent --local: K2.5 via gateway. thinking=on is safe here
+  # because there are no tools to round-trip. --no-mcp would be ideal
+  # but is not exposed on 2026.4.x; the prompt itself forbids tool use,
+  # which the agent honors when no tool definitions are surfaced.
+  PROMPT_BODY="$(cat "$PROMPT_FILE")"
+  if env HOME=/sandbox \
+       timeout --kill-after=5 "${TIMEOUT}s" \
+       openclaw agent --agent main --local \
+         --session-id "phase2-$(date -u +%s)" \
+         -m "$PROMPT_BODY" \
+       > "$RESP_FILE" 2> "$ERR_FILE"; then
+    INVOKE_STATUS="ok"
+  else
+    INVOKE_STATUS="failed"
+  fi
+fi
+
+# ── Parse ────────────────────────────────────────────────────────────
+RESP_FILE="$RESP_FILE" ERR_FILE="$ERR_FILE" \
+INVOKE_STATUS="$INVOKE_STATUS" \
+EFFECTIVE_MODEL="$EFFECTIVE_MODEL" \
+PREMIUM_ROUTING="$PREMIUM_ROUTING" \
+OUTPUT="$OUTPUT" \
+python3 <<'PY'
+import json, os, re, sys
+resp = open(os.environ["RESP_FILE"]).read()
+err = open(os.environ["ERR_FILE"]).read() if os.path.isfile(os.environ["ERR_FILE"]) else ""
+status = os.environ["INVOKE_STATUS"]
+model = os.environ["EFFECTIVE_MODEL"]
+premium = os.environ["PREMIUM_ROUTING"] == "1"
+
+def write(payload):
+    with open(os.environ["OUTPUT"], "w") as f:
+        json.dump(payload, f)
+
+if status != "ok" and not resp.strip():
+    write({"drafts": [], "error": f"agent exit non-zero: {err.strip()[:240]}"})
+    sys.exit(0)
+
+# Extract the first balanced JSON object from the response.
+text = resp.strip()
+# Models sometimes wrap in code fences or pre/post chatter; pull the
+# first {...} balanced span.
+def find_json(s):
+    start = s.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            c = s[i]
+            if esc:
+                esc = False; continue
+            if c == "\\":
+                esc = True; continue
+            if c == '"':
+                in_str = not in_str; continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+        start = s.find("{", start + 1)
+    return None
+
+raw_json = find_json(text)
+if not raw_json:
+    write({"drafts": [], "error": "no JSON object in response", "raw": text[:500]})
+    sys.exit(0)
+
+try:
+    parsed = json.loads(raw_json)
+except json.JSONDecodeError as exc:
+    write({"drafts": [], "error": f"json decode: {exc}", "raw": raw_json[:500]})
+    sys.exit(0)
+
+drafts = parsed.get("drafts")
+if not isinstance(drafts, list):
+    write({"drafts": [], "error": "missing drafts array"})
+    sys.exit(0)
+
+cleaned = []
+for d in drafts:
+    if not isinstance(d, dict):
+        continue
+    cleaned.append({
+        "id": str(d.get("id", "")),
+        "action": str(d.get("action", "skip")),
+        "reason": str(d.get("reason", ""))[:200],
+        "draft": str(d.get("draft", ""))[:2000] if d.get("draft") else "",
+        "model": model,
+        "premium": premium,
+    })
+
+write({"drafts": cleaned})
+PY
+
+exit 0

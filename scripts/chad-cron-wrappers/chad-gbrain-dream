@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-gbrain-dream — Daily gbrain maintenance + workspace sync.
+#
+# Replaces the multi-step prompt previously sent to the embedded model.
+# The cron prompt now just calls this and reports its output.
+#
+# Steps:
+#   1. Ensure today's memory file exists
+#   2. Sync workspace docs into the brain (parallel `gbrain put`)
+#   3. gbrain embed --stale (vectorize new content)
+#   4. gbrain extract links --source db
+#   5. gbrain extract timeline --source db
+#   6. gbrain doctor
+#   7. Append "## Brain maintenance" summary to today's memory file
+#
+# Designed to finish in well under 60s so the embedded model's exec tool
+# returns a "completed" status (not "still running"). All gbrain put calls
+# run in parallel; each is hard-capped via `timeout` so a slow embedding
+# call can't hang the whole job.
+
+set -uo pipefail
+
+WORKSPACE="/sandbox/.openclaw/workspace"
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+LOG="$(mktemp)"
+RESULTS="$(mktemp -d)"
+TS="$(date -u +%FT%TZ)"
+PUT_TIMEOUT=20
+
+put_doc_async() {
+  local name="$1"
+  local src="${WORKSPACE}/${name}.md"
+  local slug
+  slug="system/$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+  local result_file="${RESULTS}/${name}"
+  if [ ! -f "$src" ]; then
+    echo "skipped (missing): ${slug}" > "$result_file"
+    return 0
+  fi
+  if timeout "$PUT_TIMEOUT" gbrain put "$slug" --content "$(cat "$src")" >>"$LOG" 2>&1; then
+    echo "ok: ${slug}" > "$result_file"
+  else
+    echo "FAILED: ${slug}" > "$result_file"
+  fi
+}
+
+run_step() {
+  local label="$1"
+  shift
+  if timeout 60 "$@" >>"$LOG" 2>&1; then
+    echo "${label}: ok"
+  else
+    echo "${label}: FAILED (exit $?)"
+  fi
+}
+
+# Fire off all workspace puts in parallel.
+for doc in SOUL USER AGENTS MEMORY HEARTBEAT TOOLS EMAIL-POLICY IDENTITY; do
+  put_doc_async "$doc" &
+done
+
+# Today's memory log (read its current content before any wrapper-write happens below).
+today="$(basename "$MEMORY_FILE" .md)"
+(
+  if timeout "$PUT_TIMEOUT" gbrain put "memory/${today}" --content "$(cat "$MEMORY_FILE")" >>"$LOG" 2>&1; then
+    echo "ok: memory/${today}" > "${RESULTS}/__memory"
+  else
+    echo "FAILED: memory/${today}" > "${RESULTS}/__memory"
+  fi
+) &
+
+wait
+
+{
+  echo ""
+  echo "## Brain maintenance — ${TS}"
+  echo ""
+  echo "### Workspace sync"
+  for f in "$RESULTS"/*; do
+    echo "  $(cat "$f")"
+  done
+  echo ""
+  echo "### Maintenance"
+  run_step "extract timeline" gbrain extract timeline --source db
+  echo ""
+  echo "### Doctor"
+  timeout 10 gbrain doctor 2>&1 | tail -3 || echo "doctor: FAILED or timed out"
+} >> "$MEMORY_FILE"
+
+# Detach slow steps. embed --stale walks all pages (~1s/page over 1000+);
+# extract links is LLM-driven (60s+). They write their own logs and the
+# next dream cycle picks up wherever they left off. nohup + disown so they
+# survive shell exit.
+TS_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
+EMBED_LOG="/tmp/chad-gbrain-embed-${TS_TAG}.log"
+LINK_LOG="/tmp/chad-gbrain-extract-links-${TS_TAG}.log"
+nohup bash -c "gbrain embed --stale" >"$EMBED_LOG" 2>&1 < /dev/null &
+disown 2>/dev/null || true
+nohup bash -c "gbrain extract links --source db" >"$LINK_LOG" 2>&1 < /dev/null &
+disown 2>/dev/null || true
+{
+  echo "embed --stale: detached (log: ${EMBED_LOG})"
+  echo "extract links: detached (log: ${LINK_LOG})"
+} >> "$MEMORY_FILE"
+
+rm -rf "$RESULTS" "$LOG"
+echo "gbrain dream complete → ${MEMORY_FILE}"

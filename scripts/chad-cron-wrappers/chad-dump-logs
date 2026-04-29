@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-dump-logs — bulk-fetch every log stream the sandbox knows about.
+#
+# Categories (selectable via --category gateway,cron,subagent,memory,tui,system):
+#   gateway   /tmp/gateway.log, /tmp/dns-proxy.log, /tmp/auto-pair.log
+#   cron      openclaw cron list/runs snapshots, /sandbox/.openclaw-data/queue/tasks.jsonl,
+#             /sandbox/.openclaw-data/budget.json, /tmp/chad-*-<TS>.log (recent)
+#   subagent  /sandbox/.openclaw-data/subagents/*/{result.json,stderr.log,prompt.txt}
+#   memory    /sandbox/.openclaw/workspace/memory/<UTC-date>.md (today + yesterday)
+#   tui       openshell session metadata (best-effort), shields-audit
+#   system    journalctl tail (if available), uname, df, mount, ps, free
+#   premium   /tmp/chad-premium.jsonl (audit ledger), chad-auth-context show
+#
+# Output: tarball at /tmp/chad-dump-<TS>.tar.gz (path printed to stdout).
+# The host-side dump-logs.sh wrapper copies this back and unpacks it.
+#
+# Usage:
+#   chad-dump-logs                                # all categories, tail 200
+#   chad-dump-logs --tail 1000 --category cron,gateway
+#   chad-dump-logs --since "1 hour ago"           # passed to journalctl --since
+#   chad-dump-logs --no-redact                    # don't sanitize secrets
+
+set -uo pipefail
+
+TAIL_N=200
+SINCE=""
+CATEGORIES="gateway,cron,subagent,memory,tui,system,premium"
+REDACT=1
+OUTDIR_PREFIX="/tmp/chad-dump"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tail) TAIL_N="$2"; shift 2 ;;
+    --since) SINCE="$2"; shift 2 ;;
+    --category) CATEGORIES="$2"; shift 2 ;;
+    --no-redact) REDACT=0; shift ;;
+    -h|--help)
+      sed -n '4,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "chad-dump-logs: unknown flag $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+WORKDIR="$(mktemp -d -t chad-dump.XXXXXX)"
+trap 'rm -rf "$WORKDIR"' EXIT
+DUMPDIR="${WORKDIR}/chad-dump-${TS}"
+mkdir -p "$DUMPDIR"
+
+want() { printf ',%s,' "$CATEGORIES" | grep -q ",$1,"; }
+
+snapshot() {
+  # snapshot <category> <name> <command>
+  local cat="$1" name="$2"
+  shift 2
+  local dest="${DUMPDIR}/${cat}/${name}"
+  mkdir -p "$(dirname "$dest")"
+  ( "$@" ) > "$dest" 2>&1 || true
+}
+
+copy_tail() {
+  # copy_tail <category> <src> [dest-name]
+  local cat="$1" src="$2" name="${3:-$(basename "$src")}"
+  local dest="${DUMPDIR}/${cat}/${name}"
+  mkdir -p "$(dirname "$dest")"
+  if [ -r "$src" ]; then
+    tail -n "$TAIL_N" "$src" > "$dest" 2>/dev/null || true
+  else
+    echo "(missing: $src)" > "$dest"
+  fi
+}
+
+redact() {
+  # redact common secret shapes in-place across the dumped tree.
+  [ "$REDACT" -eq 1 ] || return 0
+  find "$DUMPDIR" -type f \( -name "*.json" -o -name "*.jsonl" -o -name "*.log" -o -name "*.md" -o -name "*.txt" \) -print0 |
+    xargs -0 -I{} sed -i.bak -E \
+      -e 's/(sk-ant-[A-Za-z0-9_-]{8,})[A-Za-z0-9_-]{4,}/\1__REDACTED/g' \
+      -e 's/(nvapi-[A-Za-z0-9_-]{8,})[A-Za-z0-9_-]{4,}/\1__REDACTED/g' \
+      -e 's/(github_pat_[A-Za-z0-9_]{8,})[A-Za-z0-9_]{4,}/\1__REDACTED/g' \
+      -e 's/(ghp_[A-Za-z0-9]{8,})[A-Za-z0-9]{4,}/\1__REDACTED/g' \
+      -e 's/("(?:apiKey|api_key|token|password|PROTON_PASSWORD|NEMOCLAW_INVOKER_TOKEN)"[[:space:]]*:[[:space:]]*")[^"]+/\1__REDACTED/g' \
+      "{}" 2>/dev/null || true
+  find "$DUMPDIR" -name "*.bak" -delete 2>/dev/null || true
+}
+
+## ── Gateway ─────────────────────────────────────────────────────────────
+if want gateway; then
+  copy_tail gateway gateway.log /tmp/gateway.log
+  copy_tail gateway dns-proxy.log /tmp/dns-proxy.log
+  copy_tail gateway auto-pair.log /tmp/auto-pair.log
+  snapshot gateway openclaw-config.json cat /sandbox/.openclaw/openclaw.json
+fi
+
+## ── Cron ────────────────────────────────────────────────────────────────
+if want cron; then
+  snapshot cron openclaw-cron-list.json sh -c "openclaw cron list --json 2>/dev/null"
+  snapshot cron openclaw-cron-runs.txt sh -c "openclaw cron runs 2>/dev/null | head -n 200"
+  copy_tail cron tasks.jsonl /sandbox/.openclaw-data/queue/tasks.jsonl
+  snapshot cron budget.json cat /sandbox/.openclaw-data/budget.json
+  # Most recent N detached cron output files
+  mkdir -p "${DUMPDIR}/cron/detached"
+  ls -t /tmp/chad-*-*.log 2>/dev/null | head -n 10 | while read -r f; do
+    tail -n "$TAIL_N" "$f" > "${DUMPDIR}/cron/detached/$(basename "$f")" 2>/dev/null || true
+  done
+fi
+
+## ── Subagent ────────────────────────────────────────────────────────────
+if want subagent; then
+  if [ -d /sandbox/.openclaw-data/subagents ]; then
+    mkdir -p "${DUMPDIR}/subagent"
+    ls -t /sandbox/.openclaw-data/subagents 2>/dev/null | head -n 10 | while read -r d; do
+      sa_src="/sandbox/.openclaw-data/subagents/$d"
+      sa_dst="${DUMPDIR}/subagent/$d"
+      mkdir -p "$sa_dst"
+      for f in result.json stderr.log stdout.log prompt.txt; do
+        if [ -r "$sa_src/$f" ]; then
+          tail -n "$TAIL_N" "$sa_src/$f" > "$sa_dst/$f" 2>/dev/null || true
+        fi
+      done
+    done
+  else
+    echo "(no /sandbox/.openclaw-data/subagents dir)" > "${DUMPDIR}/subagent/_missing"
+  fi
+fi
+
+## ── Memory (TUI ack log) ────────────────────────────────────────────────
+if want memory; then
+  today="$(date -u +%Y-%m-%d)"
+  yesterday="$(date -u -d 'yesterday' +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d)"
+  copy_tail memory "today-${today}.md" "/sandbox/.openclaw/workspace/memory/${today}.md"
+  copy_tail memory "yesterday-${yesterday}.md" "/sandbox/.openclaw/workspace/memory/${yesterday}.md"
+  copy_tail memory feedback-proposals.md /sandbox/.openclaw-data/memory/feedback-proposals.md
+fi
+
+## ── TUI / shields ───────────────────────────────────────────────────────
+if want tui; then
+  copy_tail tui shields-audit.jsonl ~/.nemoclaw/state/shields-audit.jsonl
+  copy_tail tui mail-handled.jsonl /sandbox/.openclaw/workspace/state/mail-handled.jsonl
+fi
+
+## ── System ──────────────────────────────────────────────────────────────
+if want system; then
+  snapshot system uname.txt uname -a
+  snapshot system df.txt df -h
+  snapshot system free.txt sh -c "free -h 2>/dev/null || vm_stat"
+  snapshot system ps.txt sh -c "ps -eo pid,ppid,user,cmd --sort=-pcpu 2>/dev/null | head -n 50 || ps aux | head -n 50"
+  if command -v journalctl >/dev/null 2>&1; then
+    if [ -n "$SINCE" ]; then
+      snapshot system journalctl.log journalctl --no-pager --since "$SINCE" -n "$TAIL_N"
+    else
+      snapshot system journalctl.log journalctl --no-pager -n "$TAIL_N"
+    fi
+  fi
+fi
+
+## ── Premium ledger ──────────────────────────────────────────────────────
+if want premium; then
+  copy_tail premium chad-premium.jsonl /tmp/chad-premium.jsonl
+  if command -v chad-auth-context >/dev/null 2>&1; then
+    snapshot premium auth-context-current.json chad-auth-context show
+  fi
+fi
+
+# Write a manifest with versions and what was collected
+{
+  echo "chad-dump-logs manifest"
+  echo "ts: $TS"
+  echo "host: $(hostname 2>/dev/null || echo unknown)"
+  echo "tail_n: $TAIL_N"
+  echo "since: ${SINCE:-<none>}"
+  echo "categories: $CATEGORIES"
+  echo "redact: $REDACT"
+  echo ""
+  echo "files:"
+  find "$DUMPDIR" -type f -printf '  %p  (%s bytes)\n' 2>/dev/null | sed "s|$DUMPDIR/||"
+} > "${DUMPDIR}/MANIFEST.txt"
+
+redact
+
+OUT="${OUTDIR_PREFIX}-${TS}.tar.gz"
+tar -C "$WORKDIR" -czf "$OUT" "chad-dump-${TS}"
+echo "$OUT"

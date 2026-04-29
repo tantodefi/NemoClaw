@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-mail-check — Inbox sweep + state surface for the email-check cron.
+#
+# Writes the following sections to today's memory file:
+#   ## Mail check — <ts>
+#   ### Inbox (last 20)
+#   ### Recent sent (7d)
+#   ### Already handled (last 7d)
+#
+# The "Already handled" section is parsed from
+# /sandbox/.openclaw/workspace/state/mail-handled.jsonl, populated by
+# chad-mail-send. The cron agent reads these three sections together
+# before deciding what to act on — preventing re-replies and duplicate
+# sends across runs.
+#
+# Heavy content-creation work (e.g. tjcooke article requests) is still
+# routed through chad-intake when the cron agent identifies a matching
+# message. This script does inbox triage + state surfacing only.
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+# Pull MIN_BUDGET from scripts/task-profiles.json (single source of truth)
+# with a hardcoded fallback for sandboxes that haven't deployed the
+# registry yet. Override via CHAD_PROFILES_FILE for tests.
+MIN_BUDGET_FALLBACK=30000
+PROFILES_FILE="${CHAD_PROFILES_FILE:-/usr/local/share/chad/task-profiles.json}"
+MIN_BUDGET="$MIN_BUDGET_FALLBACK"
+if [ -r "$PROFILES_FILE" ]; then
+  MIN_BUDGET="$(python3 -c "import json; p=json.load(open('${PROFILES_FILE}')).get('profiles',{}).get('email-check',{}); print(p.get('minBudgetTokens', ${MIN_BUDGET_FALLBACK}))" 2>/dev/null || echo "${MIN_BUDGET_FALLBACK}")"
+fi
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+TS="$(date -u +%FT%TZ)"
+
+WORKSPACE_STATE="/sandbox/.openclaw/workspace/state"
+HANDLED_LOG="${WORKSPACE_STATE}/mail-handled.jsonl"
+mkdir -p "$WORKSPACE_STATE"
+touch "$HANDLED_LOG"
+
+# Budget gate. Read budget.json directly — chad-budget has a stale env-var
+# export bug (CHAD_BUDGET_FILE is exported unset). Falls back to 0 if missing.
+BUDGET_FILE="${CHAD_BUDGET_FILE:-/sandbox/.openclaw-data/budget.json}"
+REMAINING=0
+if [ -f "$BUDGET_FILE" ]; then
+  REMAINING="$(python3 -c "import json; print(json.load(open('${BUDGET_FILE}')).get('remaining_tokens',0))" 2>/dev/null || echo 0)"
+fi
+REMAINING="${REMAINING//[^0-9]/}"
+REMAINING="${REMAINING:-0}"
+
+if [ "$REMAINING" -lt "$MIN_BUDGET" ]; then
+  {
+    echo ""
+    echo "## Mail check skipped (low budget) — ${TS}"
+    echo "remaining_tokens=${REMAINING} (< ${MIN_BUDGET})"
+  } >> "$MEMORY_FILE"
+  echo "skipped: budget=${REMAINING}"
+  exit 0
+fi
+
+INBOX="$(mktemp)"
+SENT="$(mktemp)"
+HANDLED_VIEW="$(mktemp)"
+
+# Inbox sweep.
+if /usr/local/bin/proton-tool mail --limit=20 >"$INBOX" 2>&1; then
+  INBOX_STATUS="ok"
+else
+  INBOX_STATUS="FAILED (exit $?)"
+fi
+
+# Sent sweep (7-day window).
+if /usr/local/bin/proton-tool sent --days=7 --limit=30 >"$SENT" 2>&1; then
+  SENT_STATUS="ok"
+else
+  SENT_STATUS="FAILED (exit $?)"
+fi
+
+# Handled-log view (last 7d, most recent first).
+HANDLED_LOG_PATH="$HANDLED_LOG" python3 <<'PY' > "$HANDLED_VIEW"
+import json, os, datetime
+UTC = getattr(datetime, "UTC", datetime.timezone.utc)
+cutoff = datetime.datetime.now(UTC) - datetime.timedelta(days=7)
+log_path = os.environ["HANDLED_LOG_PATH"]
+try:
+    lines = open(log_path).read().splitlines()
+except FileNotFoundError:
+    lines = []
+rows = []
+for raw in lines:
+    if not raw.strip(): continue
+    try:
+        e = json.loads(raw)
+        ts = datetime.datetime.fromisoformat(e["ts"].replace("Z","+00:00"))
+        if ts >= cutoff:
+            rows.append((ts, e))
+    except Exception:
+        continue
+rows.sort(key=lambda r: r[0], reverse=True)
+if not rows:
+    print("(none)")
+for _, e in rows[:30]:
+    target = e.get("to") or "(reply)"
+    subj = e.get("subject") or ""
+    inrep = (e.get("in_reply_to") or "")[:20]
+    print(f"- [{e.get('ts')}] {e.get('action')} to={target} subject={subj!r} in_reply_to={inrep}")
+PY
+
+{
+  echo ""
+  echo "## Mail check — ${TS}"
+  echo "Inbox status: ${INBOX_STATUS}"
+  echo "Sent status: ${SENT_STATUS}"
+  echo "Budget remaining: ${REMAINING}"
+  echo ""
+  echo "### Inbox (last 20)"
+  echo '```'
+  head -100 "$INBOX"
+  echo '```'
+  echo ""
+  echo "### Recent sent (7d)"
+  echo '```'
+  head -80 "$SENT"
+  echo '```'
+  echo ""
+  echo "### Already handled (last 7d, from chad-mail-send log)"
+  echo '```'
+  cat "$HANDLED_VIEW"
+  echo '```'
+} >> "$MEMORY_FILE"
+
+cat "$INBOX"
+rm -f "$INBOX" "$SENT" "$HANDLED_VIEW"
+echo "chad-mail-check: appended Inbox + Recent sent + Already handled to ${MEMORY_FILE}"

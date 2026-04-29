@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-mail-send — proton-tool send/reply with dedup safeguards.
+#
+# Why: the cron agent reads memory files that contain old mail context, and
+# without state it will happily re-reply to threads it already replied to or
+# re-send the same body to the same recipient on consecutive days. This
+# wrapper enforces those rules at the boundary so a chatty agent cannot
+# spam recipients.
+#
+# Modes:
+#   chad-mail-send reply --id MSGID --body TEXT [--all] [--force]
+#   chad-mail-send new   --to ADDR --subject SUBJ --body TEXT [--cc ADDR] [--html] [--force]
+#
+# Body may also be read from stdin if --body is omitted.
+#
+# Dedup rules:
+#   reply: refuse if MSGID already has action=replied in mail-handled.jsonl
+#   any:   refuse if same recipient + same body-hash sent in last 24h
+#
+# Use --force to override (logged with action=replied-forced or sent-forced).
+#
+# Successful sends are appended to:
+#   /sandbox/.openclaw/workspace/state/mail-handled.jsonl
+# (workspace path so it gets included in chad-workspace-backup.)
+
+set -uo pipefail
+
+WORKSPACE_STATE="/sandbox/.openclaw/workspace/state"
+LOG_FILE="${WORKSPACE_STATE}/mail-handled.jsonl"
+DEDUP_HOURS=24
+
+mkdir -p "$WORKSPACE_STATE"
+touch "$LOG_FILE"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  chad-mail-send reply --id MSGID --body TEXT [--all] [--force]
+  chad-mail-send new   --to ADDR --subject SUBJ --body TEXT [--cc ADDR] [--html] [--force]
+EOF
+  exit 2
+}
+
+[ "$#" -ge 1 ] || usage
+mode="$1"; shift
+[ "$mode" = "reply" ] || [ "$mode" = "new" ] || usage
+
+msg_id=""; to=""; cc=""; subject=""; body=""; html=0; reply_all=0; force=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id)      msg_id="$2";   shift 2 ;;
+    --to)      to="$2";       shift 2 ;;
+    --cc)      cc="$2";       shift 2 ;;
+    --subject) subject="$2";  shift 2 ;;
+    --body)    body="$2";     shift 2 ;;
+    --all)     reply_all=1;   shift ;;
+    --html)    html=1;        shift ;;
+    --force)   force=1;       shift ;;
+    -h|--help) usage ;;
+    *) echo "chad-mail-send: unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+if [ -z "$body" ] && [ ! -t 0 ]; then
+  body="$(cat)"
+fi
+if [ -z "$body" ]; then
+  echo "chad-mail-send: --body (or stdin) is required" >&2
+  exit 2
+fi
+
+if [ "$mode" = "reply" ] && [ -z "$msg_id" ]; then
+  echo "chad-mail-send: reply requires --id MSGID" >&2; exit 2
+fi
+if [ "$mode" = "new" ] && { [ -z "$to" ] || [ -z "$subject" ]; }; then
+  echo "chad-mail-send: new requires --to and --subject" >&2; exit 2
+fi
+
+body_hash="$(printf %s "$body" | sha256sum | awk '{print $1}')"
+TS="$(date -u +%FT%TZ)"
+
+# ── Dedup checks (skipped when --force) ────────────────────────────
+if [ "$force" -eq 0 ]; then
+  CHECK_LOG="$LOG_FILE" \
+  CHECK_MODE="$mode" \
+  CHECK_MSG_ID="$msg_id" \
+  CHECK_TO="$to" \
+  CHECK_HASH="$body_hash" \
+  CHECK_HOURS="$DEDUP_HOURS" \
+  python3 <<'PY' || exit 3
+import json, os, sys, datetime
+log_path = os.environ["CHECK_LOG"]
+mode     = os.environ["CHECK_MODE"]
+msg_id   = os.environ["CHECK_MSG_ID"]
+to       = os.environ["CHECK_TO"]
+body_h   = os.environ["CHECK_HASH"]
+hours    = int(os.environ["CHECK_HOURS"])
+
+UTC = getattr(datetime, "UTC", datetime.timezone.utc)
+now = datetime.datetime.now(UTC)
+cutoff = now - datetime.timedelta(hours=hours)
+
+try:
+    lines = open(log_path).read().splitlines()
+except FileNotFoundError:
+    lines = []
+
+for raw in lines:
+    if not raw.strip(): continue
+    try:
+        e = json.loads(raw)
+    except Exception:
+        continue
+    # 1. No double-reply
+    if mode == "reply" and msg_id and e.get("in_reply_to") == msg_id and e.get("action") in ("replied","replied-forced"):
+        sys.stderr.write(
+            f"chad-mail-send: refused — already replied to {msg_id} at {e.get('ts')} "
+            f"(use --force to override)\n"
+        )
+        sys.exit(1)
+    # 2. No same-body-to-same-recipient within window
+    if e.get("body_hash") == body_h and (
+        (mode == "new"   and to == e.get("to")) or
+        (mode == "reply" and msg_id and e.get("in_reply_to") == msg_id)
+    ):
+        try:
+            ts_e = datetime.datetime.fromisoformat(e["ts"].replace("Z","+00:00"))
+            if ts_e >= cutoff:
+                sys.stderr.write(
+                    f"chad-mail-send: refused — identical body sent at {e.get('ts')} "
+                    f"(within {hours}h window; use --force to override)\n"
+                )
+                sys.exit(1)
+        except Exception:
+            pass
+PY
+fi
+
+# ── Send via proton-tool ──────────────────────────────────────────
+proton_args=()
+case "$mode" in
+  reply)
+    proton_args=(reply-mail --id="$msg_id" --body="$body")
+    [ "$reply_all" -eq 1 ] && proton_args+=(--all)
+    ;;
+  new)
+    proton_args=(send-mail --to="$to" --subject="$subject" --body="$body")
+    [ -n "$cc" ]         && proton_args+=(--cc="$cc")
+    [ "$html" -eq 1 ]    && proton_args+=(--html)
+    ;;
+esac
+
+OUT="$(mktemp)"
+if /usr/local/bin/proton-tool "${proton_args[@]}" >"$OUT" 2>&1; then
+  rc=0
+else
+  rc=$?
+fi
+
+# Extract resulting message ID if proton-tool printed one. proton-tool emits
+# "Message ID: ..." or "Draft created: ...". We capture either as best-effort.
+sent_id="$(grep -oE 'Message ID: [^ ]+' "$OUT" | tail -1 | awk '{print $3}')"
+[ -z "$sent_id" ] && sent_id="$(grep -oE 'Draft created: [^ ]+' "$OUT" | tail -1 | awk '{print $3}')"
+
+if [ "$rc" -ne 0 ]; then
+  echo "chad-mail-send: proton-tool failed (rc=$rc):" >&2
+  cat "$OUT" >&2
+  rm -f "$OUT"
+  exit "$rc"
+fi
+
+# ── Append to handled log ─────────────────────────────────────────
+action="$mode"
+[ "$action" = "reply" ] && action="replied"
+[ "$action" = "new" ]   && action="sent"
+[ "$force" -eq 1 ]      && action="${action}-forced"
+
+LOG_TS="$TS" \
+LOG_ACTION="$action" \
+LOG_MSGID="${sent_id:-}" \
+LOG_INREPLY="$msg_id" \
+LOG_TO="$to" \
+LOG_SUBJECT="$subject" \
+LOG_BODYHASH="$body_hash" \
+python3 <<'PY' >> "$LOG_FILE"
+import json, os
+print(json.dumps({
+    "ts": os.environ["LOG_TS"],
+    "action": os.environ["LOG_ACTION"],
+    "msg_id": os.environ["LOG_MSGID"] or None,
+    "in_reply_to": os.environ["LOG_INREPLY"] or None,
+    "to": os.environ["LOG_TO"] or None,
+    "subject": os.environ["LOG_SUBJECT"] or None,
+    "body_hash": os.environ["LOG_BODYHASH"],
+}, separators=(",", ":")))
+PY
+
+cat "$OUT"
+rm -f "$OUT"
+echo "chad-mail-send: logged action=${action} hash=${body_hash:0:12}"
+exit 0

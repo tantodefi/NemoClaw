@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-email-check-cron — Deterministic mail sweep for the email-check cron.
+#
+# Pipeline:
+#   1. Run chad-mail-check — surfaces Inbox/Recent sent/Already handled
+#      sections to today's memory file; emits the inbox listing on stdout.
+#   2. Parse the inbox + chad-mail-send's handled log; classify each
+#      message into MARK-READ vs PENDING-REPLY:
+#        MARK-READ when sender is NOT admin, OR Flags: replied is set,
+#                  OR id was already replied-to within DEDUP_HOURS.
+#        PENDING   otherwise (admin sender, fresh, awaiting reply).
+#   3. Batch `proton-tool mark-read --id=<csv>` for the MARK-READ set.
+#   4. Append "## Email-check (cron wrapper) — <ts>" block to memory:
+#      counts, mark-read status, and parked entries with id/from/subject.
+#
+# This wrapper deliberately does NOT draft replies or trigger chad-intake.
+# The Kimi-K2.5 ↔ openclaw harness multi-turn tool-call regression makes
+# any LLM-driven reply intermittent — see project_chad_cron_pattern memory.
+# When that's fixed, the cron prompt can grow back to include reply
+# drafting; for now the cron is observability + automated mark-read only.
+# Pending replies sit visible in today's memory for the human to handle.
+
+set -uo pipefail
+
+ADMIN_SENDERS_RE='tjcooke@protonmail\.com|tjcooke@pm\.me|tantodefi@proton\.me|supachad@proton\.me'
+# Subset of admins whose inbound mail authorizes a premium (Anthropic) call
+# downstream. See scripts/chad-cron-wrappers/chad-auth-context.
+PREMIUM_SENDERS_RE='tantodefi@proton\.me|supachad@proton\.me'
+DEDUP_HOURS=24
+
+WORKSPACE_STATE="/sandbox/.openclaw/workspace/state"
+HANDLED_LOG="${WORKSPACE_STATE}/mail-handled.jsonl"
+AUTH_CONTEXT_DIR="/sandbox/.openclaw-data/state/auth-context-mail"
+mkdir -p "$WORKSPACE_STATE" "$AUTH_CONTEXT_DIR"
+touch "$HANDLED_LOG"
+
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+TS="$(date -u +%FT%TZ)"
+
+# Phase 2 reads remaining_tokens to gate the optional LLM draft pass.
+# chad-mail-check has its own gate; this is a second, larger floor.
+BUDGET_FILE="${CHAD_BUDGET_FILE:-/sandbox/.openclaw-data/budget.json}"
+REMAINING=0
+if [ -f "$BUDGET_FILE" ]; then
+  REMAINING="$(python3 -c "import json; print(json.load(open('${BUDGET_FILE}')).get('remaining_tokens',0))" 2>/dev/null || echo 0)"
+fi
+REMAINING="${REMAINING//[^0-9]/}"
+REMAINING="${REMAINING:-0}"
+
+INBOX="$(mktemp)"
+CLASSIFIED="$(mktemp)"
+trap 'rm -f "$INBOX" "$CLASSIFIED"' EXIT
+
+# Step 1 — chad-mail-check handles its own budget gate, memory append, and
+# inbox surfacing. We capture stdout for parsing.
+if /usr/local/bin/chad-mail-check >"$INBOX" 2>&1; then
+  CHECK_STATUS="ok"
+else
+  rc=$?
+  CHECK_STATUS="FAILED (exit $rc)"
+  {
+    echo ""
+    echo "## Email-check (cron wrapper) — ${TS}"
+    echo "Status: chad-mail-check ${CHECK_STATUS}"
+    echo ""
+    echo '```'
+    head -80 "$INBOX"
+    echo '```'
+  } >> "$MEMORY_FILE"
+  echo "email-check: chad-mail-check ${CHECK_STATUS}"
+  exit "$rc"
+fi
+
+# If chad-mail-check skipped due to low budget, there's no inbox to parse.
+if grep -q '^skipped: budget=' "$INBOX"; then
+  echo "email-check: skipped (chad-mail-check reported low budget)"
+  exit 0
+fi
+
+# Step 2 — classify entries.
+PARSE_INBOX="$INBOX" \
+PARSE_HANDLED="$HANDLED_LOG" \
+PARSE_ADMINS="$ADMIN_SENDERS_RE" \
+PARSE_PREMIUM="$PREMIUM_SENDERS_RE" \
+PARSE_HOURS="$DEDUP_HOURS" \
+python3 - >"$CLASSIFIED" <<'PY'
+import json, os, re, datetime
+
+admin_re = re.compile(os.environ["PARSE_ADMINS"], re.IGNORECASE)
+premium_re = re.compile(os.environ["PARSE_PREMIUM"], re.IGNORECASE)
+hours = int(os.environ["PARSE_HOURS"])
+
+UTC = getattr(datetime, "UTC", datetime.timezone.utc)
+cutoff = datetime.datetime.now(UTC) - datetime.timedelta(hours=hours)
+
+recent_replied = set()
+try:
+    for raw in open(os.environ["PARSE_HANDLED"]):
+        if not raw.strip():
+            continue
+        try:
+            e = json.loads(raw)
+            ts = datetime.datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+            if ts >= cutoff and e.get("action") in ("replied", "replied-forced") and e.get("in_reply_to"):
+                recent_replied.add(e["in_reply_to"])
+        except Exception:
+            continue
+except FileNotFoundError:
+    pass
+
+text = open(os.environ["PARSE_INBOX"]).read()
+entries = []
+cur = None
+for line in text.splitlines():
+    m = re.match(r'^\[(\d+)\]\s+(.*)$', line)
+    if m:
+        if cur:
+            entries.append(cur)
+        cur = {"idx": int(m.group(1)), "subject": m.group(2), "from": "", "id": "", "flags": ""}
+        continue
+    if cur is None:
+        continue
+    m = re.match(r'^\s+From:\s+(.*)$', line)
+    if m:
+        cur["from"] = m.group(1).strip()
+        continue
+    m = re.match(r'^\s+ID:\s+(\S+)$', line)
+    if m:
+        cur["id"] = m.group(1).strip()
+        continue
+    m = re.match(r'^\s+Flags:\s+(.*)$', line)
+    if m:
+        cur["flags"] = m.group(1).strip()
+        continue
+if cur:
+    entries.append(cur)
+
+mark_read, park = [], []
+for e in entries:
+    sender_admin = bool(admin_re.search(e["from"]))
+    e["premium_eligible"] = bool(premium_re.search(e["from"]))
+    replied_flag = "replied" in e["flags"]
+    recently_handled = e["id"] in recent_replied
+    if not sender_admin or replied_flag or recently_handled:
+        mark_read.append(e)
+    else:
+        park.append(e)
+
+print(json.dumps({
+    "total": len(entries),
+    "mark_read_ids": [e["id"] for e in mark_read if e["id"]],
+    "park": park,
+}))
+PY
+
+TOTAL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["total"])' "$CLASSIFIED")"
+MARK_READ_IDS="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["mark_read_ids"]))' "$CLASSIFIED")"
+PARK_COUNT="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["park"]))' "$CLASSIFIED")"
+
+MARK_COUNT=0
+if [ -n "$MARK_READ_IDS" ]; then
+  MARK_COUNT="$(echo "$MARK_READ_IDS" | tr ',' '\n' | wc -l | tr -d ' ')"
+fi
+
+# For each premium-eligible parked message, drop a per-message AuthContext
+# file so a downstream reply tool (or human-invoked chad-premium) can resolve
+# the trigger back to a verified identity. Files accumulate; chad-mail-send
+# /chad-premium-client may consume + delete on action.
+PREMIUM_PARK_COUNT="$(python3 - "$CLASSIFIED" "$AUTH_CONTEXT_DIR" "$TS" <<'PY'
+import json, sys, os, re, hashlib
+classified, ctx_dir, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+park = json.load(open(classified))["park"]
+n = 0
+for e in park:
+    if not e.get("premium_eligible") or not e.get("id"):
+        continue
+    safe_id = re.sub(r'[^A-Za-z0-9_.-]', '_', e["id"])[:64]
+    if not safe_id:
+        safe_id = hashlib.sha1(e["id"].encode()).hexdigest()[:16]
+    out = os.path.join(ctx_dir, f"{safe_id}.json")
+    with open(out, "w") as f:
+        json.dump({
+            "source": "email",
+            "verifiedIdentity": e["from"],
+            "allowsPremium": True,
+            "createdAt": ts,
+            "createdBy": "chad-email-check-cron",
+            "scope": {"messageId": e["id"], "subject": e["subject"]},
+        }, f)
+    n += 1
+print(n)
+PY
+)"
+
+# Step 3 — batch mark-read.
+MARK_STATUS="skipped"
+if [ -n "$MARK_READ_IDS" ]; then
+  if /usr/local/bin/proton-tool mark-read --id="$MARK_READ_IDS" >/dev/null 2>&1; then
+    MARK_STATUS="ok"
+  else
+    rc=$?
+    MARK_STATUS="FAILED (exit $rc)"
+  fi
+fi
+
+# Step 4 — memory append.
+{
+  echo ""
+  echo "## Email-check (cron wrapper) — ${TS}"
+  echo "Inbox total: ${TOTAL}"
+  echo "Marked read: ${MARK_COUNT} (${MARK_STATUS})"
+  echo "Pending replies: ${PARK_COUNT}"
+  echo "Premium-eligible parks: ${PREMIUM_PARK_COUNT} (auth context dir: ${AUTH_CONTEXT_DIR})"
+  if [ "$PARK_COUNT" -gt 0 ]; then
+    echo ""
+    echo "### Pending replies (admin sender, fresh, awaiting reply)"
+    python3 - "$CLASSIFIED" <<'PY'
+import json, sys
+for e in json.load(open(sys.argv[1]))["park"]:
+    tag = " 🔐 PREMIUM-ELIGIBLE" if e.get("premium_eligible") else ""
+    print(f"- [{e['idx']}]{tag} {e['subject']}")
+    print(f"  from: {e['from']}")
+    print(f"  id: {e['id']}")
+    if e["flags"]:
+        print(f"  flags: {e['flags']}")
+    if e.get("premium_eligible"):
+        print(f"  premium: prefix reply prompt with `/premium` or shell `chad-premium`")
+PY
+  fi
+} >> "$MEMORY_FILE"
+
+# ── Step 5 — Phase 2 (optional LLM draft pass) ───────────────────────
+# Gated by:
+#   1. profile defines a `phase2` block
+#   2. PARK_COUNT > 0 (something to draft)
+#   3. remaining_tokens >= phase2.minBudgetTokens
+# Single-turn, no MCP, no tools — K2.5-safe by construction. NEVER
+# auto-sends; drafts append to memory under "### Draft replies (review
+# before sending)" for human gating. Failures here are non-fatal.
+DRAFT_COUNT=0
+PHASE2_STATUS="not-configured"
+
+if [ "$PARK_COUNT" -gt 0 ]; then
+  PHASE2_CFG="$(python3 - "$CLASSIFIED" <<PY
+import json, os
+cfg_path = os.environ.get("CHAD_PROFILES_FILE", "/usr/local/share/chad/task-profiles.json")
+try:
+    p = json.load(open(cfg_path)).get("profiles", {}).get("email-check", {})
+    ph = p.get("phase2") or {}
+except Exception:
+    ph = {}
+if not ph:
+    print("")
+else:
+    print(json.dumps({
+        "minBudgetTokens": ph.get("minBudgetTokens", 0),
+        "timeoutSeconds": ph.get("timeoutSeconds", 60),
+        "maxOutputTokens": ph.get("maxOutputTokens", 4096),
+        "usePremium": bool(ph.get("usePremium")),
+        "model": ph.get("model", ""),
+    }))
+PY
+)"
+
+  if [ -n "$PHASE2_CFG" ] && [ -x /usr/local/bin/chad-phase2-draft-replies ]; then
+    PHASE2_MIN_BUDGET="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("minBudgetTokens",0))')"
+    PHASE2_TIMEOUT="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("timeoutSeconds",60))')"
+    PHASE2_MAX_TOK="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("maxOutputTokens",4096))')"
+    PHASE2_PREMIUM="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(int(bool(json.load(sys.stdin).get("usePremium"))))')"
+    PHASE2_MODEL="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model","") or "")')"
+
+    if [ "$REMAINING" -lt "$PHASE2_MIN_BUDGET" ]; then
+      PHASE2_STATUS="skipped (budget=${REMAINING} < ${PHASE2_MIN_BUDGET})"
+    else
+      PHASE2_OUT="$(mktemp)"
+      PHASE2_ARGS=( --kind email --timeout "$PHASE2_TIMEOUT" --max-tokens "$PHASE2_MAX_TOK" )
+      [ "$PHASE2_PREMIUM" = "1" ] && PHASE2_ARGS+=( --use-premium )
+      [ -n "$PHASE2_MODEL" ] && PHASE2_ARGS+=( --model "$PHASE2_MODEL" )
+
+      # If a premium-eligible park exists and usePremium is on, attach the
+      # first matching AuthContext so chad-premium-client passes its gate.
+      if [ "$PHASE2_PREMIUM" = "1" ] && [ "$PREMIUM_PARK_COUNT" -gt 0 ]; then
+        FIRST_CTX="$(ls -1 "${AUTH_CONTEXT_DIR}"/*.json 2>/dev/null | head -n 1 || true)"
+        [ -n "$FIRST_CTX" ] && export CHAD_AUTH_CONTEXT_PATH="$FIRST_CTX"
+      fi
+
+      if /usr/local/bin/chad-phase2-draft-replies "$CLASSIFIED" "$PHASE2_OUT" \
+            "${PHASE2_ARGS[@]}" 2>/dev/null; then
+        DRAFT_COUNT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len([x for x in d.get("drafts",[]) if x.get("action") in ("draft","comment-draft")]))' "$PHASE2_OUT")"
+        DRAFT_ERR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error","") or "")' "$PHASE2_OUT")"
+        if [ -n "$DRAFT_ERR" ]; then
+          PHASE2_STATUS="degraded (${DRAFT_ERR})"
+        else
+          PHASE2_STATUS="ok (drafts=${DRAFT_COUNT})"
+        fi
+        # Append drafts block.
+        {
+          echo ""
+          echo "### Draft replies (review before sending)"
+          echo "_Phase 2 single-turn pass. NEVER auto-sends. Review then send via chad-mail-send / chad-premium._"
+          python3 - "$PHASE2_OUT" "$CLASSIFIED" <<'PY'
+import json, sys
+out = json.load(open(sys.argv[1]))
+park = {e["id"]: e for e in json.load(open(sys.argv[2])).get("park", [])}
+for d in out.get("drafts", []):
+    e = park.get(d.get("id"))
+    head_idx = f"[{e['idx']}] " if e else ""
+    head_from = f"  from: {e['from']}" if e else ""
+    badge = " 🔐 PREMIUM" if d.get("premium") else ""
+    action = d.get("action", "skip")
+    print(f"\n#### {head_idx}{(e['subject'] if e else d.get('id'))}{badge}")
+    if e:
+        print(head_from)
+    print(f"  model: {d.get('model','?')}")
+    print(f"  decision: **{action}** — {d.get('reason','')}")
+    if action in ("draft", "comment-draft") and d.get("draft"):
+        print(f"  draft:\n  > {d['draft'].replace(chr(10), chr(10)+'  > ')}")
+PY
+        } >> "$MEMORY_FILE"
+      else
+        PHASE2_STATUS="failed (helper exit non-zero)"
+      fi
+      rm -f "$PHASE2_OUT"
+    fi
+
+    # Memo at end of memory block so it's grep-able.
+    {
+      echo ""
+      echo "_phase2: ${PHASE2_STATUS}_"
+    } >> "$MEMORY_FILE"
+  fi
+fi
+
+echo "email-check: total=${TOTAL} marked-read=${MARK_COUNT} pending=${PARK_COUNT} premium=${PREMIUM_PARK_COUNT} drafts=${DRAFT_COUNT} phase2=${PHASE2_STATUS}"
+exit 0

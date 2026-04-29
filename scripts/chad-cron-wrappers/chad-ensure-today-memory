@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-ensure-today-memory — Idempotently ensures today's memory log exists.
+#
+# Every cron job appends to memory/<UTC-date>.md. If the file is missing, the
+# append fails. The previous prompt-based approach asked the embedded model to
+# evaluate $(date -u +%Y-%m-%d) inline, which was unreliable. This wrapper does
+# it in pure shell so the model only has to invoke one command.
+#
+# Usage: chad-ensure-today-memory
+# Output: prints the absolute path of the file (newly created or existing).
+
+set -euo pipefail
+
+MEMORY_DIR="/sandbox/.openclaw/workspace/memory"
+TODAY="$(date -u +%Y-%m-%d)"
+TARGET="${MEMORY_DIR}/${TODAY}.md"
+
+mkdir -p "$MEMORY_DIR"
+
+if [ ! -f "$TARGET" ]; then
+  printf '# %s\n' "$TODAY" > "$TARGET"
+fi
+
+echo "$TARGET"
