@@ -87,4 +87,10 @@ network_policies:
         port: 443
         access: full
     binaries:
+      # /usr/local/bin/proton-tool is a shell wrapper that exec()s
+      # /usr/local/bin/proton-tool-bin (renamed by chad-setup.sh so PROTON_*
+      # env vars can be loaded from credentials.json before invocation).
+      # OPA pins by /proc/self/exe, so the L7 gateway sees the bin path
+      # after exec — both must be allowlisted for the wrapper flow to work.
       - { path: "/usr/local/bin/proton-tool" }
+      - { path: "/usr/local/bin/proton-tool-bin" }
