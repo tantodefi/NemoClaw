@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""chad-premium-client — call Anthropic Messages API after AuthContext check.
+
+Reads ANTHROPIC_API_KEY from /sandbox/.nemoclaw/credentials.json (deployed
+by chad-setup.sh). Validates $CHAD_AUTH_CONTEXT_PATH says allowsPremium=true.
+Streams the response to stdout. Appends one audit line per call to
+/tmp/chad-premium.jsonl.
+
+Usage:
+  chad-premium-client --probe                       # cheap connectivity check
+  chad-premium-client --model <id> [--max-tokens N] [--system "..."]  "<prompt>"
+  echo "<prompt>" | chad-premium-client --model <id> --stdin
+
+Exits 1 with PremiumAccessDenied when AuthContext is missing or denies.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+CREDS_FILE = os.environ.get("CHAD_CREDS_FILE", "/sandbox/.nemoclaw/credentials.json")
+AUDIT_FILE = os.environ.get("CHAD_PREMIUM_AUDIT_FILE", "/tmp/chad-premium.jsonl")
+DEFAULT_MODEL = "claude-sonnet-4-6"
+PROBE_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+
+def _load_api_key() -> str:
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    if not os.path.isfile(CREDS_FILE):
+        sys.stderr.write(f"chad-premium-client: credentials file not found: {CREDS_FILE}\n")
+        sys.exit(2)
+    try:
+        with open(CREDS_FILE) as f:
+            data = json.load(f)
+    except Exception as exc:
+        sys.stderr.write(f"chad-premium-client: failed to read credentials: {exc}\n")
+        sys.exit(2)
+    key = (data.get("ANTHROPIC_API_KEY") or "").strip()
+    if not key:
+        sys.stderr.write("chad-premium-client: ANTHROPIC_API_KEY not present in credentials.json\n")
+        sys.exit(2)
+    return key
+
+
+def _load_auth_context() -> dict:
+    """Read $CHAD_AUTH_CONTEXT_PATH and return the parsed dict.
+
+    Raises SystemExit(1) with a structured message if missing or denying."""
+    path = os.environ.get("CHAD_AUTH_CONTEXT_PATH", "")
+    if not path or not os.path.isfile(path):
+        sys.stderr.write(
+            "PremiumAccessDenied: no auth context, source=cron, allowsPremium=false\n"
+        )
+        sys.exit(1)
+    try:
+        with open(path) as f:
+            ctx = json.load(f)
+    except Exception as exc:
+        sys.stderr.write(f"PremiumAccessDenied: auth context unreadable ({exc})\n")
+        sys.exit(1)
+    if not ctx.get("allowsPremium"):
+        sys.stderr.write(
+            f"PremiumAccessDenied: source={ctx.get('source','?')}, "
+            f"identity={ctx.get('verifiedIdentity')}, allowsPremium=false\n"
+        )
+        sys.exit(1)
+    return ctx
+
+
+def _audit(entry: dict) -> None:
+    try:
+        with open(AUDIT_FILE, "a") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+    except Exception:
+        # Audit failure must not break the call; surface to stderr only.
+        sys.stderr.write(f"chad-premium-client: audit append failed for {AUDIT_FILE}\n")
+
+
+def _call_anthropic(api_key: str, model: str, max_tokens: int, system: str | None,
+                    prompt: str, timeout: float) -> dict:
+    """POST /v1/messages via curl.
+
+    The HTTP call is shelled out to /usr/bin/curl on purpose: the OpenShell
+    L7 proxy keys its binaries allowlist on /proc/self/exe, which would be
+    /usr/bin/python3 if we used urllib here — too broad to pin in the
+    chad_premium policy. Routing through curl lets the policy pin
+    chad-premium-client + curl specifically. Same shape as chad-report-bug
+    using gh for GitHub writes.
+    """
+    payload: dict = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        payload["system"] = system
+    body = json.dumps(payload)
+    cmd = [
+        "/usr/bin/curl",
+        "-sS",
+        "--fail-with-body",
+        "--max-time", str(int(timeout)),
+        "-X", "POST",
+        "-H", f"x-api-key: {api_key}",
+        "-H", f"anthropic-version: {ANTHROPIC_VERSION}",
+        "-H", "content-type: application/json",
+        "--data-binary", "@-",
+        ANTHROPIC_URL,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=body,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"anthropic curl timeout after {timeout}s\n")
+        sys.exit(3)
+    except FileNotFoundError:
+        sys.stderr.write("anthropic call failed: /usr/bin/curl not found\n")
+        sys.exit(3)
+    if proc.returncode != 0:
+        sys.stderr.write(
+            f"anthropic curl exit={proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}\n"
+        )
+        sys.exit(3)
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"anthropic non-json response: {exc}: {proc.stdout[:200]}\n")
+        sys.exit(3)
+
+
+def _extract_text(response: dict) -> str:
+    parts = response.get("content", []) or []
+    return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="chad-premium-client")
+    p.add_argument("--probe", action="store_true", help="cheap probe call (haiku, max=16)")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument("--system", default=None)
+    p.add_argument("--timeout", type=float, default=120.0)
+    p.add_argument("--stdin", action="store_true", help="read prompt from stdin")
+    p.add_argument("--json", action="store_true", help="emit raw response JSON instead of text")
+    p.add_argument("--skip-auth-context", action="store_true",
+                   help="probe-only escape hatch; ignored unless --probe")
+    p.add_argument("prompt", nargs="?", default=None)
+    args = p.parse_args()
+
+    api_key = _load_api_key()
+
+    if args.probe:
+        # Probe is allowed without auth context — it's a connectivity check.
+        # Audit it anyway so we know who's probing.
+        ctx = {}
+        if not args.skip_auth_context:
+            try:
+                ctx = _load_auth_context()
+            except SystemExit:
+                ctx = {"source": "probe-no-context", "verifiedIdentity": None}
+        t0 = time.time()
+        resp = _call_anthropic(
+            api_key=api_key,
+            model=PROBE_MODEL,
+            max_tokens=16,
+            system=None,
+            prompt="Reply with the single word OK.",
+            timeout=30.0,
+        )
+        latency_ms = int((time.time() - t0) * 1000)
+        text = _extract_text(resp).strip()
+        usage = resp.get("usage", {})
+        _audit({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "kind": "probe",
+            "model": PROBE_MODEL,
+            "in_tokens": usage.get("input_tokens", 0),
+            "out_tokens": usage.get("output_tokens", 0),
+            "latency_ms": latency_ms,
+            "source": ctx.get("source"),
+            "identity": ctx.get("verifiedIdentity"),
+        })
+        print(f"anthropic api ok, model={PROBE_MODEL} latency={latency_ms}ms reply={text!r}")
+        return
+
+    # Non-probe path: AuthContext is mandatory.
+    ctx = _load_auth_context()
+
+    prompt = args.prompt
+    if args.stdin:
+        prompt = sys.stdin.read()
+    if not prompt:
+        sys.stderr.write("chad-premium-client: prompt required (positional or --stdin)\n")
+        sys.exit(2)
+
+    t0 = time.time()
+    resp = _call_anthropic(
+        api_key=api_key,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        system=args.system,
+        prompt=prompt,
+        timeout=args.timeout,
+    )
+    latency_ms = int((time.time() - t0) * 1000)
+    usage = resp.get("usage", {})
+    _audit({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "kind": "messages",
+        "model": args.model,
+        "in_tokens": usage.get("input_tokens", 0),
+        "out_tokens": usage.get("output_tokens", 0),
+        "latency_ms": latency_ms,
+        "source": ctx.get("source"),
+        "identity": ctx.get("verifiedIdentity"),
+        "scope": ctx.get("scope"),
+    })
+
+    if args.json:
+        json.dump(resp, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(_extract_text(resp))
+        if not _extract_text(resp).endswith("\n"):
+            sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

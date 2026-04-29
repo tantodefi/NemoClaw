@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-route-prompt — tiny prompt-prefix router.
+#
+# Reads a prompt from stdin (or argv) and inspects the first line:
+#   /premium <text>           → exec chad-premium "<text>"
+#   /premium --opus <text>    → exec chad-premium --opus "<text>"
+# Otherwise echoes the prompt unchanged to stdout (passthrough).
+#
+# Used by callers that want to honor a /premium prefix in user-supplied
+# content (mail-check, issue-triage, dashboard prompt forwarder).
+#
+# AuthContext must already be set up by the caller (e.g. mail-check writes
+# one when From: is tantodefi@proton.me). chad-premium itself fail-closes
+# if no context is present.
+
+set -uo pipefail
+
+if [ $# -gt 0 ]; then
+  prompt="$*"
+else
+  prompt="$(cat)"
+fi
+
+# Match only on first non-whitespace prefix; strip any leading blank lines.
+first_line="$(printf '%s' "$prompt" | sed -n '1p')"
+
+case "$first_line" in
+  "/premium --opus "*)
+    rest="${prompt#"/premium --opus "}"
+    exec /usr/local/bin/chad-premium --opus "$rest"
+    ;;
+  "/premium "*)
+    rest="${prompt#"/premium "}"
+    exec /usr/local/bin/chad-premium "$rest"
+    ;;
+  *)
+    printf '%s' "$prompt"
+    ;;
+esac

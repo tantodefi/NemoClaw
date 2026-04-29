@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-premium — invoke Anthropic Sonnet/Opus from the sandbox after an
+# AuthContext check. Cron prompts cannot reach this; only flows that
+# attached an AuthContext via chad-auth-context.
+#
+# Usage:
+#   chad-premium [--opus] [--max-tokens N] [--system "..."] [--memory] "<prompt>"
+#   echo "<prompt>" | chad-premium --stdin [--opus]
+#
+# By default uses claude-sonnet-4-6. --opus escalates to claude-opus-4-7.
+# --memory appends the response to today's memory file under "## Premium runs".
+#
+# Convenience: if NEMOCLAW_INVOKER_TOKEN is set in the environment AND no
+# AuthContext exists, this wrapper will auto-detect a terminal context. This
+# lets a logged-in operator just run `chad-premium "..."` without manually
+# calling chad-auth-context first.
+
+set -uo pipefail
+
+MODEL="claude-sonnet-4-6"
+MAX_TOKENS=4096
+SYSTEM=""
+APPEND_MEMORY=0
+USE_STDIN=0
+PROMPT=""
+EXTRA_ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --opus)
+      MODEL="claude-opus-4-7"
+      MAX_TOKENS=8192
+      shift
+      ;;
+    --sonnet)
+      MODEL="claude-sonnet-4-6"
+      shift
+      ;;
+    --haiku)
+      MODEL="claude-haiku-4-5-20251001"
+      shift
+      ;;
+    --max-tokens)
+      MAX_TOKENS="$2"
+      shift 2
+      ;;
+    --system)
+      SYSTEM="$2"
+      shift 2
+      ;;
+    --memory)
+      APPEND_MEMORY=1
+      shift
+      ;;
+    --stdin)
+      USE_STDIN=1
+      shift
+      ;;
+    -h|--help)
+      sed -n '4,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --)
+      shift
+      PROMPT="$*"
+      break
+      ;;
+    -*)
+      echo "chad-premium: unknown flag $1" >&2
+      exit 2
+      ;;
+    *)
+      PROMPT="$1"
+      shift
+      ;;
+  esac
+done
+
+# Auto-detect terminal context if operator has the token but no context yet.
+if [ -z "${CHAD_AUTH_CONTEXT_PATH:-}" ] && [ -n "${NEMOCLAW_INVOKER_TOKEN:-}" ]; then
+  CHAD_AUTH_CONTEXT_PATH="$(mktemp -t chad-auth-ctx.XXXXXX.json)"
+  export CHAD_AUTH_CONTEXT_PATH
+  /usr/local/bin/chad-auth-context detect --terminal-token "$NEMOCLAW_INVOKER_TOKEN" >/dev/null
+fi
+
+# Refuse early if no premium access — better signal than letting the client fail.
+if ! /usr/local/bin/chad-auth-context require-premium 2>/dev/null; then
+  /usr/local/bin/chad-auth-context require-premium
+  exit 1
+fi
+
+if [ "$USE_STDIN" -eq 1 ]; then
+  EXTRA_ARGS+=("--stdin")
+elif [ -z "$PROMPT" ]; then
+  echo "chad-premium: prompt required (positional or --stdin)" >&2
+  exit 2
+fi
+
+if [ -n "$SYSTEM" ]; then
+  EXTRA_ARGS+=("--system" "$SYSTEM")
+fi
+
+TMP_OUT="$(mktemp -t chad-premium-out.XXXXXX)"
+trap 'rm -f "$TMP_OUT"' EXIT
+
+if [ "$USE_STDIN" -eq 1 ]; then
+  /usr/local/bin/chad-premium-client \
+    --model "$MODEL" --max-tokens "$MAX_TOKENS" \
+    "${EXTRA_ARGS[@]}" | tee "$TMP_OUT"
+else
+  /usr/local/bin/chad-premium-client \
+    --model "$MODEL" --max-tokens "$MAX_TOKENS" \
+    "${EXTRA_ARGS[@]}" "$PROMPT" | tee "$TMP_OUT"
+fi
+status=${PIPESTATUS[0]}
+
+if [ "$APPEND_MEMORY" -eq 1 ] && [ "$status" -eq 0 ] && [ -s "$TMP_OUT" ]; then
+  MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory 2>/dev/null || true)"
+  if [ -n "$MEMORY_FILE" ] && [ -w "$MEMORY_FILE" ]; then
+    {
+      echo ""
+      echo "## Premium run — $(date -u +%FT%TZ)"
+      echo "model: $MODEL"
+      if [ -n "$PROMPT" ]; then
+        echo "prompt: $(printf '%s' "$PROMPT" | head -c 200)"
+      fi
+      echo ""
+      echo '```'
+      cat "$TMP_OUT"
+      echo '```'
+    } >> "$MEMORY_FILE"
+  fi
+fi
+
+exit "$status"

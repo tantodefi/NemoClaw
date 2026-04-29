@@ -129,6 +129,38 @@ def main() -> None:
         }
     }
 
+    # Premium side-channel: surface Anthropic Sonnet/Opus/Haiku as a
+    # *secondary* provider when ANTHROPIC_API_KEY is present in the deployed
+    # credentials. Default routing stays on the primary inference gateway;
+    # chad-premium / /premium explicitly select these models. Access is gated
+    # downstream by chad-auth-context — the registry just declares them
+    # available. The L7 proxy resolves the apiKey from
+    # /sandbox/.nemoclaw/credentials.json (deployed by chad-setup.sh).
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        anthropic_models = [
+            ("claude-sonnet-4-6", 200000, 64000),
+            ("claude-opus-4-7", 200000, 64000),
+            ("claude-haiku-4-5-20251001", 200000, 64000),
+        ]
+        providers["anthropic"] = {
+            "baseUrl": "https://api.anthropic.com",
+            "apiKey": "openshell:resolve:env:ANTHROPIC_API_KEY",
+            "api": "anthropic-messages",
+            "models": [
+                {
+                    "id": mid,
+                    "name": mid,
+                    "reasoning": True,
+                    "input": ["text", "image"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "contextWindow": ctx,
+                    "maxTokens": maxout,
+                    "requiresAuthContext": True,
+                }
+                for (mid, ctx, maxout) in anthropic_models
+            ],
+        }
+
     # Bundled OpenClaw skills (clawhub, coding-agent, gog, session-logs,
     # summarize) and the three custom sandbox skills (chad-bug-intake,
     # chad-orchestrator, proton-calendar) are explicitly enabled here.
