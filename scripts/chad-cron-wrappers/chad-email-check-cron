@@ -16,12 +16,14 @@
 #   4. Append "## Email-check (cron wrapper) — <ts>" block to memory:
 #      counts, mark-read status, and parked entries with id/from/subject.
 #
-# This wrapper deliberately does NOT draft replies or trigger chad-intake.
-# The Kimi-K2.5 ↔ openclaw harness multi-turn tool-call regression makes
-# any LLM-driven reply intermittent — see project_chad_cron_pattern memory.
-# When that's fixed, the cron prompt can grow back to include reply
-# drafting; for now the cron is observability + automated mark-read only.
-# Pending replies sit visible in today's memory for the human to handle.
+# The drafter (single-turn, tool-less) generates draft reply text per parked
+# admin sender. chad-autosend-replies then routes each draft through
+# chad-action-gate against /sandbox/.openclaw-data/auto-actions.json:
+#   email_reply policy "auto"  → sent immediately via chad-mail-send
+#   email_reply policy "draft" → parked for human review (legacy behavior)
+#   email_reply policy "block" → recorded as blocked, not sent
+# Kill switch: touch /sandbox/.openclaw/workspace/.auto-disabled to globally
+# halt every auto-action without changing the policy file.
 
 set -uo pipefail
 
@@ -40,7 +42,7 @@ touch "$HANDLED_LOG"
 MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
 TS="$(date -u +%FT%TZ)"
 
-# Phase 2 reads remaining_tokens to gate the optional LLM draft pass.
+# The drafter reads remaining_tokens to gate the optional LLM draft pass.
 # chad-mail-check has its own gate; this is a second, larger floor.
 BUDGET_FILE="${CHAD_BUDGET_FILE:-/sandbox/.openclaw-data/budget.json}"
 REMAINING=0
@@ -232,24 +234,81 @@ PY
   fi
 } >> "$MEMORY_FILE"
 
-# ── Step 5 — Phase 2 (optional LLM draft pass) ───────────────────────
+# ── Step 4.5 — Enrich parked entries with message bodies ─────────────
+# chad-mail-check's listing only carries headers; the drafter needs the body
+# to produce a useful draft. We persist fetched bodies to a long-lived
+# cache (mail-bodies/<safe-id>.txt) because mail content is immutable
+# once received — Proton's ~10/hour SRP login cap means refetching every
+# cron run trips 429s. On cache hit we skip proton-tool entirely.
+#
+# Failures per-id are non-fatal (body stays empty, the drafter will skip
+# with "insufficient context"). Step gated on PARK_COUNT>0 to avoid
+# pointless work.
+BODIES_CACHE="${WORKSPACE_STATE}/mail-bodies"
+mkdir -p "$BODIES_CACHE"
+if [ "$PARK_COUNT" -gt 0 ]; then
+  python3 -c 'import json,sys; print(" ".join(e["id"] for e in json.load(open(sys.argv[1]))["park"] if e.get("id")))' "$CLASSIFIED" \
+    | tr ' ' '\n' \
+    | while IFS= read -r MID; do
+        [ -z "$MID" ] && continue
+        SAFE="$(printf '%s' "$MID" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-64)"
+        DEST="${BODIES_CACHE}/${SAFE}.txt"
+        # Cache hit: skip the Proton call entirely.
+        [ -s "$DEST" ] && continue
+        /usr/local/bin/proton-tool read-mail --id="$MID" > "$DEST" 2>/dev/null || true
+        # If we got an empty file (rate-limit or other failure), leave
+        # it absent so a later run can retry instead of caching the miss.
+        [ -s "$DEST" ] || rm -f "$DEST"
+      done
+  CLASSIFIED_ENRICHED="$(mktemp)"
+  BODIES_CACHE="$BODIES_CACHE" python3 - "$CLASSIFIED" "$CLASSIFIED_ENRICHED" <<'PY'
+import json, os, re, sys
+src, dst = sys.argv[1], sys.argv[2]
+bodies_dir = os.environ["BODIES_CACHE"]
+data = json.load(open(src))
+for e in data.get("park", []):
+    mid = e.get("id", "")
+    if not mid:
+        continue
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', mid)[:64]
+    path = os.path.join(bodies_dir, f"{safe}.txt")
+    if not os.path.isfile(path):
+        continue
+    raw = open(path, encoding="utf-8", errors="replace").read()
+    # proton-tool read-mail emits headers, blank line, body. Take after
+    # the first blank line; if format is unexpected, fall back to whole.
+    parts = raw.split("\n\n", 1)
+    body = parts[1] if len(parts) == 2 else raw
+    # Strip quoted-reply tail to keep prompt tight (>, On … wrote:, --)
+    lines = []
+    for ln in body.splitlines():
+        if ln.startswith(">") or ln.startswith("On ") and ln.endswith("wrote:"):
+            break
+        lines.append(ln)
+    e["body"] = "\n".join(lines).strip()[:1200]
+json.dump(data, open(dst, "w"))
+PY
+  mv "$CLASSIFIED_ENRICHED" "$CLASSIFIED"
+fi
+
+# ── Step 5 — Drafter (optional LLM draft pass) ───────────────────────
 # Gated by:
-#   1. profile defines a `phase2` block
+#   1. profile defines a `drafter` block
 #   2. PARK_COUNT > 0 (something to draft)
-#   3. remaining_tokens >= phase2.minBudgetTokens
+#   3. remaining_tokens >= drafter.minBudgetTokens
 # Single-turn, no MCP, no tools — K2.5-safe by construction. NEVER
 # auto-sends; drafts append to memory under "### Draft replies (review
 # before sending)" for human gating. Failures here are non-fatal.
 DRAFT_COUNT=0
-PHASE2_STATUS="not-configured"
+DRAFTER_STATUS="not-configured"
 
 if [ "$PARK_COUNT" -gt 0 ]; then
-  PHASE2_CFG="$(python3 - "$CLASSIFIED" <<PY
+  DRAFTER_CFG="$(python3 - "$CLASSIFIED" <<PY
 import json, os
 cfg_path = os.environ.get("CHAD_PROFILES_FILE", "/usr/local/share/chad/task-profiles.json")
 try:
     p = json.load(open(cfg_path)).get("profiles", {}).get("email-check", {})
-    ph = p.get("phase2") or {}
+    ph = p.get("drafter") or {}
 except Exception:
     ph = {}
 if not ph:
@@ -265,74 +324,96 @@ else:
 PY
 )"
 
-  if [ -n "$PHASE2_CFG" ] && [ -x /usr/local/bin/chad-phase2-draft-replies ]; then
-    PHASE2_MIN_BUDGET="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("minBudgetTokens",0))')"
-    PHASE2_TIMEOUT="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("timeoutSeconds",60))')"
-    PHASE2_MAX_TOK="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("maxOutputTokens",4096))')"
-    PHASE2_PREMIUM="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(int(bool(json.load(sys.stdin).get("usePremium"))))')"
-    PHASE2_MODEL="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model","") or "")')"
+  if [ -n "$DRAFTER_CFG" ] && [ -x /usr/local/bin/chad-drafter ]; then
+    DRAFTER_MIN_BUDGET="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("minBudgetTokens",0))')"
+    DRAFTER_TIMEOUT="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("timeoutSeconds",60))')"
+    DRAFTER_MAX_TOK="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("maxOutputTokens",4096))')"
+    DRAFTER_PREMIUM="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(int(bool(json.load(sys.stdin).get("usePremium"))))')"
+    DRAFTER_MODEL="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model","") or "")')"
 
-    if [ "$REMAINING" -lt "$PHASE2_MIN_BUDGET" ]; then
-      PHASE2_STATUS="skipped (budget=${REMAINING} < ${PHASE2_MIN_BUDGET})"
+    if [ "$REMAINING" -lt "$DRAFTER_MIN_BUDGET" ]; then
+      DRAFTER_STATUS="skipped (budget=${REMAINING} < ${DRAFTER_MIN_BUDGET})"
     else
-      PHASE2_OUT="$(mktemp)"
-      PHASE2_ARGS=( --kind email --timeout "$PHASE2_TIMEOUT" --max-tokens "$PHASE2_MAX_TOK" )
-      [ "$PHASE2_PREMIUM" = "1" ] && PHASE2_ARGS+=( --use-premium )
-      [ -n "$PHASE2_MODEL" ] && PHASE2_ARGS+=( --model "$PHASE2_MODEL" )
+      DRAFTER_OUT="$(mktemp)"
+      DRAFTER_ARGS=( --kind email --timeout "$DRAFTER_TIMEOUT" --max-tokens "$DRAFTER_MAX_TOK" )
+      [ "$DRAFTER_PREMIUM" = "1" ] && DRAFTER_ARGS+=( --use-premium )
+      [ -n "$DRAFTER_MODEL" ] && DRAFTER_ARGS+=( --model "$DRAFTER_MODEL" )
 
       # If a premium-eligible park exists and usePremium is on, attach the
       # first matching AuthContext so chad-premium-client passes its gate.
-      if [ "$PHASE2_PREMIUM" = "1" ] && [ "$PREMIUM_PARK_COUNT" -gt 0 ]; then
+      if [ "$DRAFTER_PREMIUM" = "1" ] && [ "$PREMIUM_PARK_COUNT" -gt 0 ]; then
         FIRST_CTX="$(ls -1 "${AUTH_CONTEXT_DIR}"/*.json 2>/dev/null | head -n 1 || true)"
         [ -n "$FIRST_CTX" ] && export CHAD_AUTH_CONTEXT_PATH="$FIRST_CTX"
       fi
 
-      if /usr/local/bin/chad-phase2-draft-replies "$CLASSIFIED" "$PHASE2_OUT" \
-            "${PHASE2_ARGS[@]}" 2>/dev/null; then
-        DRAFT_COUNT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len([x for x in d.get("drafts",[]) if x.get("action") in ("draft","comment-draft")]))' "$PHASE2_OUT")"
-        DRAFT_ERR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error","") or "")' "$PHASE2_OUT")"
+      if /usr/local/bin/chad-drafter "$CLASSIFIED" "$DRAFTER_OUT" \
+            "${DRAFTER_ARGS[@]}" 2>/dev/null; then
+        DRAFT_COUNT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len([x for x in d.get("drafts",[]) if x.get("action") in ("draft","comment-draft")]))' "$DRAFTER_OUT")"
+        DRAFT_ERR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error","") or "")' "$DRAFTER_OUT")"
         if [ -n "$DRAFT_ERR" ]; then
-          PHASE2_STATUS="degraded (${DRAFT_ERR})"
+          DRAFTER_STATUS="degraded (${DRAFT_ERR})"
         else
-          PHASE2_STATUS="ok (drafts=${DRAFT_COUNT})"
+          DRAFTER_STATUS="ok (drafts=${DRAFT_COUNT})"
         fi
-        # Append drafts block.
-        {
-          echo ""
-          echo "### Draft replies (review before sending)"
-          echo "_Phase 2 single-turn pass. NEVER auto-sends. Review then send via chad-mail-send / chad-premium._"
-          python3 - "$PHASE2_OUT" "$CLASSIFIED" <<'PY'
+
+        # ── Autosend gate ─────────────────────────────────────────────
+        # chad-autosend-replies routes each draft through the action gate.
+        # Drafts whose sender's email_reply policy is "auto" get sent now;
+        # others are mutated to action="auto-sent" / "blocked" / "deferred"
+        # so the renderer below skips or labels them appropriately.
+        AUTOSEND_STATUS="not-installed"
+        if [ -x /usr/local/bin/chad-autosend-replies ]; then
+          AUTOSEND_OUT="$(/usr/local/bin/chad-autosend-replies \
+            "$CLASSIFIED" "$DRAFTER_OUT" "$MEMORY_FILE" 2>&1 || true)"
+          AUTOSEND_STATUS="$(printf '%s' "$AUTOSEND_OUT" | head -n 1)"
+        fi
+
+        # Append drafts block — only items still flagged as "draft" need
+        # human review. Auto-sent / blocked / deferred items already have
+        # their own memory sections written by chad-autosend-replies.
+        REMAINING_DRAFTS="$(python3 -c 'import json,sys; print(sum(1 for d in json.load(open(sys.argv[1])).get("drafts",[]) if d.get("action") in ("draft","comment-draft") and (d.get("draft") or "").strip()))' "$DRAFTER_OUT")"
+        if [ "$REMAINING_DRAFTS" -gt 0 ]; then
+          {
+            echo ""
+            echo "### Draft replies (review before sending)"
+            echo "_Drafter single-turn pass. Items below were NOT auto-sent — review and ship via chad-mail-send / chad-premium._"
+            python3 - "$DRAFTER_OUT" "$CLASSIFIED" <<'PY'
 import json, sys
 out = json.load(open(sys.argv[1]))
 park = {e["id"]: e for e in json.load(open(sys.argv[2])).get("park", [])}
 for d in out.get("drafts", []):
+    if d.get("action") not in ("draft", "comment-draft"):
+        continue
+    if not (d.get("draft") or "").strip():
+        continue
     e = park.get(d.get("id"))
     head_idx = f"[{e['idx']}] " if e else ""
     head_from = f"  from: {e['from']}" if e else ""
     badge = " 🔐 PREMIUM" if d.get("premium") else ""
-    action = d.get("action", "skip")
     print(f"\n#### {head_idx}{(e['subject'] if e else d.get('id'))}{badge}")
     if e:
         print(head_from)
     print(f"  model: {d.get('model','?')}")
-    print(f"  decision: **{action}** — {d.get('reason','')}")
-    if action in ("draft", "comment-draft") and d.get("draft"):
-        print(f"  draft:\n  > {d['draft'].replace(chr(10), chr(10)+'  > ')}")
+    print(f"  decision: **{d.get('action','draft')}** — {d.get('reason','')}")
+    print(f"  draft:\n  > {d['draft'].replace(chr(10), chr(10)+'  > ')}")
 PY
-        } >> "$MEMORY_FILE"
+          } >> "$MEMORY_FILE"
+        fi
       else
-        PHASE2_STATUS="failed (helper exit non-zero)"
+        DRAFTER_STATUS="failed (helper exit non-zero)"
+        AUTOSEND_STATUS="skipped (drafter-failed)"
       fi
-      rm -f "$PHASE2_OUT"
+      rm -f "$DRAFTER_OUT"
     fi
 
     # Memo at end of memory block so it's grep-able.
     {
       echo ""
-      echo "_phase2: ${PHASE2_STATUS}_"
+      echo "_drafter: ${DRAFTER_STATUS}_"
+      [ -n "${AUTOSEND_STATUS:-}" ] && echo "_autosend: ${AUTOSEND_STATUS}_"
     } >> "$MEMORY_FILE"
   fi
 fi
 
-echo "email-check: total=${TOTAL} marked-read=${MARK_COUNT} pending=${PARK_COUNT} premium=${PREMIUM_PARK_COUNT} drafts=${DRAFT_COUNT} phase2=${PHASE2_STATUS}"
+echo "email-check: total=${TOTAL} marked-read=${MARK_COUNT} pending=${PARK_COUNT} premium=${PREMIUM_PARK_COUNT} drafts=${DRAFT_COUNT} drafter=${DRAFTER_STATUS} autosend=${AUTOSEND_STATUS:-n/a}"
 exit 0

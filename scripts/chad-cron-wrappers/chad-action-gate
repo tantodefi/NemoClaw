@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-action-gate — central policy + audit gate for autonomous actions.
+#
+# Reads /sandbox/.openclaw-data/auto-actions.json. Anything not explicitly
+# allow-listed is BLOCKED. Kill-switch file overrides everything.
+#
+# Subcommands:
+#
+#   chad-action-gate check <action_type> <target>
+#     Decide whether Chad may perform <action_type> on <target>.
+#     Exit 0 = auto      → caller proceeds and must call `log` after
+#     Exit 1 = draft     → caller writes a draft for human review (no action)
+#     Exit 2 = block     → caller must not perform the action
+#     Exit 3 = budget exhausted (today)
+#     Exit 4 = kill switch active
+#     Stdout: single token "auto" | "draft" | "block" | "budget" | "killed"
+#
+#   chad-action-gate log <action_type> <target> [--result ok|error]
+#                                               [--message-id <id>]
+#                                               [--detail <text>]
+#     Append an entry to the audit log AND increment today's counter.
+#     Always exit 0.
+#
+#   chad-action-gate budget <action_type>
+#     Print "spent/limit" for today; exit 0 unless exhausted (then 3).
+#
+#   chad-action-gate reset
+#     Wipe today's counters (called by midnight cron). Idempotent.
+#
+#   chad-action-gate dump
+#     Print current policy + counter snapshot for inspection.
+#
+# Exit codes are stable — wrappers branch on them.
+
+set -uo pipefail
+
+POLICY_FILE="${CHAD_AUTO_ACTIONS_FILE:-/sandbox/.openclaw-data/auto-actions.json}"
+COUNTERS_FILE="${CHAD_AUTO_COUNTERS_FILE:-/sandbox/.openclaw-data/state/auto-action-counters.json}"
+AUDIT_LOG="${CHAD_AUTO_ACTION_LOG:-/sandbox/.openclaw-data/state/auto-action-log.jsonl}"
+KILL_SWITCH="${CHAD_AUTO_KILL_SWITCH:-/sandbox/.openclaw/workspace/.auto-disabled}"
+
+mkdir -p "$(dirname "$COUNTERS_FILE")" "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
+[ -f "$AUDIT_LOG" ] || touch "$AUDIT_LOG"
+
+usage() {
+  sed -n '5,42p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+}
+
+[ "$#" -ge 1 ] || usage
+sub="$1"; shift
+
+case "$sub" in
+  check) ;;
+  log) ;;
+  budget) ;;
+  reset) ;;
+  dump) ;;
+  -h|--help) usage ;;
+  *) echo "chad-action-gate: unknown subcommand: $sub" >&2; usage ;;
+esac
+
+if [ "$sub" = "reset" ]; then
+  python3 - "$COUNTERS_FILE" <<'PY'
+import json, sys, datetime
+path = sys.argv[1]
+today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+data = {"date": today, "counts": {}}
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+print(f"counters reset for {today}")
+PY
+  exit 0
+fi
+
+if [ "$sub" = "dump" ]; then
+  python3 - "$POLICY_FILE" "$COUNTERS_FILE" "$AUDIT_LOG" "$KILL_SWITCH" <<'PY'
+import json, os, sys
+p, c, l, k = sys.argv[1:5]
+def safe_load(path, default):
+    try:
+        with open(path) as f: return json.load(f)
+    except FileNotFoundError: return default
+    except Exception as e: return {"_error": str(e)}
+print("policy_file:", p, "exists:", os.path.exists(p))
+print("counters:", json.dumps(safe_load(c, {}), indent=2))
+print("audit_log:", l, "lines:",
+      sum(1 for _ in open(l)) if os.path.exists(l) else 0)
+print("kill_switch_active:", os.path.exists(k))
+PY
+  exit 0
+fi
+
+if [ "$sub" = "budget" ]; then
+  [ "$#" -ge 1 ] || { echo "chad-action-gate budget <action_type>" >&2; exit 64; }
+  ACTION="$1"
+  python3 - "$POLICY_FILE" "$COUNTERS_FILE" "$ACTION" <<'PY'
+import json, sys, os, datetime
+policy_path, counters_path, action = sys.argv[1:4]
+try:
+    pol = json.load(open(policy_path))
+except Exception:
+    pol = {}
+limit = (pol.get("_budgets") or {}).get(action)
+today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+spent = 0
+if os.path.exists(counters_path):
+    try:
+        c = json.load(open(counters_path))
+        if c.get("date") == today:
+            spent = (c.get("counts") or {}).get(action, 0)
+    except Exception:
+        pass
+if limit is None:
+    print(f"{spent}/∞")
+    sys.exit(0)
+print(f"{spent}/{limit}")
+sys.exit(3 if spent >= limit else 0)
+PY
+  exit $?
+fi
+
+if [ "$sub" = "check" ]; then
+  [ "$#" -ge 2 ] || { echo "chad-action-gate check <action_type> <target>" >&2; exit 64; }
+  ACTION="$1"; TARGET="$2"
+
+  if [ -e "$KILL_SWITCH" ]; then
+    echo "killed"
+    exit 4
+  fi
+
+  python3 - "$POLICY_FILE" "$COUNTERS_FILE" "$ACTION" "$TARGET" <<'PY'
+import json, sys, os, datetime
+policy_path, counters_path, action, target = sys.argv[1:5]
+try:
+    pol = json.load(open(policy_path))
+except FileNotFoundError:
+    print("block"); sys.exit(2)
+except Exception:
+    print("block"); sys.exit(2)
+
+action_pol = pol.get(action)
+if not isinstance(action_pol, dict):
+    print("block"); sys.exit(2)
+
+decision = action_pol.get(target)
+if decision is None:
+    decision = action_pol.get("_default", "block")
+
+if decision not in ("auto", "draft", "block"):
+    print("block"); sys.exit(2)
+
+if decision != "auto":
+    print(decision)
+    sys.exit({"draft": 1, "block": 2}[decision])
+
+# auto path → check budget
+limit = (pol.get("_budgets") or {}).get(action)
+if limit is not None:
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    spent = 0
+    if os.path.exists(counters_path):
+        try:
+            c = json.load(open(counters_path))
+            if c.get("date") == today:
+                spent = (c.get("counts") or {}).get(action, 0)
+        except Exception:
+            pass
+    if spent >= limit:
+        print("budget"); sys.exit(3)
+
+print("auto"); sys.exit(0)
+PY
+  exit $?
+fi
+
+if [ "$sub" = "log" ]; then
+  [ "$#" -ge 2 ] || { echo "chad-action-gate log <action_type> <target> [opts]" >&2; exit 64; }
+  ACTION="$1"; TARGET="$2"; shift 2
+  RESULT="ok"; MSGID=""; DETAIL=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --result)     RESULT="$2";  shift 2 ;;
+      --message-id) MSGID="$2";   shift 2 ;;
+      --detail)     DETAIL="$2";  shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  python3 - "$AUDIT_LOG" "$COUNTERS_FILE" "$ACTION" "$TARGET" \
+            "$RESULT" "$MSGID" "$DETAIL" <<'PY'
+import json, sys, os, datetime
+log, counters, action, target, result, msgid, detail = sys.argv[1:8]
+ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+entry = {"ts": ts, "action": action, "target": target, "result": result}
+if msgid: entry["message_id"] = msgid
+if detail: entry["detail"] = detail
+with open(log, "a") as f:
+    f.write(json.dumps(entry) + "\n")
+today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+data = {"date": today, "counts": {}}
+if os.path.exists(counters):
+    try:
+        loaded = json.load(open(counters))
+        if loaded.get("date") == today:
+            data = loaded
+    except Exception:
+        pass
+counts = data.setdefault("counts", {})
+if result == "ok":
+    counts[action] = counts.get(action, 0) + 1
+with open(counters, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+  exit 0
+fi

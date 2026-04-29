@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-autosend-replies — route drafter reply drafts through the action gate
+# and either send them immediately (auto) or leave them for human review (draft/block).
+#
+# Usage:
+#   chad-autosend-replies <classified.json> <drafter-out.json> <memory-file>
+#
+# - <classified.json>   : output of chad-email-check-cron's classify step
+#                         ({"park":[{idx,id,from,subject,...}, ...]})
+# - <drafter-out.json>  : output of chad-drafter
+#                         ({"drafts":[{id,action,reason,draft,...}, ...]})
+# - <memory-file>       : today's memory file to append the audit section to
+#
+# Side effects per draft (when action == "draft" AND draft body is non-empty):
+#   1. chad-action-gate check email_reply <sender>
+#   2. if "auto"  → chad-mail-send reply --id <id> --body <draft>
+#                 → on success: mark draft action="auto-sent" in drafter-out
+#                              + chad-action-gate log email_reply <sender>
+#                 → on failure: leave action="draft", log result=error
+#   3. if "draft" → leave as-is for existing renderer
+#   4. if "block" → mark action="blocked" with reason
+#   5. if "budget"/"killed" → mark action="deferred" with reason
+#
+# Mutates <drafter-out> in place so the upstream renderer naturally skips
+# anything that already shipped (filter: only render action == "draft").
+#
+# Appends "### Auto-sent replies (already shipped)" and (if any) "### Blocked drafts"
+# sections to <memory-file>.
+#
+# Always exit 0 unless invocation is malformed; per-draft failures are logged.
+
+set -uo pipefail
+
+if [ "$#" -ne 3 ]; then
+  echo "usage: chad-autosend-replies <classified.json> <drafter-out.json> <memory-file>" >&2
+  exit 64
+fi
+
+CLASSIFIED="$1"; DRAFTER_OUT="$2"; MEMORY_FILE="$3"
+
+if [ ! -r "$CLASSIFIED" ] || [ ! -r "$DRAFTER_OUT" ]; then
+  echo "chad-autosend-replies: input not readable" >&2
+  exit 0
+fi
+
+GATE="${CHAD_ACTION_GATE:-/usr/local/bin/chad-action-gate}"
+MAIL_SEND="${CHAD_MAIL_SEND:-/usr/local/bin/chad-mail-send}"
+
+if [ ! -x "$GATE" ] || [ ! -x "$MAIL_SEND" ]; then
+  echo "chad-autosend-replies: missing helper (gate=$GATE mail-send=$MAIL_SEND)" >&2
+  exit 0
+fi
+
+# Build a working list: id, sender, subject, draft body, premium flag.
+WORK="$(mktemp)"
+trap 'rm -f "$WORK"' EXIT
+
+python3 - "$CLASSIFIED" "$DRAFTER_OUT" >"$WORK" <<'PY'
+import json, sys
+classified = json.load(open(sys.argv[1]))
+drafter = json.load(open(sys.argv[2]))
+park_by_id = {e.get("id"): e for e in classified.get("park", []) if e.get("id")}
+items = []
+for d in drafter.get("drafts", []):
+    if d.get("action") != "draft":
+        continue
+    body = (d.get("draft") or "").strip()
+    if not body:
+        continue
+    pid = d.get("id") or ""
+    e = park_by_id.get(pid) or {}
+    items.append({
+        "id": pid,
+        "from": e.get("from", ""),
+        "subject": e.get("subject", ""),
+        "premium": bool(d.get("premium")),
+        "body": body,
+    })
+print(json.dumps(items))
+PY
+
+ITEM_COUNT="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$WORK")"
+
+if [ "$ITEM_COUNT" -eq 0 ]; then
+  echo "auto-sent: 0  (no draft bodies to route)"
+  exit 0
+fi
+
+# Iterate items. For each one, ask the gate, optionally send, and record results.
+RESULTS="$(mktemp)"
+trap 'rm -f "$WORK" "$RESULTS"' EXIT
+echo '[]' >"$RESULTS"
+
+i=0
+while [ "$i" -lt "$ITEM_COUNT" ]; do
+  ID="$(python3 -c    'import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])]["id"])'      "$WORK" "$i")"
+  FROM="$(python3 -c  'import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])]["from"])'    "$WORK" "$i")"
+  SUBJ="$(python3 -c  'import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])]["subject"])' "$WORK" "$i")"
+  BODY="$(python3 -c  'import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])]["body"])'    "$WORK" "$i")"
+
+  # Extract a stable email address from the From: header for the gate target.
+  ADDR="$(python3 -c '
+import sys, re
+s = sys.argv[1]
+m = re.search(r"<([^>]+)>", s)
+print((m.group(1) if m else s).strip().lower())
+' "$FROM")"
+
+  DECISION="$("$GATE" check email_reply "$ADDR" 2>/dev/null || true)"
+  RC=$?
+  case "$RC" in
+    0) NEW_ACTION="auto-sent";   STATUS="" ;;
+    1) NEW_ACTION="draft";       STATUS="kept-for-review" ;;
+    2) NEW_ACTION="blocked";     STATUS="policy-block" ;;
+    3) NEW_ACTION="deferred";    STATUS="budget-exhausted" ;;
+    4) NEW_ACTION="deferred";    STATUS="kill-switch" ;;
+    *) NEW_ACTION="draft";       STATUS="gate-error-rc${RC}" ;;
+  esac
+
+  RESULT="ok"
+  DETAIL=""
+  if [ "$NEW_ACTION" = "auto-sent" ]; then
+    if printf '%s' "$BODY" | "$MAIL_SEND" reply --id "$ID" >/tmp/chad-autosend-last.log 2>&1; then
+      "$GATE" log email_reply "$ADDR" --message-id "$ID" --result ok >/dev/null 2>&1 || true
+    else
+      RESULT="error"
+      DETAIL="$(tail -3 /tmp/chad-autosend-last.log 2>/dev/null | tr '\n' ' ' | head -c 240)"
+      NEW_ACTION="draft"
+      STATUS="send-failed: ${DETAIL}"
+      "$GATE" log email_reply "$ADDR" --message-id "$ID" --result error --detail "$DETAIL" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  python3 - "$RESULTS" "$ID" "$ADDR" "$SUBJ" "$BODY" "$NEW_ACTION" "$STATUS" "$RESULT" <<'PY'
+import json, sys
+path, mid, addr, subj, body, action, status, result = sys.argv[1:9]
+data = json.load(open(path))
+data.append({
+    "id": mid, "from": addr, "subject": subj, "body": body,
+    "action": action, "status": status, "result": result,
+})
+with open(path, "w") as f:
+    json.dump(data, f)
+PY
+
+  i=$((i + 1))
+done
+
+# Mutate drafter-out: rewrite each shipped draft's action to "auto-sent" so the
+# upstream renderer skips it. Failed sends remain action=draft.
+python3 - "$DRAFTER_OUT" "$RESULTS" <<'PY'
+import json, sys
+drafter_path, results_path = sys.argv[1], sys.argv[2]
+data = json.load(open(drafter_path))
+results = {r["id"]: r for r in json.load(open(results_path))}
+for d in data.get("drafts", []):
+    r = results.get(d.get("id"))
+    if not r:
+        continue
+    if r["action"] == "auto-sent" and r["result"] == "ok":
+        d["action"] = "auto-sent"
+        d["sent_via"] = "chad-mail-send"
+    elif r["action"] == "blocked":
+        d["action"] = "blocked"
+        d["reason"] = (d.get("reason", "") + f" | gate: {r['status']}").strip(" |")
+    elif r["action"] == "deferred":
+        d["action"] = "deferred"
+        d["reason"] = (d.get("reason", "") + f" | gate: {r['status']}").strip(" |")
+with open(drafter_path, "w") as f:
+    json.dump(data, f)
+PY
+
+# Append memory sections.
+TS="$(date -u +%FT%TZ)"
+SHIPPED="$(python3 -c 'import json,sys; print(sum(1 for r in json.load(open(sys.argv[1])) if r["action"]=="auto-sent" and r["result"]=="ok"))' "$RESULTS")"
+BLOCKED="$(python3 -c 'import json,sys; print(sum(1 for r in json.load(open(sys.argv[1])) if r["action"] in ("blocked","deferred")))' "$RESULTS")"
+FAILED="$(python3 -c  'import json,sys; print(sum(1 for r in json.load(open(sys.argv[1])) if r["action"]=="draft"  and r["result"]=="error"))' "$RESULTS")"
+
+if [ "$SHIPPED" -gt 0 ]; then
+  {
+    echo ""
+    echo "### Auto-sent replies (already shipped — FYI) — ${TS}"
+    python3 - "$RESULTS" <<'PY'
+import json, sys
+for r in json.load(open(sys.argv[1])):
+    if r["action"] == "auto-sent" and r["result"] == "ok":
+        print(f"\n#### → {r['from']}: {r['subject']}")
+        print(f"  id: {r['id']}")
+        print(f"  body:\n  > " + (r["body"] or "").replace("\n", "\n  > "))
+PY
+  } >> "$MEMORY_FILE"
+fi
+
+if [ "$BLOCKED" -gt 0 ]; then
+  {
+    echo ""
+    echo "### Drafts blocked/deferred by action gate — ${TS}"
+    python3 - "$RESULTS" <<'PY'
+import json, sys
+for r in json.load(open(sys.argv[1])):
+    if r["action"] in ("blocked", "deferred"):
+        print(f"- [{r['id']}] {r['subject']} — from: {r['from']} — {r['action']} ({r['status']})")
+PY
+  } >> "$MEMORY_FILE"
+fi
+
+if [ "$FAILED" -gt 0 ]; then
+  {
+    echo ""
+    echo "### Send failures (left as drafts for retry) — ${TS}"
+    python3 - "$RESULTS" <<'PY'
+import json, sys
+for r in json.load(open(sys.argv[1])):
+    if r["action"] == "draft" and r["result"] == "error":
+        print(f"- [{r['id']}] {r['subject']} — from: {r['from']} — {r['status']}")
+PY
+  } >> "$MEMORY_FILE"
+fi
+
+echo "auto-sent: ${SHIPPED}  blocked-or-deferred: ${BLOCKED}  failed: ${FAILED}  (total considered: ${ITEM_COUNT})"
+exit 0

@@ -58,7 +58,7 @@ fi
 # mention @supachad or @tantodefi in title/body. If so, drop a per-issue
 # AuthContext file so a downstream premium call can resolve the trigger
 # back to a verified github actor. Also caches the gh issue list so the
-# Phase-2 hook below doesn't re-fetch.
+# drafter hook below doesn't re-fetch.
 AUTH_CONTEXT_DIR="/sandbox/.openclaw-data/state/auth-context-issue"
 mkdir -p "$AUTH_CONTEXT_DIR"
 PREMIUM_MENTION_RE='@(supachad|tantodefi)\b'
@@ -134,21 +134,21 @@ fi
   fi
 } >> "$MEMORY_FILE"
 
-# ── Phase 2 — optional single-turn LLM draft pass ────────────────────
+# ── Drafter — optional single-turn LLM draft pass ────────────────────
 # Runs BEFORE the heavy nohup detach. Drafts a triage decision (skip /
 # comment-draft / close-stale) per issue. NEVER posts; the human reviews
 # the drafts in memory under "### Issue triage drafts (review before
 # posting)" and the existing detached chad-issue-triage continues to do
 # its full researcher/coder work. Failures are non-fatal.
 DRAFT_COUNT=0
-PHASE2_STATUS="not-configured"
+DRAFTER_STATUS="not-configured"
 if [ "$PARK_ISSUE_COUNT" -gt 0 ]; then
-  PHASE2_CFG="$(python3 - <<PY
+  DRAFTER_CFG="$(python3 - <<PY
 import json, os
 cfg_path = os.environ.get("CHAD_PROFILES_FILE", "/usr/local/share/chad/task-profiles.json")
 try:
     p = json.load(open(cfg_path)).get("profiles", {}).get("issue-triage", {})
-    ph = p.get("phase2") or {}
+    ph = p.get("drafter") or {}
 except Exception:
     ph = {}
 if not ph:
@@ -163,40 +163,40 @@ else:
     }))
 PY
 )"
-  if [ -n "$PHASE2_CFG" ] && [ -x /usr/local/bin/chad-phase2-draft-replies ]; then
-    PHASE2_MIN_BUDGET="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("minBudgetTokens",0))')"
-    PHASE2_TIMEOUT="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("timeoutSeconds",60))')"
-    PHASE2_MAX_TOK="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("maxOutputTokens",4096))')"
-    PHASE2_PREMIUM="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(int(bool(json.load(sys.stdin).get("usePremium"))))')"
-    PHASE2_MODEL="$(printf '%s' "$PHASE2_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model","") or "")')"
+  if [ -n "$DRAFTER_CFG" ] && [ -x /usr/local/bin/chad-drafter ]; then
+    DRAFTER_MIN_BUDGET="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("minBudgetTokens",0))')"
+    DRAFTER_TIMEOUT="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("timeoutSeconds",60))')"
+    DRAFTER_MAX_TOK="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("maxOutputTokens",4096))')"
+    DRAFTER_PREMIUM="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(int(bool(json.load(sys.stdin).get("usePremium"))))')"
+    DRAFTER_MODEL="$(printf '%s' "$DRAFTER_CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model","") or "")')"
 
-    if [ "$REMAINING" -lt "$PHASE2_MIN_BUDGET" ]; then
-      PHASE2_STATUS="skipped (budget=${REMAINING} < ${PHASE2_MIN_BUDGET})"
+    if [ "$REMAINING" -lt "$DRAFTER_MIN_BUDGET" ]; then
+      DRAFTER_STATUS="skipped (budget=${REMAINING} < ${DRAFTER_MIN_BUDGET})"
     else
-      PHASE2_OUT="$(mktemp)"
-      PHASE2_ARGS=( --kind issue --timeout "$PHASE2_TIMEOUT" --max-tokens "$PHASE2_MAX_TOK" )
-      [ "$PHASE2_PREMIUM" = "1" ] && PHASE2_ARGS+=( --use-premium )
-      [ -n "$PHASE2_MODEL" ] && PHASE2_ARGS+=( --model "$PHASE2_MODEL" )
+      DRAFTER_OUT="$(mktemp)"
+      DRAFTER_ARGS=( --kind issue --timeout "$DRAFTER_TIMEOUT" --max-tokens "$DRAFTER_MAX_TOK" )
+      [ "$DRAFTER_PREMIUM" = "1" ] && DRAFTER_ARGS+=( --use-premium )
+      [ -n "$DRAFTER_MODEL" ] && DRAFTER_ARGS+=( --model "$DRAFTER_MODEL" )
 
-      if [ "$PHASE2_PREMIUM" = "1" ] && [ "$PREMIUM_HITS" -gt 0 ]; then
+      if [ "$DRAFTER_PREMIUM" = "1" ] && [ "$PREMIUM_HITS" -gt 0 ]; then
         FIRST_CTX="$(ls -1 "${AUTH_CONTEXT_DIR}"/issue-*.json 2>/dev/null | head -n 1 || true)"
         [ -n "$FIRST_CTX" ] && export CHAD_AUTH_CONTEXT_PATH="$FIRST_CTX"
       fi
 
-      if /usr/local/bin/chad-phase2-draft-replies "$PARKED_ISSUES" "$PHASE2_OUT" \
-            "${PHASE2_ARGS[@]}" 2>/dev/null; then
-        DRAFT_COUNT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len([x for x in d.get("drafts",[]) if x.get("action") in ("draft","comment-draft","close-stale")]))' "$PHASE2_OUT")"
-        DRAFT_ERR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error","") or "")' "$PHASE2_OUT")"
+      if /usr/local/bin/chad-drafter "$PARKED_ISSUES" "$DRAFTER_OUT" \
+            "${DRAFTER_ARGS[@]}" 2>/dev/null; then
+        DRAFT_COUNT="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len([x for x in d.get("drafts",[]) if x.get("action") in ("draft","comment-draft","close-stale")]))' "$DRAFTER_OUT")"
+        DRAFT_ERR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error","") or "")' "$DRAFTER_OUT")"
         if [ -n "$DRAFT_ERR" ]; then
-          PHASE2_STATUS="degraded (${DRAFT_ERR})"
+          DRAFTER_STATUS="degraded (${DRAFT_ERR})"
         else
-          PHASE2_STATUS="ok (drafts=${DRAFT_COUNT})"
+          DRAFTER_STATUS="ok (drafts=${DRAFT_COUNT})"
         fi
         {
           echo ""
           echo "### Issue triage drafts (review before posting)"
-          echo "_Phase 2 single-turn pass. NEVER posts. Review then post via gh issue comment / close._"
-          python3 - "$PHASE2_OUT" "$PARKED_ISSUES" <<'PY'
+          echo "_Drafter single-turn pass. NEVER posts. Review then post via gh issue comment / close._"
+          python3 - "$DRAFTER_OUT" "$PARKED_ISSUES" <<'PY'
 import json, sys
 out = json.load(open(sys.argv[1]))
 park = {e["id"]: e for e in json.load(open(sys.argv[2])).get("park", [])}
@@ -216,13 +216,13 @@ for d in out.get("drafts", []):
 PY
         } >> "$MEMORY_FILE"
       else
-        PHASE2_STATUS="failed (helper exit non-zero)"
+        DRAFTER_STATUS="failed (helper exit non-zero)"
       fi
-      rm -f "$PHASE2_OUT"
+      rm -f "$DRAFTER_OUT"
     fi
     {
       echo ""
-      echo "_phase2: ${PHASE2_STATUS}_"
+      echo "_drafter: ${DRAFTER_STATUS}_"
     } >> "$MEMORY_FILE"
   fi
 fi
@@ -253,5 +253,5 @@ nohup bash -c "
 " >/dev/null 2>&1 < /dev/null &
 disown 2>/dev/null || true
 
-echo "issue-triage: top=${TOP_N} premium=${PREMIUM_HITS} drafts=${DRAFT_COUNT} phase2=${PHASE2_STATUS} detached → ${LOG}"
+echo "issue-triage: top=${TOP_N} premium=${PREMIUM_HITS} drafts=${DRAFT_COUNT} drafter=${DRAFTER_STATUS} detached → ${LOG}"
 exit 0

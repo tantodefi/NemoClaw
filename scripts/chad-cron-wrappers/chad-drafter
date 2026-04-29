@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# chad-phase2-draft-replies — single-turn LLM pass that produces draft
-# reply text for the parked entries surfaced by a Phase-1 wrapper.
+# chad-drafter — single-turn LLM pass that produces draft reply text
+# for the parked entries surfaced by a cron wrapper. Renamed from
+# chad-phase2-draft-replies; "drafter" is the role, not a phase number.
 #
 # Usage:
-#   chad-phase2-draft-replies <input.json> <output.json> \
+#   chad-drafter <input.json> <output.json> \
 #       [--kind email|issue] [--use-premium] [--model <id>] \
 #       [--timeout <secs>] [--max-tokens <N>]
 #
@@ -46,8 +47,8 @@ shift 2 2>/dev/null || true
 KIND="email"
 USE_PREMIUM=0
 MODEL=""
-TIMEOUT="${CHAD_PHASE2_TIMEOUT:-60}"
-MAX_TOKENS="${CHAD_PHASE2_MAX_TOKENS:-4096}"
+TIMEOUT="${CHAD_DRAFTER_TIMEOUT:-60}"
+MAX_TOKENS="${CHAD_DRAFTER_MAX_TOKENS:-4096}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -71,7 +72,7 @@ PY
 }
 
 if [ -z "$INPUT" ] || [ -z "$OUTPUT" ]; then
-  echo "usage: chad-phase2-draft-replies <input.json> <output.json> [opts]" >&2
+  echo "usage: chad-drafter <input.json> <output.json> [opts]" >&2
   exit 2
 fi
 if [ ! -r "$INPUT" ]; then
@@ -101,7 +102,7 @@ def trim(s, n=600):
 
 items = []
 any_premium = False
-for e in park[:int(os.environ.get("CHAD_PHASE2_MAX_ITEMS", "8"))]:
+for e in park[:int(os.environ.get("CHAD_DRAFTER_MAX_ITEMS", "8"))]:
     items.append({
         "idx": e.get("idx"),
         "id": e.get("id", ""),
@@ -199,7 +200,7 @@ else
   if env HOME=/sandbox \
        timeout --kill-after=5 "${TIMEOUT}s" \
        openclaw agent --agent main --local \
-         --session-id "phase2-$(date -u +%s)" \
+         --session-id "drafter-$(date -u +%s)" \
          -m "$PROMPT_BODY" \
        > "$RESP_FILE" 2> "$ERR_FILE"; then
     INVOKE_STATUS="ok"
