@@ -4626,6 +4626,11 @@ async function setupMessagingChannels() {
   const getMessagingToken = (envKey) =>
     getCredential(envKey) || normalizeCredentialValue(process.env[envKey]) || null;
 
+  const isChannelConfigured = (ch: (typeof MESSAGING_CHANNELS)[number]): boolean => {
+    if (!ch.envKey) return false;
+    return !!(getCredential(ch.envKey) || normalizeCredentialValue(process.env[ch.envKey]));
+  };
+
   // Non-interactive: skip prompt, tokens come from env/credentials
   if (isNonInteractive() || process.env.NEMOCLAW_NON_INTERACTIVE === "1") {
     const found = MESSAGING_CHANNELS.filter((c) => isChannelConfigured(c)).map((c) => c.name);

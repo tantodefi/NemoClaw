@@ -199,14 +199,15 @@ can iterate on them without a rebuild.
 
 A kind is a YAML manifest under
 [`.github/skills/chad-orchestrator/kinds/`](.github/skills/chad-orchestrator/kinds/)
-describing how to invoke a sub-agent. Today we ship four:
+describing how to invoke a sub-agent. Today we ship five:
 
 | Kind | Binary | Policy preset | Timeout / Budget | Use case |
 |---|---|---|---|---|
 | `coder` | `/usr/local/bin/pi` | `pi-agent` | 600s / 50000 tok | Write/refactor code, run build + tests |
 | `researcher` | `/usr/local/bin/claude` | `subagent-researcher` | 300s / 20000 tok | gh search, web facts, report |
-| `writer` | `/usr/local/bin/claude` | `subagent-writer` | 180s / 15000 tok | Draft mail, docs, comments (never publishes) |
+| `writer` | `/usr/local/bin/claude` | `subagent-writer` | 600s / 25000 tok | Draft mail, docs, articles (never publishes — one spawn per article) |
 | `reviewer` | `/usr/local/bin/claude` | `subagent-reviewer` | 300s / 25000 tok | Audit PR diff, run checklist (read-only gh) |
+| `fitness` | `/usr/local/bin/claude` | `subagent-researcher` | 300s / 15000 tok | Strength + mobility answers from gbrain-ingested books (Rippetoe, Starrett) — brain-first, falls back to archive.org |
 
 The manifest shape:
 
@@ -237,7 +238,7 @@ No recompile, no image rebuild.
 
 ```bash
 # 1. Classify (or skip and pick the kind manually)
-kind="$(chad-route --task-file /tmp/task.md)"     # echoes one of the four kinds
+kind="$(chad-route --task-file /tmp/task.md)"     # echoes one of the five kinds
 
 # 2. Spawn. Returns the task id on stdout.
 task_id="$(chad-spawn --kind "$kind" --task-file /tmp/task.md)"
@@ -303,6 +304,111 @@ repeatedly — at the end of every spawn batch, from cron, or by hand.
 
 ---
 
+### 4.6 Brain & workflow stack (gbrain + gstack)
+
+Two auxiliary systems live alongside the orchestrator: gbrain provides
+shared persistent memory, gstack provides role-based reasoning frameworks.
+
+#### gbrain
+
+Hybrid vector + graph knowledge brain running as a local PGLite store at
+`/sandbox/.gbrain/brain.pglite`. Wired into the sandbox in four places:
+
+1. **Image build** — installed from the `tantodefi/gbrain` fork into
+   `/usr/local/lib/gbrain/` with a shim at `/usr/local/bin/gbrain`. The
+   bun-based install path is pinned so the binary resolves on Linux arm64.
+2. **Per-sandbox init** — `chad-setup.sh` runs `gbrain init` and registers
+   it as a persistent MCP server in `/sandbox/.openclaw/openclaw.json` via
+   `openclaw mcp set gbrain '{"command":"/usr/local/bin/gbrain","args":["serve"]}'`.
+   Every `openclaw agent` session thereafter has the brain MCP tools
+   (`mcp_gbrain_search`, `mcp_gbrain_put_page`, …) available with no
+   spawn-time flags required.
+3. **Kind prompts** — `researcher`, `coder`, `reviewer`, and `fitness`
+   sub-agents are instructed to `mcp_gbrain_search` before any external
+   API call, and to write findings back with `mcp_gbrain_put_page` so the
+   next spawn doesn't pay the same research cost twice.
+4. **Backup/restore** — `chad-backup-to-github.sh` exports all pages as
+   per-page `.md` files (sha-diff-checked). Restore: `gbrain import brain/
+   --no-embed` — embeddings rebuild lazily on the first query.
+
+> **Known gotcha — PGLite root-ownership.** Any `gbrain import` or
+> `gbrain export` run that executes as root (e.g. during a chad-setup.sh
+> restore step run via `kubectl exec`) writes WAL segments and lock files
+> as `root:root`. On the next session startup `gbrain serve` cannot acquire
+> the lock and aborts with `Timed out waiting for PGLite lock` or
+> `PGlite failed to initialize properly`. The `chad-setup.sh` gbrain-init
+> step now runs `chown -R sandbox:sandbox` and removes stale
+> `postmaster.pid` / `.gbrain-lock` via `kubectl exec` before `gbrain init`.
+
+#### gstack
+
+gstack ships two distinct tiers; only the first works inside Chad's
+sandbox.
+
+**Tier 1 — openclaw reasoning skills (sandbox-safe, synced by chad-setup.sh)**
+
+Four pure-text SKILL.md files from `garrytan/gstack`'s `openclaw/skills/`
+directory. No browser daemon, no Bun binary, no Chromium. Just structured
+reasoning frameworks the agent can invoke in-session:
+
+| Skill | When to use |
+|---|---|
+| `gstack-openclaw-ceo-review` | Challenge a plan, expand or reduce scope, find landmines |
+| `gstack-openclaw-investigate` | Root-cause debugging — no fix before diagnosis |
+| `gstack-openclaw-office-hours` | Evaluate an idea before writing any code |
+| `gstack-openclaw-retro` | Weekly engineering retrospective from commit history |
+
+`chad-setup.sh` syncs these from `~/.claude/skills/gstack/openclaw/skills/`
+on the host into `/sandbox/.openclaw-data/skills/` in the sandbox. If
+gstack is not installed on the host the step warns and skips — it is not
+a hard dependency.
+
+Install gstack on the host once:
+```bash
+git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git \
+  ~/.claude/skills/gstack
+cd ~/.claude/skills/gstack && ./setup
+```
+
+**Tier 2 — full gstack with browse daemon (host-only, not in sandbox)**
+
+Skills like `/review`, `/qa`, `/ship`, `/browse`, `/gstack-ceo` rely on a
+persistent headless Chromium daemon (`bun build --compile`). This tier
+runs on the developer's host machine (tantodefi's Mac), driven by Claude
+Code, and does not belong inside the Chad sandbox — the sandbox has no
+Bun, no Chromium, and the L7 policy does not allow arbitrary browser
+egress.
+
+The two tiers combine cleanly: when tantodefi asks Chad to review code,
+Chad spawns a `reviewer` sub-agent (tier 1, in-sandbox); when tantodefi
+runs `/review` himself in Claude Code on the host, that's tier 2 with full
+diff analysis and browser-based verification.
+
+### 4.7 Fitness RAG kind
+
+The `fitness` kind is the first application-specific sub-agent and the
+worked example of the brain-first pattern:
+
+- Two books ingested once into gbrain by
+  [`chad-ingest-fitness-books.sh`](.github/skills/chad-orchestrator/scripts/chad-ingest-fitness-books.sh):
+  **Starting Strength** (Rippetoe, 3rd ed., 313 chunks) and
+  **Supple Leopard** (Starrett, 677 chunks). The ingest script pulls
+  the OCR text from archive.org, chunks on paragraph boundaries with
+  a 1-paragraph overlap, and calls `gbrain put` per chunk.
+- The kind manifest
+  [`kinds/fitness.yaml`](.github/skills/chad-orchestrator/kinds/fitness.yaml)
+  instructs the sub-agent to run two `mcp_gbrain_search` calls, build
+  the answer *only* from retrieved chunks, cite chunk titles, and emit
+  a `NOT_FOUND` sentinel if the books don't cover the topic — no
+  fallback to general training knowledge, no web search.
+- Network egress is `subagent-researcher` plus the archive.org rules in
+  the preset (see §5) — enough to re-fetch a book if the brain gets
+  wiped, nothing more.
+
+After a one-time ingest, answers are essentially free: keyword search
+against PGLite, no inference unless the agent needs to synthesize across
+chunks.
+
 ## 5. Network policy presets per kind
 
 Each sub-agent kind runs under a dedicated set of L7 policies pinned to
@@ -314,9 +420,15 @@ a git remote.
 | Preset file | Binds | Egress scope |
 |---|---|---|
 | `presets/pi-agent.yaml` | `/usr/local/bin/pi` | NVIDIA inference only |
-| `presets/subagent-researcher.yaml` | `claude`, `openclaw`, `node`, `gh`, `curl` | NVIDIA inference + full `github.com` read (for research) |
+| `presets/subagent-researcher.yaml` | `claude`, `openclaw`, `node`, `gh`, `curl`, `python3` | NVIDIA inference + full `github.com` read + **GET-only `archive.org` / `*.archive.org`** for book/paper ingest |
 | `presets/subagent-writer.yaml` | `claude`, `openclaw`, `node` | NVIDIA inference only — no github, no messaging |
 | `presets/subagent-reviewer.yaml` | `claude`, `openclaw`, `node`, `gh`, `curl` | NVIDIA inference + `GET`-only `api.github.com` / `github.com` / `raw.githubusercontent.com` |
+| `presets/gbrain.yaml` | `/usr/local/bin/gbrain`, `bun` | loopback (host MCP) + NVIDIA inference for embeddings |
+
+The base `openclaw-sandbox` policy also adds an `internet_archive` rule
+(GET-only) pinned to `python3` + `curl` so the top-level
+`chad-ingest-fitness-books.sh` can run from the sandbox without
+inheriting researcher privileges.
 
 The reviewer's GET-only rule is the key asymmetry: it can fetch PR
 diffs but it cannot post a review or a comment. Writing verdicts back
@@ -368,7 +480,7 @@ catch honest bugs, not attackers.
 
 ## 7. Cron integration (token-optimized)
 
-Chad runs four standing cron jobs, all registered by `chad-setup.sh`.
+Chad runs **six** standing cron jobs, all registered by `chad-setup.sh`.
 The schedules are **deliberately conservative** — every cron fire
 tokenizes instructions and spawns a model call, so the rule is:
 fewer, cheaper runs + a budget guard at the top of each one.
@@ -378,7 +490,9 @@ fewer, cheaper runs + a budget guard at the top of each one.
 | `email-check` | `0 2,6-23 * * *` (19×/day) | skip if `remaining_tokens < 30000` | Reads mail via `proton-tool`, follows `EMAIL-POLICY.md` rules in the workspace, logs to `memory/<today>.md` |
 | `workspace-backup` | every 6h | n/a (no model call) | `chad-backup-to-github` with the §12 diff-check |
 | `issue-triage` | daily 10:00 UTC | skip if `remaining_tokens < 3×N×70k` | `chad-issue-triage` — scores open issues, routes top 2 through a researcher (see §12) |
+| `gbrain-dream` | nightly 03:00 UTC | skip if `remaining_tokens < 50k` | `chad-gbrain-dream` — runs `gbrain dream` to consolidate links and surface orphans |
 | `self-improve` | weekly Sun 03:00 UTC | skip if `remaining_tokens < 2×budget` | `chad-self-improve` — proposes 1–3 durable improvements based on last week's signal (see §13) |
+| `chad-budget-audit` | weekly Mon 04:00 UTC | n/a (audits, no model call) | Compares last-50-runs telemetry against `task-profiles.json`, rolls up premium spend from `/tmp/chad-premium.jsonl`, appends recommendations to `memory/feedback-proposals.md` |
 
 **What changed from the prior schedule:**
 
@@ -401,6 +515,97 @@ a reply as "needs-research + draft-reply" and spawn both a `researcher`
 and a `writer` in one shot. `issue-triage` is how a human-curated GitHub
 issue turns into a triage plan without Chad having to poll all day.
 
+### 7.1 Wrapper-only invariant (K2.5 caveat) and the hybrid Phase-2 inference path
+
+`openclaw cron` runs in **isolated sessions** that re-tokenize the full
+prompt every fire and don't inherit the interactive shell's env. Two
+consequences:
+
+1. **Cron prompts must be one-line wrapper invocations.** Multi-step
+   prompts trigger K2.5's multi-turn tool-call regression, which has
+   produced runs of 550k input tokens / 691s. Every cron message looks
+   like: *"Run `<wrapper>`. Confirm it printed `<sentinel line>`, then
+   exit. Do not …"*
+2. **Slow work goes via `nohup … & disown` inside the wrapper.** The
+   wrapper returns within 1–60s; the actual work writes its result into
+   `memory/<today>.md` for the next cron tick to read. `chad-workspace-backup`
+   is the canonical example.
+
+The wrappers themselves live at `scripts/chad-cron-wrappers/` and are
+deployed to `/usr/local/bin/` by `chad-setup.sh`. Each wrapper is its own
+SPDX-headered script — diffs are reviewable, and individual wrappers can
+be hot-patched on a running sandbox via `kubectl cp` without rerunning
+the whole setup.
+
+#### Phase-1 / Phase-2 hybrid
+
+The wrapper-only invariant gives correctness but loses one nice property
+the old "full inference" cron prompts had: actual *thinking* about the
+inbox or the issue queue. Chad recovers it with a two-phase design:
+
+- **Phase 1 — deterministic shell.** The wrapper does the boring,
+  reliable work: parse `proton-tool inbox`, classify by sender/flags,
+  batch `mark-read`, drop AuthContext blobs, write the memory block.
+  Pure shell + Python regex. Always runs.
+- **Phase 2 — single-turn, no-tools LLM draft.** When the wrapper has
+  parked items that warrant thought, it shells out to
+  `chad-phase2-draft-replies` for one assistant turn:
+  - No MCP servers attached, no tools defined, prompt explicitly
+    forbids tool use → K2.5 multi-turn regression cannot fire because
+    there's nothing to round-trip.
+  - Reasoning ON for max intelligence (per profile, currently `high`).
+  - Output is a strict JSON object validated by a tolerant
+    balanced-brace extractor; failure mode is a no-op.
+  - Premium routes to Sonnet (or Opus) when the parked item came from
+    a sender / GitHub mention that holds a valid AuthContext blob.
+  - **Drafts are NEVER sent / posted** — they append to today's memory
+    under "### Draft replies (review before sending)" or
+    "### Issue triage drafts (review before posting)" for human gating.
+
+Phase 2 is opt-in per task profile via a `phase2: { … }` block in
+`scripts/task-profiles.json` (currently wired for `email-check` and
+`issue-triage`). The block names model, thinking, max-tokens, timeout,
+min-budget floor, and whether premium routing is allowed.
+
+This is how the system gets the "full inference quality" feel back
+without re-introducing the multi-turn regression: the cron payload stays
+a dumb harness call (thinking off, tools on, K2.5-safe), and the heavy
+thinking happens in the single-turn helper (thinking high, tools off,
+K2.5-safe).
+
+---
+
+## 7.2 Premium escalation (Anthropic outsource)
+
+Chad's primary inference is K2.5 via the NVIDIA "nemotron-3-super-120b"
+endpoint. For tasks that K2.5 can't reliably do (multi-turn coding,
+complex reasoning), Chad can escalate to Claude Opus through a tightly
+gated wrapper.
+
+| Component | Path | Purpose |
+|---|---|---|
+| `chad-premium-client` | `scripts/chad-cron-wrappers/chad-premium-client` | Python helper that POSTs to `api.anthropic.com/v1/messages`. Shells the actual HTTP call out to `curl` so OPA can pin a real binary identity (Python's `/proc/self/exe` is `/usr/bin/python3` — too broad). Logs every call to `/tmp/chad-premium.jsonl` (model, source, identity, in/out tokens, latency). |
+| `chad-auth-context` | `scripts/chad-cron-wrappers/chad-auth-context` | AuthContext drop/show — `{source, verifiedIdentity, allowsPremium, createdAt, scope}`. Premium calls require `allowsPremium=true`. |
+| `chad-premium` | `scripts/chad-cron-wrappers/chad-premium` | User-facing wrapper. Auto-detects `NEMOCLAW_INVOKER_TOKEN` for terminal use; reads `$CHAD_AUTH_CONTEXT_PATH` for cron use. |
+| `chad-route-prompt` | `scripts/chad-cron-wrappers/chad-route-prompt` | Dashboard `/premium <prompt>` prefix → drops AuthContext → calls `chad-premium`. |
+| `nemoclaw-blueprint/policies/presets/chad-premium.yaml` | policy preset | L7 policy: only `/usr/local/bin/chad-premium-client` and `/usr/bin/curl` may POST `/v1/messages`. |
+
+**Authorized invocation paths** (each carries an AuthContext):
+
+- Dashboard `/premium <prompt>` → `chad-route-prompt` → `chad-premium`
+- Terminal `chad-premium` (auto-detects `NEMOCLAW_INVOKER_TOKEN`)
+- `email-check` cron when From: matches `tantodefi@proton.me` / `supachad@proton.me`
+- `issue-triage` cron when an open issue mentions `@supachad` / `@tantodefi`
+
+Cron ticks with no inbound trigger have **no AuthContext** — `chad-premium-client`
+fails closed at the application layer. Even if a future bug allowed an
+unauthorized python script to fabricate an AuthContext, the L7 proxy still
+blocks the call because only `chad-premium-client` is in the binaries
+allowlist.
+
+`chad-budget-audit` rolls up `/tmp/chad-premium.jsonl` weekly (model ×
+source × identity × calls × tokens × p95 latency) into the audit report.
+
 ---
 
 ## 8. Backup and recovery
@@ -422,6 +627,19 @@ before PUT: it computes the local blob sha (using the same algorithm
 as `git hash-object`) and compares it to the remote sha before
 uploading. Unchanged files are skipped. With ~20 files and a 6h cron
 this saves ~400 GitHub API calls per day.
+
+The backup set also grew on this branch:
+
+- Workspace top-level now pushes `HEARTBEAT.md` and `TOOLS.md`
+  alongside `SOUL.md`, `USER.md`, `IDENTITY.md`, `AGENTS.md`,
+  `MEMORY.md`.
+- **Brain pages** are exported as a directory of per-page `.md` files
+  (via `gbrain export --dir`) instead of a single `pages.ndjson`. The
+  backup script briefly stops `gbrain serve` to release the PGLite
+  lock, exports, pushes each markdown file through the sha-diff path
+  (so unchanged pages skip), then restarts `gbrain serve`. The restore
+  mirror (`chad-restore-from-github.sh`) uses `gbrain import <dir>
+  --no-embed`, which re-indexes lazily at first query.
 
 ---
 
@@ -449,6 +667,34 @@ this saves ~400 GitHub API calls per day.
 - **YAML fallback.** `chad-spawn.sh` ships a stdlib-only YAML loader
   so the helpers work on hosts without PyYAML (matters for local
   iteration — the sandbox base image always has it).
+- **gbrain MCP auto-register.** `chad-setup.sh` now runs
+  `openclaw mcp set gbrain …` after `gbrain init`, momentarily making
+  `/sandbox/.openclaw` writable for the edit and restoring the stricter
+  `444` perms on `openclaw.json` afterwards. Sub-agents get the gbrain
+  tools without any per-spawn flag.
+- **Spawner cleanup.** `chad-spawn.sh` dropped the `--local` flag and
+  the inline `--mcp-server gbrain` wiring — both are incompatible with
+  openclaw 2026.4.x. Gbrain lives in `openclaw.json` instead, and the
+  spawner sets `HOME=/sandbox` so `openclaw agent` resolves its config
+  regardless of the invoking uid.
+- **Gbrain install path.** The image now installs gbrain into a fixed
+  project dir (`/usr/local/lib/gbrain`) from the `tantodefi/gbrain`
+  fork and ships a small wrapper at `/usr/local/bin/gbrain`.
+  `bun install -g` had unpredictable bin-link paths on Linux arm64;
+  this is deterministic. `/opt/gbrain` is also whitelisted for read +
+  execute in the base sandbox policy so bun can run it.
+- **Sub-agent `fitness` + archive.org egress.** New kind + routing rule
+  in `chad-route`; new `internet_archive` policy in
+  `openclaw-sandbox.yaml` and matching rule in
+  `subagent-researcher.yaml`. GET-only, pinned to `python3` + `curl`.
+- **Router additions.** `chad-route` now matches fitness vocab
+  (squat/deadlift/mobility/Rippetoe/Starrett/…) before the generic
+  `coder` regex, so "how do I fix my squat" stops getting classified
+  as a code task.
+- **Onboarding typing fix.** `src/lib/onboard.ts` gained a local
+  `isChannelConfigured` helper so the non-interactive messaging-setup
+  path stops crashing when the symbol is referenced before the
+  interactive branch defines it.
 
 ---
 

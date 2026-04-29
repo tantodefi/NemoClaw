@@ -55,6 +55,8 @@ Options:
   --skip-gh-auth      Skip gh authentication
   --skip-crons        Skip cron job registration
   --skip-clone-source Skip cloning Chad's own source into the sandbox
+  --skip-gbrain       Skip gbrain CLI configuration
+  --skip-policies     Skip L7 policy preset registration
   --dry-run           Print steps without executing them
   -h, --help          Show this help
 
@@ -62,11 +64,15 @@ What this does:
   1. Restores workspace from latest local backup (~/.nemoclaw/backups/),
      falling back to ${CHAD_STATE_REPO}@main (github) if no local backup exists
   2. Syncs .github/skills/ into the sandbox
-  3. Deploys credentials (PROTON_*, GITHUB_TOKEN, BRAVE_API_KEY) to sandbox
+  3. Deploys credentials (PROTON_*, GITHUB_TOKEN, BRAVE_API_KEY, NVIDIA_API_KEY,
+     ANTHROPIC_API_KEY, NEMOCLAW_INVOKER_TOKEN) to sandbox
   4. Authenticates gh CLI using GITHUB_TOKEN
   5. Clones Chad's source (${CHAD_SOURCE_REPO}) into /sandbox/source for
      local read/grep access
-  6. Registers the email-check and workspace-backup cron jobs
+  6. Registers six cron jobs (email-check, workspace-backup, issue-triage,
+     gbrain-dream, self-improve, chad-budget-audit)
+  7. Applies required L7 policy presets (proton-calendar, github, gbrain,
+     chad-premium, subagent-*, etc.)
 
 proton-tool, gh, and chad-{backup,restore,clone}-* helpers are baked into
 the image — no post-create deploy step needed for binaries or scripts.
@@ -83,6 +89,7 @@ skip_gh_auth=0
 skip_crons=0
 skip_clone_source=0
 skip_gbrain=0
+skip_policies=0
 dry_run=0
 
 for arg in "${@:2}"; do
@@ -94,6 +101,7 @@ for arg in "${@:2}"; do
     --skip-crons)        skip_crons=1 ;;
     --skip-clone-source) skip_clone_source=1 ;;
     --skip-gbrain)       skip_gbrain=1 ;;
+    --skip-policies)     skip_policies=1 ;;
     --dry-run)           dry_run=1 ;;
     -h|--help)           usage ;;
     *) fail "Unknown argument: $arg" ;;
@@ -147,6 +155,42 @@ if [ "$skip_skills" -eq 0 ]; then
   if [ -f "$sync_script" ]; then
     # No --build-proton: proton-tool is baked into the image at /usr/local/bin/proton-tool
     run bash "$sync_script" "$SANDBOX" proton-calendar chad-bug-intake chad-orchestrator
+    # EMAIL-POLICY.md lives in the skills dir but the email-check cron reads it
+    # from the workspace root — deploy it there explicitly after skill sync.
+    email_policy_src="${REPO_ROOT}/.github/skills/proton-calendar/EMAIL-POLICY.md"
+    if [ -f "$email_policy_src" ]; then
+      if [ "$dry_run" -eq 1 ]; then
+        echo "  [dry-run] Would upload EMAIL-POLICY.md to workspace root"
+      else
+        openshell sandbox upload "$SANDBOX" "$email_policy_src" "/sandbox/.openclaw/workspace/" 2>/dev/null \
+          && info "EMAIL-POLICY.md deployed to workspace root" \
+          || warn "EMAIL-POLICY.md upload failed — email-check cron will not find it"
+      fi
+    else
+      warn "EMAIL-POLICY.md not found at $email_policy_src"
+    fi
+    # Sync gstack openclaw reasoning skills (text-only, no browser daemon needed).
+    # Source: ~/.claude/skills/gstack/openclaw/skills/ on the host.
+    # Destination: /sandbox/.openclaw-data/skills/ in the sandbox.
+    gstack_skills_src="${HOME}/.claude/skills/gstack/openclaw/skills"
+    if [ -d "$gstack_skills_src" ]; then
+      for skill_dir in "$gstack_skills_src"/*/; do
+        skill_name="$(basename "$skill_dir")"
+        if [ "$dry_run" -eq 1 ]; then
+          echo "  [dry-run] Would sync gstack skill: $skill_name"
+        else
+          tar -C "$gstack_skills_src" -cf - "$skill_name" \
+            | ssh "$REMOTE_HOST" \
+                "mkdir -p /sandbox/.openclaw-data/skills && \
+                 tar -C /sandbox/.openclaw-data/skills -xf -" \
+            && info "Synced gstack skill: $skill_name" \
+            || warn "Failed to sync gstack skill: $skill_name"
+        fi
+      done
+    else
+      warn "gstack openclaw skills not found at ${gstack_skills_src}"
+      warn "  Install: git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup"
+    fi
   else
     warn "sync-skills-to-sandbox.sh not found — skipping skill sync"
   fi
@@ -160,8 +204,8 @@ fi
 # a filtered credentials file to /sandbox/.nemoclaw/credentials.json so
 # proton-tool and other tools can read PROTON_* and service tokens.
 #
-# Keys deployed: PROTON_USERNAME, PROTON_PASSWORD, GITHUB_TOKEN, BRAVE_API_KEY
-# Keys NOT deployed: NVIDIA_API_KEY (managed by OpenClaw inference config)
+# Keys deployed: PROTON_USERNAME, PROTON_PASSWORD, GITHUB_TOKEN, BRAVE_API_KEY, NVIDIA_API_KEY
+# NVIDIA_API_KEY is passed to gbrain so it can call integrate.api.nvidia.com for embeddings.
 
 if [ "$skip_creds" -eq 0 ]; then
   step "Deploying credentials to '${SANDBOX}'"
@@ -171,7 +215,7 @@ if [ "$skip_creds" -eq 0 ]; then
   sandbox_creds="$(python3 -c "
 import json, sys
 src = json.load(open('${CREDENTIALS_SRC}'))
-keep = ['PROTON_USERNAME', 'PROTON_PASSWORD', 'GITHUB_TOKEN', 'BRAVE_API_KEY']
+keep = ['PROTON_USERNAME', 'PROTON_PASSWORD', 'GITHUB_TOKEN', 'BRAVE_API_KEY', 'NVIDIA_API_KEY', 'ANTHROPIC_API_KEY', 'NEMOCLAW_INVOKER_TOKEN']
 out = {k: src[k] for k in keep if k in src}
 print(json.dumps(out, indent=2))
 ")"
@@ -188,6 +232,103 @@ print(json.dumps(out, indent=2))
       echo "$sandbox_creds" | ssh "$REMOTE_HOST" \
         'cat > /sandbox/.nemoclaw/credentials.json && chmod 600 /sandbox/.nemoclaw/credentials.json'
       info "Credentials deployed to /sandbox/.nemoclaw/credentials.json"
+
+      # Install proton-tool credential wrapper.
+      # proton-tool reads PROTON_* from env vars, but isolated cron sessions
+      # don't have them injected. The wrapper loads them from credentials.json.
+      #
+      # The wrapper source lives at scripts/sandbox-bin/proton-tool-wrapper.sh
+      # and is delivered via base64 + kubectl exec to avoid heredoc escape
+      # bugs (we've been bitten by triple-escaped $ before).
+      SANDBOX_POD=$(docker exec openshell-cluster-nemoclaw kubectl get pods -n openshell \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+      WRAPPER_SRC="${REPO_ROOT}/scripts/sandbox-bin/proton-tool-wrapper.sh"
+      if [ -n "$SANDBOX_POD" ] && [ -f "$WRAPPER_SRC" ]; then
+        WRAPPER_B64=$(base64 < "$WRAPPER_SRC" | tr -d '\n')
+        docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+          sh -c "
+            if [ ! -f /usr/local/bin/proton-tool-bin ]; then
+              cp /usr/local/bin/proton-tool /usr/local/bin/proton-tool-bin
+            fi
+            echo '${WRAPPER_B64}' | base64 -d > /usr/local/bin/proton-tool
+            chmod 755 /usr/local/bin/proton-tool /usr/local/bin/proton-tool-bin
+            echo 'proton-tool wrapper installed'
+          " 2>&1 | grep -v '^$' || warn "Could not install proton-tool wrapper (kubectl exec failed)"
+      elif [ ! -f "$WRAPPER_SRC" ]; then
+        warn "proton-tool wrapper source missing: ${WRAPPER_SRC}"
+      else
+        warn "Could not find sandbox pod — proton-tool wrapper not installed"
+      fi
+
+      # Deploy chad-dispatch (GitHub Actions worker client) and the cron
+      # wrapper scripts. The sandbox SSH user can't write to /usr/local/bin
+      # directly (root-owned) — stage the file in /tmp and move it via a
+      # kubectl exec running as root.
+      install_to_usrlocal() {
+        local src="$1"
+        local name
+        name="$(basename "$src")"
+        if [ ! -f "$src" ]; then
+          warn "source missing: $src — skipping $name"
+          return 0
+        fi
+        if [ -z "$SANDBOX_POD" ]; then
+          warn "no sandbox pod — skipping $name"
+          return 0
+        fi
+        cat "$src" | ssh "$REMOTE_HOST" \
+          "cat > /tmp/${name} && chmod +x /tmp/${name}" 2>/dev/null || {
+          warn "stage to /tmp failed — skipping $name"
+          return 0
+        }
+        docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+          sh -c "cp /tmp/${name} /usr/local/bin/${name} && chmod +x /usr/local/bin/${name} && rm -f /tmp/${name}" 2>/dev/null \
+          && info "${name} deployed to /usr/local/bin/${name}" \
+          || warn "Could not install ${name} (kubectl exec failed)"
+      }
+
+      install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
+      for wrapper in chad-ensure-today-memory chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-phase2-draft-replies; do
+        install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
+      done
+
+      # Deploy registry/profile data files to /usr/local/share/chad/. Same
+      # stage-then-kubectl-exec dance as install_to_usrlocal, but the dest
+      # directory is for read-only data (no +x) and we must mkdir -p it.
+      # Wrappers find the deployed files via env-var-override-then-default
+      # paths (CHAD_PROFILES_FILE, NEMOCLAW_MODEL_REGISTRY).
+      install_to_share_chad() {
+        local src="$1"
+        local name
+        name="$(basename "$src")"
+        if [ ! -f "$src" ]; then
+          warn "source missing: $src — skipping $name"
+          return 0
+        fi
+        if [ -z "$SANDBOX_POD" ]; then
+          warn "no sandbox pod — skipping $name"
+          return 0
+        fi
+        cat "$src" | ssh "$REMOTE_HOST" \
+          "cat > /tmp/${name}" 2>/dev/null || {
+          warn "stage to /tmp failed — skipping $name"
+          return 0
+        }
+        docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+          sh -c "mkdir -p /usr/local/share/chad && cp /tmp/${name} /usr/local/share/chad/${name} && rm -f /tmp/${name}" 2>/dev/null \
+          && info "${name} deployed to /usr/local/share/chad/${name}" \
+          || warn "Could not install ${name} (kubectl exec failed)"
+      }
+
+      for data in model-registry.json task-profiles.json chad-workspace-files.txt; do
+        install_to_share_chad "${REPO_ROOT}/scripts/${data}"
+      done
+
+      # _chad-paths.sh is sourced by every bash wrapper at start-up to pick
+      # up the canonical paths for profiles/audit/auth-context/credentials.
+      # Deploying as a data file (no +x) under /usr/local/share/chad/ keeps
+      # /usr/local/bin/ free of non-executables.
+      install_to_share_chad "${REPO_ROOT}/scripts/chad-cron-wrappers/_chad-paths.sh"
     fi
   fi
 else
@@ -210,15 +351,137 @@ if [ "$skip_gbrain" -eq 0 ]; then
     echo "  [dry-run] ssh $REMOTE_HOST 'gbrain doctor 2>&1 | tail -5'"
   else
     if ssh "$REMOTE_HOST" 'command -v gbrain >/dev/null 2>&1'; then
-      ssh "$REMOTE_HOST" 'gbrain init 2>/dev/null || true'
+      # Fix ownership of PGLite files that may have been written as root
+      # during a prior gbrain import/export run. Stale root-owned WAL or
+      # lock files cause PGLite to abort on startup.
+      docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- \
+        sh -c 'chown -R sandbox:sandbox /sandbox/.gbrain/brain.pglite 2>/dev/null; \
+               rm -f /sandbox/.gbrain/brain.pglite/postmaster.pid \
+                     /sandbox/.gbrain/brain.pglite/.gbrain-lock 2>/dev/null; true' || true
+      ssh "$REMOTE_HOST" 'HOME=/sandbox gbrain init 2>/dev/null || true'
       gbrain_status="$(ssh "$REMOTE_HOST" 'gbrain doctor 2>&1 | tail -3')"
       info "gbrain init done: ${gbrain_status}"
+      # gbrain is intentionally NOT registered as an MCP server.
+      # PGLite is single-process; registering it causes lock contention and
+      # cold-start timeouts in isolated cron sessions. The main agent uses
+      # gbrain via CLI directly. Subagents receive context in their prompt.
     else
       warn "gbrain not found in sandbox — skipping brain init (image may need rebuild)"
     fi
   fi
 else
   info "Skipping gbrain init (--skip-gbrain)"
+fi
+
+# ── Step 3b: Configure gbrain embeddings ──────────────────────────────────
+#
+# Point gbrain at NVIDIA's hosted embedding API using the NVIDIA_API_KEY
+# deployed in step 3. gbrain uses the OpenAI SDK internally, so we set
+# OPENAI_BASE_URL + OPENAI_API_KEY via gbrain config. Model is
+# nvidia/nv-embedqa-e5-v5 which is available on integrate.api.nvidia.com.
+
+if [ "$skip_gbrain" -eq 0 ] && [ "$dry_run" -eq 0 ]; then
+  nvidia_key="$(python3 -c "
+import json, sys
+src = json.load(open('${CREDENTIALS_SRC}'))
+print(src.get('NVIDIA_API_KEY', ''))
+" 2>/dev/null)"
+
+  # Write gbrain config.json directly — gbrain config set doesn't persist to disk.
+  # Uses LM Studio on the Docker host (host.openshell.internal:1234) for free local
+  # embeddings. text-embedding-nomic-embed-text-v1.5 must be loaded in LM Studio.
+  # Falls back to Ollama (:11434) if LM Studio isn't running.
+  ssh "$REMOTE_HOST" "python3 -c \"
+import json
+cfg = {
+  'engine': 'pglite',
+  'database_path': '/sandbox/.gbrain/brain.pglite',
+  'openai_base_url': 'http://host.openshell.internal:1234/v1',
+  'openai_api_key': 'unused',
+  'embed_model': 'text-embedding-nomic-embed-text-v1.5'
+}
+with open('/sandbox/.gbrain/config.json', 'w') as f:
+    json.dump(cfg, f, indent=2)
+print('gbrain configured for LM Studio embeddings')
+\""
+  info "gbrain configured to use LM Studio embeddings (nomic-embed-text-v1.5 via host:1234)"
+
+  # Install gbrain wrapper that exports OPENAI_API_KEY before invoking the
+  # real binary. The OpenAI Node SDK throws if OPENAI_API_KEY is empty even
+  # though gbrain's config.json sets it to "unused" — cron sessions don't
+  # inherit interactive env, so embeddings fail without this wrapper.
+  GBRAIN_WRAPPER_SRC="${REPO_ROOT}/scripts/sandbox-bin/gbrain-wrapper.sh"
+  SANDBOX_POD="${SANDBOX_POD:-$(docker exec openshell-cluster-nemoclaw kubectl get pods -n openshell \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)}"
+  if [ -n "$SANDBOX_POD" ] && [ -f "$GBRAIN_WRAPPER_SRC" ]; then
+    GBRAIN_WRAPPER_B64=$(base64 < "$GBRAIN_WRAPPER_SRC" | tr -d '\n')
+    docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+      sh -c "
+        if [ ! -f /usr/local/bin/gbrain-bin ]; then
+          cp /usr/local/bin/gbrain /usr/local/bin/gbrain-bin
+        fi
+        echo '${GBRAIN_WRAPPER_B64}' | base64 -d > /usr/local/bin/gbrain
+        chmod 755 /usr/local/bin/gbrain /usr/local/bin/gbrain-bin
+        echo 'gbrain wrapper installed'
+      " 2>&1 | grep -v '^$' || warn "Could not install gbrain wrapper"
+  elif [ ! -f "$GBRAIN_WRAPPER_SRC" ]; then
+    warn "gbrain wrapper source missing: ${GBRAIN_WRAPPER_SRC}"
+  fi
+fi
+
+# ── Step 3c: Configure openclaw inference providers ───────────────────────
+#
+# NVIDIA (inference.local → cloud) is the primary model; LM Studio on
+# host:1234 is the fallback via openclaw's configured-provider-fallback
+# mechanism. openclaw tries the first configured provider (inference/NVIDIA)
+# and falls back to lmstudio if the default provider isn't available.
+
+if [ "$dry_run" -eq 0 ]; then
+  if docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- chmod 644 /sandbox/.openclaw/openclaw.json 2>/dev/null; then
+    ssh "$REMOTE_HOST" "python3 -c \"
+import json
+cfg = json.load(open('/sandbox/.openclaw/openclaw.json'))
+cfg['models'] = {
+  'mode': 'merge',
+  'providers': {
+    'inference': {
+      'baseUrl': 'https://inference.local/v1',
+      'apiKey': 'unused',
+      'api': 'openai-completions',
+      'models': [{
+        'id': 'nvidia/nemotron-3-super-120b-a12b',
+        'name': 'inference/nvidia/nemotron-3-super-120b-a12b',
+        'reasoning': False,
+        'input': ['text'],
+        'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
+        'contextWindow': 262144,
+        'maxTokens': 32768
+      }]
+    },
+    'lmstudio': {
+      'baseUrl': 'http://host.openshell.internal:1234/v1',
+      'apiKey': 'unused',
+      'api': 'openai-completions',
+      'models': [{
+        'id': 'google/gemma-4-e4b',
+        'name': 'lmstudio/google/gemma-4-e4b',
+        'reasoning': False,
+        'input': ['text'],
+        'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
+        'contextWindow': 131072,
+        'maxTokens': 8192
+      }]
+    }
+  }
+}
+json.dump(cfg, open('/sandbox/.openclaw/openclaw.json', 'w'), indent=2)
+print('done')
+\""
+    docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- chmod 444 /sandbox/.openclaw/openclaw.json 2>/dev/null || true
+    info "openclaw inference configured: NVIDIA primary, LM Studio fallback"
+  else
+    warn "Could not chmod openclaw.json — inference provider config skipped"
+  fi
 fi
 
 # ── Step 4: Authenticate gh ───────────────────────────────────────────────
@@ -307,20 +570,24 @@ if [ "$skip_crons" -eq 0 ]; then
   # + reference saves ~25k tokens/day at the new daytime-hourly cadence.
   # The budget guard at the top short-circuits the whole run when
   # remaining tokens are below 30000, so a bad day can't drain the pool.
-  email_check_message='Run mail check. First: `chad-budget show --field remaining_tokens` — if <30000, append "## Mail check skipped (low budget)" to memory/<today-UTC>.md and exit. Otherwise follow EMAIL-POLICY.md from the workspace root. Always log follow-ups and awaiting responses to memory/<today-UTC>.md.'
+  # The wrapper does the deterministic work (chad-mail-check + parse + batch
+  # mark-read + memory append). Replies and chad-intake routing are deferred
+  # to a human or a future agent run while the Kimi-K2.5 multi-turn tool-call
+  # regression is unresolved — see project_chad_cron_pattern memory.
+  email_check_message='Run `chad-email-check-cron`. The wrapper sweeps the inbox, batch-marks-read everything that does not need a human reply, and appends a `## Email-check (cron wrapper)` block to today'"'"'s memory file. Confirm it printed `email-check: total=... marked-read=... pending=...`, then exit. Do not draft replies or call chad-intake — the wrapper parks anything that needs a reply under `### Pending replies` for human review.'
 
-  workspace_backup_message='Run workspace backup. Execute /usr/local/bin/chad-backup-to-github and capture its stdout+stderr. On success (exit 0), append a "## Workspace Backup" section to memory/<today-UTC>.md with the timestamp and the reported file count. On failure (non-zero exit), append the same section with the error output and flag it as "BACKUP FAILED" so the next cron run sees it.'
+  workspace_backup_message='Run `chad-workspace-backup`. The wrapper detaches the slow git push and returns in <1s. Confirm it printed a `workspace-backup detached` line, then exit. Do not poll or follow up — the result lands in todays memory file when the background job finishes.'
 
   # Daily issue triage: reads open issues from $CHAD_BUG_REPO, scores
   # them, routes top 2 through a researcher sub-agent. Budget-guarded
   # (will skip when <40% remaining). Runs at 10:00 UTC so the human
   # triage from the previous afternoon has time to land reactions/labels.
-  issue_triage_message='Run `chad-issue-triage --top 2` and log its output to memory/<today-UTC>.md under "## Issue triage". Do not manually review the issues — the helper handles budget checks and spawning. If it reports "no issues with positive score", that is the expected quiet-day state.'
+  issue_triage_message='Run `chad-issue-triage-cron`. The wrapper enforces the budget gate, detaches the triage run, and returns in <1s. Confirm it printed `issue-triage detached` (or `skipped: budget=...`), then exit.'
 
   # Weekly self-improvement: scans failed spawns + feedback memory,
   # spawns a researcher with a "propose 1-3 improvements" task. Runs
   # Sunday 03:00 UTC when the inbox is quiet and budget is fresh.
-  self_improve_message='Run `chad-self-improve --days 7` and log its output to memory/<today-UTC>.md under "## Self-improvement". Do NOT apply the proposals — they land in memory/feedback-proposals.md for review on a later wake. If the helper reports "skipped: budget too low", note it and move on.'
+  self_improve_message='Run `chad-self-improve --days 7`. Append the stdout to todays memory file under a `## Self-improvement` heading. Do NOT apply any proposals — they land in memory/feedback-proposals.md for review later.'
 
   register_cron_via_ssh() {
     local name="$1"
@@ -377,7 +644,7 @@ if [ "$skip_crons" -eq 0 ]; then
   # GBrain nightly dream cycle: embed stale pages, extract entity links, run
   # doctor. Runs at 03:30 UTC (after self-improve) so the brain is fresh each
   # morning. Budget-guarded by gbrain itself — safe to run even on low-token days.
-  gbrain_dream_message='Run gbrain maintenance: `gbrain embed --stale` then `gbrain doctor`. Log summary to memory/<today-UTC>.md under "## Brain maintenance". If doctor reports errors, flag them for human review.'
+  gbrain_dream_message='Run `chad-gbrain-dream`. The wrapper syncs workspace docs into the brain, detaches the slow embed/extract steps, and writes its own summary to todays memory. Confirm it printed `gbrain dream complete`, then exit.'
 
   if echo "$existing_crons" | grep -q "gbrain-dream"; then
     warn "gbrain-dream cron already registered — skipping"
@@ -386,9 +653,62 @@ if [ "$skip_crons" -eq 0 ]; then
     register_cron_via_ssh "gbrain-dream" "30 3 * * *" "" "$gbrain_dream_message"
   fi
 
+  # Weekly budget audit: compares cron telemetry (p95 in/out/dur, error rate)
+  # against task-profiles.json and writes a markdown recommendation report
+  # to memory/feedback-proposals.md. Light-touch — wrapper is shell+python,
+  # cron payload only acks the summary line. See task-profiles.json for the
+  # canonical schedule (0 4 * * 1 = Mon 04:00 UTC).
+  budget_audit_message='Run `chad-budget-audit`. The wrapper computes p95 telemetry per cron, compares against task-profiles.json, and writes a recommendation block to memory/feedback-proposals.md. Confirm it printed `budget-audit: N findings, M crons, ...`, then exit. Do NOT apply any recommendations — they are reviewed by a human.'
+
+  if echo "$existing_crons" | grep -q "chad-budget-audit"; then
+    warn "chad-budget-audit cron already registered — skipping"
+  else
+    info "Registering chad-budget-audit cron (weekly Mon 04:00 UTC)"
+    register_cron_via_ssh "chad-budget-audit" "0 4 * * 1" "" "$budget_audit_message"
+  fi
+
   info "Cron jobs registered"
 else
   info "Skipping cron registration (--skip-crons)"
+fi
+
+# ── Step 8: Ensure required L7 policies are applied ────────────────────────
+#
+# nemoclaw policy-add is idempotent — if a preset is already in local state,
+# it's a no-op. The cron wrappers and orchestrator subagents need each of
+# these to function:
+#
+#   email-check       → proton-calendar (proton-tool egress)
+#   workspace-backup  → github, github-tools (gh CLI + git push)
+#   issue-triage      → github, subagent-researcher
+#   gbrain-dream      → gbrain, local-inference (NVIDIA + LM Studio fallback)
+#   chad-budget-audit → no egress
+#   premium escalate  → chad-premium (Anthropic Messages API)
+#   bug-report        → chad-bug-report (gh issue create scoped)
+#   subagent fan-out  → subagent-researcher, subagent-reviewer, subagent-writer
+#
+# Known drift: nemoclaw policy-list may report "(recorded locally, not active
+# on gateway)" even after policy-add — the local CLI state and the L7 OPA
+# gateway can diverge. Cron success is the ground-truth signal that egress
+# is allowed; if a preset is silently missing on the gateway, the wrapper
+# will surface a binary-pinned 403 in the cron's last error.
+
+REQUIRED_PRESETS="proton-calendar github github-tools gbrain local-inference \
+chad-premium chad-bug-report subagent-researcher subagent-reviewer \
+subagent-writer huggingface openclaw-bundled"
+
+if [ "$skip_policies" -eq 0 ]; then
+  step "Ensuring L7 policies are applied to '${SANDBOX}'"
+  for preset in $REQUIRED_PRESETS; do
+    if [ "$dry_run" -eq 1 ]; then
+      echo "  [dry-run] nemoclaw ${SANDBOX} policy-add ${preset} --yes"
+    else
+      out="$(nemoclaw "${SANDBOX}" policy-add "${preset}" --yes 2>&1 | tail -1 || true)"
+      info "  ${preset}: ${out}"
+    fi
+  done
+else
+  info "Skipping policy registration (--skip-policies)"
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────

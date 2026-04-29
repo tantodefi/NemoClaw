@@ -75,13 +75,24 @@ RUN if ! command -v gh >/dev/null 2>&1; then \
 # so the sandbox user can run `gbrain` without any PATH manipulation.
 # Brain data lives in /sandbox/.openclaw-data/gbrain/ (writable, persisted by
 # OpenShell across container restarts alongside workspace and credentials).
-# GBRAIN_DIR is set here so gbrain init/serve/query all resolve the same path.
+# GBRAIN_DIR is set here so gbrain init/serve/query all resolve the same path.# BUN_INSTALL tells both the curl installer and `bun install -g` where
+# to place binaries (/usr/local/bin/). Must be set as an ENV so it
+# persists into the bun install -g invocation (not just the curl | bash).
+ENV BUN_INSTALL=/usr/local
+# Install bun then install gbrain into a fixed project dir so we know exactly
+# where the package lands. bun install -g has unpredictable bin-link paths on
+# Linux arm64; a local project install to /opt/gbrain is reliable.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends unzip \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash \
+    && curl -fsSL https://bun.sh/install | bash \
     && bun --version \
-    && bun install -g gbrain \
+    && mkdir -p /usr/local/lib/gbrain \
+    && cd /usr/local/lib/gbrain && echo '{"type":"module"}' > package.json \
+    && bun add 'github:tantodefi/gbrain' \
+    && printf '#!/bin/sh\nexec bun /usr/local/lib/gbrain/node_modules/gbrain/src/cli.ts "$@"\n' \
+       > /usr/local/bin/gbrain \
+    && chmod +x /usr/local/bin/gbrain \
     && gbrain --version
 
 ENV GBRAIN_DIR=/sandbox/.openclaw-data/gbrain
