@@ -40,6 +40,7 @@ filesystem_policy:
                                     # Writable state (agents, plugins) lives in
                                     # /sandbox/.openclaw-data via symlinks.
                                     # Ref: https://github.com/NVIDIA/NemoClaw/issues/514
+    - /opt/gbrain                   # gbrain package install dir (read+execute for bun)
   read_write:
     - /tmp
     - /dev/null
@@ -139,6 +140,7 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/bun }      # gbrain embed calls inference for embeddings
 
   # NOTE: github.com / api.github.com and the git/gh binaries used to
   # live in this base policy and were therefore granted to every
@@ -361,6 +363,43 @@ network_policies:
       - { path: "/sandbox/go/bin/go" }
       - { path: "/sandbox/**/go" }
       - { path: /usr/bin/git }
+
+  # ── Internet Archive (fitness book ingest) ────────────────────
+  # Used by chad-ingest-fitness-books.sh to download OCR text for
+  # Starting Strength and Supple Leopard from archive.org.
+  # Restricted to GET — read-only fetch, no uploads.
+  internet_archive:
+    name: internet_archive
+    endpoints:
+      - host: archive.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+      - host: "*.archive.org"
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+      # CDN download servers: ia<nnn>.us.archive.org, dn<nnn>.ca.archive.org, etc.
+      # archive.org/download redirects to these regional CDN hosts; access: full
+      # is required because they negotiate TLS independently (no proxy MiTM).
+      - host: "*.us.archive.org"
+        port: 443
+        access: full
+      - host: "*.ca.archive.org"
+        port: 443
+        access: full
+      - host: "*.eu.archive.org"
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/curl }
 
   # ── Proton API (proton-calendar skill) ─────────────────────────
   # go-proton-api uses SRP auth + PGP encryption, which requires the Go

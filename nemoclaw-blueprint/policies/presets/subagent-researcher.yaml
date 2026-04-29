@@ -52,3 +52,26 @@ network_policies:
       - { path: /usr/bin/gh }
       - { path: /usr/bin/curl }
       - { path: /usr/local/bin/node }
+
+  subagent_researcher_archive:
+    name: subagent_researcher_archive
+    endpoints:
+      - host: archive.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+      - host: "*.archive.org"
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/node }

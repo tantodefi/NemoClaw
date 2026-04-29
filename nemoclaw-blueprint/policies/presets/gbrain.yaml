@@ -7,12 +7,11 @@
 
 preset:
   name: gbrain
-  description: "GBrain knowledge brain — host MCP server + OpenAI embeddings + Anthropic query expansion."
+  description: "GBrain knowledge brain — host MCP server + NVIDIA embeddings + Anthropic query expansion."
 
 network_policies:
   gbrain_host_mcp:
     name: gbrain_host_mcp
-    description: "Reach gbrain MCP server on the host via the host-gateway loopback"
     endpoints:
       - host: "host.docker.internal"
         port: 0
@@ -22,16 +21,38 @@ network_policies:
           - allow: { method: POST, path: "/mcp/**" }
           - allow: { method: GET,  path: "/health" }
 
-  gbrain_openai_embeddings:
-    name: gbrain_openai_embeddings
+  gbrain_nvidia_embeddings:
+    name: gbrain_nvidia_embeddings
     endpoints:
-      - host: api.openai.com
+      - host: integrate.api.nvidia.com
         port: 443
         protocol: rest
         enforcement: enforce
         tls: terminate
         rules:
           - allow: { method: POST, path: "/v1/embeddings" }
+    binaries:
+      - { path: /usr/local/bin/gbrain }
+
+  gbrain_nvidia_local_inference:
+    name: gbrain_nvidia_local_inference
+    # gbrain only calls /v1/embeddings (text-embedding-nomic-embed-text-v1.5)
+    # and /v1/models (capability check during `gbrain doctor`). Locking the
+    # paths instead of /** keeps this preset narrow — a future regression
+    # that uses the gbrain binary as a generic NVIDIA-inference proxy would
+    # be visible at the policy layer instead of silently allowed.
+    endpoints:
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/v1/embeddings" }
+          - allow: { method: GET,  path: "/v1/models" }
+          - allow: { method: GET,  path: "/v1/models/*" }
+    binaries:
+      - { path: /usr/local/bin/gbrain }
 
   gbrain_anthropic_expansion:
     name: gbrain_anthropic_expansion

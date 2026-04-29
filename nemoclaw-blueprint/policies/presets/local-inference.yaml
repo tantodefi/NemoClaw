@@ -3,7 +3,7 @@
 
 preset:
   name: local-inference
-  description: "Local inference access (Ollama, vLLM) via host gateway"
+  description: "Local inference access (Ollama :11434, LM Studio :1234, vLLM :8000) via host gateway"
 
 network_policies:
   local_inference:
@@ -11,6 +11,13 @@ network_policies:
     endpoints:
       - host: host.openshell.internal
         port: 11434
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: host.openshell.internal
+        port: 1234
         protocol: rest
         enforcement: enforce
         rules:
@@ -33,3 +40,5 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/bun }
