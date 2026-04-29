@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# open-webui — chat front-end backed by NemoClaw inference + Chad's gbrain.
+#
+# Hardened for internet exposure via Cloudflare Tunnel + Cloudflare Access:
+#   - 127.0.0.1 binding only (cloudflared is the sole inbound path).
+#   - Local signup disabled; CF Access at the edge is the front door.
+#   - Trusted-header SSO so the password layer is never internet-facing.
+#
+# Bring up:   bash scripts/openwebui-setup.sh
+# Tear down:  bash scripts/openwebui-down.sh
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: nemoclaw-openwebui
+    restart: unless-stopped
+    expose:
+      - "8080"
+    ports:
+      # 127.0.0.1 binding — internet access ONLY via the cloudflared sidecar.
+      # Do not change to 0.0.0.0 unless you also intend LAN exposure.
+      - "127.0.0.1:${WEBUI_HOST_PORT:-3000}:8080"
+    volumes:
+      - ${WEBUI_DATA_DIR:-${HOME}/.nemoclaw/openwebui/data}:/app/backend/data
+    environment:
+      WEBUI_AUTH: "True"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-False}"
+      # In tunnel mode this is set to Cf-Access-Authenticated-User-Email.
+      # In quick mode it's empty, so open-webui falls back to its own login form.
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${WEBUI_AUTH_TRUSTED_EMAIL_HEADER:-}"
+      WEBUI_AUTH_TRUSTED_NAME_HEADER: "${WEBUI_AUTH_TRUSTED_EMAIL_HEADER:-}"
+      DEFAULT_USER_ROLE: "user"
+      # Duration string (open-webui parses with python parse_duration; bare int
+      # like "86400" raises "Invalid duration string" and breaks /signup).
+      JWT_EXPIRES_IN: "24h"
+      ENABLE_COMMUNITY_SHARING: "False"
+      ENABLE_MESSAGE_RATING: "False"
+      WEBUI_NAME: "${WEBUI_NAME:-Chad}"
+      OPENAI_API_BASE_URL: "${OPENAI_API_BASE_URL}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-sk-no-key-required}"
+    networks:
+      - openwebui-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Tunnel mode: domain-backed managed tunnel + Cloudflare Access in front.
+  cloudflared-tunnel:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    container_name: nemoclaw-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN:-missing}
+    depends_on:
+      - open-webui
+    networks:
+      - openwebui-net
+    # Pin DNS — docker's embedded resolver on custom bridges sometimes
+    # NXDOMAINs trycloudflare.com lookups on macOS hosts.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+  # Quick mode: ephemeral *.trycloudflare.com URL, no auth gate beyond open-webui's.
+  # The URL changes on every restart; only the cloudflared logs know it.
+  cloudflared-quick:
+    profiles: ["quick"]
+    image: cloudflare/cloudflared:latest
+    container_name: nemoclaw-cloudflared-quick
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://open-webui:8080
+    depends_on:
+      - open-webui
+    networks:
+      - openwebui-net
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+networks:
+  openwebui-net:
+    driver: bridge

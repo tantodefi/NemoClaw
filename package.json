@@ -24,6 +24,10 @@
     "bump:version": "tsx scripts/bump-version.ts",
     "chad:sync": "bash scripts/chad-sync.sh",
     "chad:sync:dry": "bash scripts/chad-sync.sh --dry-run",
+    "webui:up": "bash scripts/openwebui-setup.sh",
+    "webui:up:quick": "bash scripts/openwebui-setup.sh --mode=quick",
+    "webui:down": "bash scripts/openwebui-down.sh",
+    "webui:logs": "docker compose --env-file scripts/openwebui/.env -f scripts/openwebui/docker-compose.yml --profile tunnel --profile quick logs -f",
     "prepare": "if command -v tsc >/dev/null 2>&1 || [ -x node_modules/.bin/tsc ]; then npm run build:cli; fi && (npm install --omit=dev --ignore-scripts 2>/dev/null || true) && if [ -d .git ]; then if [ -z \"${NEMOCLAW_INSTALLING:-}\" ]; then NEMOCLAW_INSTALLING=1 npm link 2>/dev/null || true; fi; if command -v prek >/dev/null 2>&1; then prek install; else echo \"Skipping git hook setup (prek not installed)\"; fi; fi",
     "prepublishOnly": "git describe --tags --match 'v*' | sed 's/^v//' > .version && test -s .version && cd nemoclaw && env -u npm_config_global -u npm_config_prefix -u npm_config_omit npm install --ignore-scripts && ./node_modules/.bin/tsc"
   },

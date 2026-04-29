@@ -165,4 +165,5 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 - [Backup and Restore](../workspace/backup-restore.md) — the canonical persistence guide
 - [Workspace Files](../workspace/workspace-files.md) — what each file does and the sectioned manifest format
 - [Backup Policy](../resources/backup-policy.md) — full inventory across all four state layers
+- [Open WebUI Front-End](openwebui.md) — chat UI exposed via Cloudflare Tunnel + Access
 - [Log Locations](log-locations.md) — where each log stream lives
