@@ -121,7 +121,7 @@ Each cell is one sub-agent Chad — a fresh `openclaw agent --local --session-id
 ```text
 chad-workflow-batch \
   --variants current,candidate-A \
-  --models   moonshotai/kimi-k2.5,anthropic/claude-sonnet-4-6 \
+  --models   nvidia/nemotron-3-super-120b-a12b,anthropic/claude-sonnet-4-6 \
   --samples  3 \
   --parallel 3
 ```

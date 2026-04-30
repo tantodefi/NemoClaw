@@ -568,7 +568,7 @@ except Exception:
 
   if [ -z "$GITHUB_TOKEN" ]; then
     warn "GITHUB_TOKEN not found in credentials.json — gh auth skipped"
-    warn "Run manually: echo \$GITHUB_TOKEN | nemoclaw ${SANDBOX} exec -- gh auth login --git-protocol https --with-token"
+    warn "Run manually: echo \$GITHUB_TOKEN | ssh openshell-${SANDBOX} 'gh auth login --git-protocol https --with-token'"
   else
     if [ "$dry_run" -eq 1 ]; then
       echo "  [dry-run] Would run: echo <token> | gh auth login --git-protocol https --with-token"

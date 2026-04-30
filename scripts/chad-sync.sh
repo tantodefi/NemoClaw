@@ -32,8 +32,6 @@
 #   CHAD_SANDBOX        sandbox name (default: chad)
 #   CHAD_STATE_REPO     state repo (default: tantodefi/chad-state)
 #   CHAD_DUMP_DIR       local dump directory (default: ~/.nemoclaw/dumps)
-#   OPENCLAW_GATEWAY_URL passed through to the sandbox-side cron audit
-#                        (default: ws://127.0.0.1:18790)
 
 set -uo pipefail
 
@@ -41,7 +39,6 @@ set -uo pipefail
 SANDBOX="${CHAD_SANDBOX:-chad}"
 STATE_REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
 DUMP_DIR="${CHAD_DUMP_DIR:-${HOME}/.nemoclaw/dumps}"
-GATEWAY_URL="${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18790}"
 DRY_RUN=0
 SKIP_DUMP=0
 
@@ -153,7 +150,7 @@ try:
     d=json.load(open(\"'\"\$JOBS_FILE\"'\")); print(len(d.get(\"jobs\", [])))
 except Exception:
     print(0)' 2>/dev/null || echo 0)
-    mem=\$(OPENCLAW_GATEWAY_URL='${GATEWAY_URL}' openclaw cron list --all --json 2>/dev/null \
+    mem=\$(openclaw cron list --all --json 2>/dev/null \
       | python3 -c 'import json,sys
 try:
     d=json.load(sys.stdin)

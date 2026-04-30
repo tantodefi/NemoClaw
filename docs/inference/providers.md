@@ -41,19 +41,21 @@ Source: `scripts/task-profiles.json` (joined with `scripts/model-registry.json`)
 
 | Task profile | Default model | Quality band | Premium variant |
 |---|---|---|---|
-| `default` | `moonshotai/kimi-k2.5` | GREEN | (none — covered by free gateway) |
-| `code-completion` | `moonshotai/kimi-k2.5` | GREEN | (none) |
-| `issue-triage` (orchestrator) | `moonshotai/kimi-k2.5` | YELLOW (multi-turn tool-call regression) | `issue-triage-coder-subagent-premium` |
-| `issue-triage-coder-subagent` | `moonshotai/kimi-k2.5` | YELLOW | `issue-triage-coder-subagent-premium` → `claude-sonnet-4-6` |
-| `content-generation` | `moonshotai/kimi-k2.5` | YELLOW | `content-generation-premium` → `claude-sonnet-4-6` |
-| `chad-bug-intake` | `moonshotai/kimi-k2.5` | YELLOW | `chad-bug-intake-premium` → `claude-sonnet-4-6` |
-| `self-improve` | `nvidia/nemotron-…` (embedded) | YELLOW (slow) | run via `chad-premium --opus` ad hoc |
-| `mail-summarize` | `moonshotai/kimi-k2.5` | GREEN | (none) |
+| `default` | `nvidia/nemotron-3-super-120b-a12b` | GREEN | (none — covered by free gateway) |
+| `code-completion` | `nvidia/nemotron-3-super-120b-a12b` | GREEN | (none) |
+| `issue-triage` (orchestrator) | `nvidia/nemotron-3-super-120b-a12b` | GREEN | `issue-triage-coder-subagent-premium` (still routed for deeper code review) |
+| `issue-triage-coder-subagent` | `nvidia/nemotron-3-super-120b-a12b` | YELLOW | `issue-triage-coder-subagent-premium` → `claude-sonnet-4-6` |
+| `content-generation` | `nvidia/nemotron-3-super-120b-a12b` | YELLOW | `content-generation-premium` → `claude-sonnet-4-6` |
+| `chad-bug-intake` | `nvidia/nemotron-3-super-120b-a12b` | YELLOW | `chad-bug-intake-premium` → `claude-sonnet-4-6` |
+| `self-improve` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` (embedded) | YELLOW (slow) | run via `chad-premium --opus` ad hoc |
+| `mail-summarize` | `nvidia/nemotron-3-super-120b-a12b` | GREEN | (none) |
 | `premium-default` | `claude-sonnet-4-6` | n/a (always premium) | — |
 | `premium-opus` | `claude-opus-4-7` | n/a (always premium) | — |
 
 GREEN = current model produces acceptable output; switching to premium would not move the needle.
 YELLOW = current model frequently underperforms (truncated reasoning, dropped tool calls, shallow reviews); premium materially improves the result.
+
+> **Migration note (2026-04-30):** Kimi K2.5 was the previous default until NVIDIA Endpoints deprecated it (returns 410 GONE). All free-tier defaults moved to `nvidia/nemotron-3-super-120b-a12b`, which has `reasoningSafe=true` so the multi-turn tool-call regression that gated Kimi behind YELLOW for several tasks no longer applies. Premium variants stayed on Sonnet/Opus for the deeper-reasoning use cases.
 
 ## When premium pays off
 
@@ -61,7 +63,7 @@ Use premium (Sonnet) when the task involves:
 
 - Multi-turn tool calls with state to thread across (issue-triage coder, bug-intake review).
 - Long-context synthesis (content-generation, retrospectives, multi-file refactors).
-- Anything where the existing Kimi-K2.5 routing has shown the multi-turn regression.
+- Anything where Nemotron's review or reasoning depth feels shallow versus the cost of a premium call.
 
 Use opus only for:
 

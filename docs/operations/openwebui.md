@@ -24,7 +24,7 @@ status: published
 
 `open-webui` is a chat UI that speaks the OpenAI API. NemoClaw bundles a
 docker compose plus a Cloudflare-Tunnel-based setup script so you can stand
-up a chat front-end backed by the same K2.5 inference Chad uses, reachable
+up a chat front-end backed by the same Nemotron 3 Super 120B inference Chad uses, reachable
 from any browser, gated by an email allowlist.
 
 ## Architecture at a glance
@@ -55,7 +55,7 @@ choose between them per conversation:
                                         ▼             ▼
                             ┌────────────────────┐  ┌──────────────────────┐
                             │ NVIDIA Build       │  │ host:8901            │
-                            │ /v1 (kimi-k2.5,    │  │ (SSH port-forward)   │
+                            │ /v1 (nemotron 120B,│  │ (SSH port-forward)   │
                             │  raw inference)    │  └──────────┬───────────┘
                             └────────────────────┘             │
                                                 ──host─────────┼────────────
@@ -76,7 +76,7 @@ against `ADMIN_EMAILS` before any traffic reaches the tunnel.
 
 **Provider 1 (raw NVIDIA Build)** is the default — chat goes straight to
 `integrate.api.nvidia.com` from the host with the `NVIDIA_API_KEY`. Same model
-Chad uses (`moonshotai/kimi-k2.5`), but no agent stack between you and the LLM.
+Chad uses (`nvidia/nemotron-3-super-120b-a12b`), but no agent stack between you and the LLM.
 
 **Provider 2 (`chad` model)** routes each turn through `chad-shim` running
 **inside** the sandbox, which translates `POST /v1/chat/completions` into
@@ -211,7 +211,7 @@ OPENAI_API_KEY=<NVIDIA_API_KEY from /sandbox/.openclaw-data/credentials/credenti
 ```
 
 The model picker shows every model in your NVIDIA Build catalog
-(`moonshotai/kimi-k2.5`, the various NIMs, etc.). No sandbox dependency —
+(`nvidia/nemotron-3-super-120b-a12b`, the various NIMs, etc.). No sandbox dependency —
 chat works even if the OpenShell sandbox is down.
 
 > Note: Cloudflare passes the user's email through to open-webui in tunnel
@@ -312,7 +312,7 @@ Cloudflare Access (tunnel mode) passes the user's email in
 users see which providers via *Admin Panel → Settings → Users → Permissions*.
 A typical split for the NemoClaw two-admin setup:
 
-| User | Sees `chad` model | Sees raw `kimi-k2.5` |
+| User | Sees `chad` model | Sees raw `nemotron-3-super-120b` |
 |---|---|---|
 | `tantodefi@proton.me` | ✓ | ✓ |
 | `tjcooke@protonmail.com` | ✓ (free flows only — premium gated by `auto-actions.json`) | ✓ |

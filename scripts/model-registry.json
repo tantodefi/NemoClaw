@@ -1,10 +1,10 @@
 {
   "$schema": "./model-registry.schema.json",
   "_comment": "Single source of truth for per-model limits. Consumed by generate-openclaw-config.py, Dockerfile defaults, and (future) routing layer. Update here, regenerate downstream artifacts.",
-  "_last_verified": "2026-04-29",
+  "_last_verified": "2026-04-30",
   "models": {
     "moonshotai/kimi-k2.5": {
-      "displayName": "Kimi K2.5",
+      "displayName": "Kimi K2.5 (DEPRECATED 2026-04-29)",
       "contextWindow": 262144,
       "maxOutputTokens": 32768,
       "reasoningSupported": true,
@@ -12,18 +12,19 @@
       "reasoningSafeReason": "K2.5 emits tool calls in a format that the openclaw harness can't round-trip when reasoning=true; agent loops on empty toolUse stops. See project_chad_cron_pattern memory.",
       "providers": ["nvidia-prod-gateway"],
       "tier": "frontier",
-      "modality": ["text"]
+      "modality": ["text"],
+      "_deprecated": "Removed from NVIDIA Endpoints catalog 2026-04-29 (returns 410 GONE on inference). Upstream NemoClaw PR #2735 dropped it from CLOUD_MODEL_OPTIONS. Entry retained for historical task-profiles inheritance comments."
     },
     "nvidia/nemotron-3-super-120b-a12b": {
-      "displayName": "Nemotron 3 Super 120B (routing label)",
-      "contextWindow": 131072,
-      "maxOutputTokens": 16384,
+      "displayName": "Nemotron 3 Super 120B",
+      "contextWindow": 262144,
+      "maxOutputTokens": 32768,
       "reasoningSupported": true,
       "reasoningSafe": true,
       "providers": ["nvidia-prod"],
       "tier": "frontier",
       "modality": ["text"],
-      "_note": "Currently used as a routing label only — gateway translates this id to moonshotai/kimi-k2.5 upstream. Keep registry honest about the *label's* native limits in case routing changes."
+      "_note": "Default cloud model since 2026-04-30 (replacing the deprecated Kimi K2.5). MoE: ~120B total / ~12B active. Hosted on integrate.api.nvidia.com via the NVIDIA_API_KEY."
     },
     "google/gemma-3-4b": {
       "displayName": "Gemma 3 4B (lmstudio fallback)",
@@ -74,7 +75,7 @@
     }
   },
   "defaults": {
-    "primary": "moonshotai/kimi-k2.5",
+    "primary": "nvidia/nemotron-3-super-120b-a12b",
     "fallback": "google/gemma-3-4b",
     "outsource": "claude-opus-4-7"
   }

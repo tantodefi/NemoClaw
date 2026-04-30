@@ -26,11 +26,14 @@ This page is the canonical catalog of every script in the Chad sandbox toolchain
 
 ## Primary Commands
 
-The four commands you'll actually type day-to-day:
+The five commands you'll actually type day-to-day:
 
 ```console
 # One-time host-side bootstrap (or after major changes):
 $ bash scripts/chad-setup.sh chad
+
+# Local sandbox snapshot — fastest pre-destroy/pre-rebuild safety net:
+$ nemoclaw chad snapshot create --name before-X
 
 # Snapshot everything and push to chad-state (run before pod resets, after meaningful changes):
 $ npm run chad:sync
@@ -41,6 +44,8 @@ $ ssh openshell-chad 'chad-restore-from-github'
 # Local triage snapshot — markdown dump for sharing or diffing, no remote calls:
 $ ssh openshell-chad 'chad-dump-state' > state-$(date -u +%Y%m%dT%H%M%SZ).md
 ```
+
+`nemoclaw chad rebuild --yes` ties the first two together — it auto-creates a snapshot, destroys the sandbox, recreates with the current image, and restores workspace state. Use it when changing credentials, model selection, or refreshing OpenClaw. After rebuild, run `bash scripts/chad-setup.sh chad --skip-restore` to redeploy gh auth, source clone, crons, and the L7-policy-aware chown for `/sandbox/.openclaw/{devices,workspace,identity,cron}` (required for OpenClaw 2026.4.24+).
 
 For more granular operations, see the categorized catalog below.
 
@@ -111,7 +116,7 @@ These run unattended via `openclaw cron`. Schedules and budgets live in [`script
 
 | Wrapper | Schedule | What it does |
 |---|---|---|
-| `chad-email-check-cron` | `0 2,6-23 * * *` | Sweeps the inbox via `chad-mail-check`, batch-marks-read low-signal mail, parks remainder under `### Pending replies` for human review. Optionally invokes `chad-drafter` (single-turn LLM, K2.5-safe) and routes drafts through `chad-autosend-replies`. |
+| `chad-email-check-cron` | `0 2,6-23 * * *` | Sweeps the inbox via `chad-mail-check`, batch-marks-read low-signal mail, parks remainder under `### Pending replies` for human review. Optionally invokes `chad-drafter` (single-turn LLM, no MCP/tools) and routes drafts through `chad-autosend-replies`. |
 | `chad-issue-triage-cron` | `0 10 * * *` | Reads top-N open issues from `${CHAD_BUG_REPO}`, runs the drafter for triage decisions (skip/comment-draft/close-stale), then detaches researcher/coder sub-agents for the highest-priority items. |
 | `chad-workspace-backup` | `0 */6 * * *` | Wraps `chad-backup-to-github` and detaches the slow git push so the cron payload returns in <1s. |
 | `chad-gbrain-dream` | `30 3 * * *` | Nightly embed-stale + extract-graph + extract-timeline against the gbrain. Detached. |
@@ -122,8 +127,8 @@ These run unattended via `openclaw cron`. Schedules and budgets live in [`script
 
 | Wrapper | What it does | Invoked by |
 |---|---|---|
-| `chad-route-prompt` | Routes a prompt to the appropriate model (K2.5 default via NVIDIA free inference; premium via Anthropic when account funded). | All cron wrappers that talk to the LLM. |
-| `chad-drafter` | Single-turn LLM drafter — no MCP, no tools, K2.5-safe even with `thinking=high`. Drafts emails, triage decisions, etc. into the day's memory file. **Never auto-sends.** | `chad-email-check-cron`, `chad-issue-triage-cron`. |
+| `chad-route-prompt` | Routes a prompt to the appropriate model (Nemotron 3 Super 120B default via NVIDIA free inference; premium via Anthropic when account funded). | All cron wrappers that talk to the LLM. |
+| `chad-drafter` | Single-turn LLM drafter — no MCP, no tools, deterministic for cron. Drafts emails, triage decisions, etc. into the day's memory file. **Never auto-sends.** | `chad-email-check-cron`, `chad-issue-triage-cron`. |
 | `chad-action-gate` | Policy + budget gate. Decides whether a queued action (auto-send, auto-comment) should run. Returns one of `auto`, `draft`, `block`, `budget`, `killed`. | `chad-autosend-replies`. |
 | `chad-autosend-replies` | Routes drafter outputs through the action gate; sends `auto` immediately, leaves `draft` for human review, marks `block`/`deferred` accordingly. Mutates the drafter output in place. | Tail end of `chad-email-check-cron`. |
 | `chad-mail-check` / `chad-mail-send` | Direct Proton inbox sweep / send (via `proton-tool`). | `chad-email-check-cron`, `chad-autosend-replies`. |
