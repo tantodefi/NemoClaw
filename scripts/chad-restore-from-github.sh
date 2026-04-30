@@ -174,3 +174,12 @@ else
   [ ! -d "$tmp_dir/state/brain" ] && log "No brain/ in chad-state — skipping brain restore"
   ! command -v gbrain >/dev/null 2>&1 && warn "gbrain not found — brain restore skipped"
 fi
+
+# Ensure chad-shim is running. open-webui's `chad` model talks to this OpenAI-
+# compat shim (loopback only, port 8901), which translates each chat turn into
+# `openclaw agent`. Idempotent — only starts if not already running and the
+# binary is installed.
+if [ -x /usr/local/bin/chad-shim.py ] && ! pgrep -f chad-shim.py >/dev/null 2>&1; then
+  HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &
+  log "chad-shim started"
+fi

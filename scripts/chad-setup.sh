@@ -292,6 +292,24 @@ print(json.dumps(out, indent=2))
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
+      # chad-shim: OpenAI-compat HTTP shim around `openclaw agent`, used by
+      # open-webui's `chad` model. Listens on 127.0.0.1:8901 inside the sandbox;
+      # the host reaches it via `npm run webui:chad:up` SSH port-forward.
+      install_to_usrlocal "${REPO_ROOT}/scripts/openwebui/chad-shim.py"
+      if [ -n "$SANDBOX_POD" ]; then
+        docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+          sh -c '
+            if ! pgrep -f chad-shim.py >/dev/null 2>&1; then
+              HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &
+              echo "chad-shim: started"
+            else
+              echo "chad-shim: already running"
+            fi
+          ' 2>/dev/null \
+          && info "chad-shim ensured running" \
+          || warn "Could not start chad-shim (kubectl exec failed)"
+      fi
+
       # Deploy registry/profile data files to /usr/local/share/chad/. Same
       # stage-then-kubectl-exec dance as install_to_usrlocal, but the dest
       # directory is for read-only data (no +x) and we must mkdir -p it.

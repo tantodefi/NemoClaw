@@ -276,19 +276,34 @@ $ curl -sS -X POST http://127.0.0.1:8901/v1/chat/completions \
 PONG
 ```
 
-**Persistence caveats** (current MVP — improvements tracked separately):
+**Persistence (auto-restart across reboots and sandbox cycles):**
 
-- The SSH tunnel is `ssh -fN` with `ServerAliveInterval=30`. It survives
-  brief network blips but dies on host sleep, reboot, or VPN flap. Re-run
-  `npm run webui:chad:up` after any of those.
-- The shim inside the sandbox is `nohup`'d. It dies on sandbox restart and
-  is not (yet) re-launched by `chad-setup.sh` or workspace restore. Re-run
-  step 2 after any sandbox cycle.
-- Session continuity: `chad-shim` derives a stable `--session-id` by
-  hashing the conversation's *first* message. New chat → new openclaw
-  session. Editing earlier turns in open-webui ("regenerate from here") will
-  hit the same openclaw session, so its memory may diverge from what the UI
-  shows. Live with it for now; revisit once we want strict consistency.
+For one-shot use, `npm run webui:chad:up` opens an `ssh -fN` tunnel and
+the shim is `nohup`'d in-sandbox. Both die on host reboot / sandbox reset.
+For always-on use, install both lifecycle hooks:
+
+```console
+$ npm run webui:chad:install     # host: launchd agent, KeepAlive=true
+$ npm run chad:sync              # sandbox: chad-setup.sh installs the shim
+                                 # and ensures it's running
+```
+
+After install:
+
+- **Host side:** launchd respawns the SSH port-forward whenever it exits
+  (network blip, sleep, reboot, or `webui:chad:down`). The agent lives at
+  `~/Library/LaunchAgents/dev.nemoclaw.chad-tunnel.plist`. Logs at
+  `/tmp/chad-tunnel.{out,err}.log`. Remove with `npm run webui:chad:uninstall`.
+- **Sandbox side:** `chad-setup.sh` installs `/usr/local/bin/chad-shim.py`
+  and starts it. `chad-restore-from-github.sh` and `chad-backup-to-github.sh`
+  each re-launch the shim if it's not running, so any cron pulse self-heals
+  a crashed shim within 24 hours (or sooner — workspace backup runs hourly).
+
+**Session continuity:** `chad-shim` derives a stable `--session-id` by
+hashing the conversation's *first* message. New chat → new openclaw
+session. Editing earlier turns in open-webui ("regenerate from here") will
+hit the same openclaw session, so its memory may diverge from what the UI
+shows. Live with it for now; revisit once we want strict consistency.
 
 ### Choosing per-user
 
