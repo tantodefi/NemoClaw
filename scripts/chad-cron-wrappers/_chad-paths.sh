@@ -34,7 +34,20 @@ export CHAD_MAIL_HANDLED_LOG="${CHAD_MAIL_HANDLED_LOG:-/sandbox/.openclaw/worksp
 # Sandbox credentials JSON (PROTON_*, ANTHROPIC_API_KEY).
 export CHAD_CREDS_FILE="${CHAD_CREDS_FILE:-/sandbox/.nemoclaw/credentials.json}"
 
-# Today's daily memory file (resolved at call-time by chad-ensure-today-memory).
-# Exported as a function-style constant for callers that want the path
-# without forking the helper.
-export CHAD_MEMORY_DIR="${CHAD_MEMORY_DIR:-/sandbox/.openclaw-data/memory}"
+# Daily memory directory. Per-day human-readable journal lives in
+# <CHAD_MEMORY_DIR>/<UTC-date>.md (created by chad-ensure-today-memory) and a
+# parallel structured event log in <CHAD_MEMORY_DIR>/events-<UTC-date>.jsonl
+# (appended by chad-log-event).
+#
+# WAS: /sandbox/.openclaw-data/memory — that path is for chad-self-improve
+# artifacts (feedback-proposals.md), not the daily journal. The journal has
+# always lived under /sandbox/.openclaw/workspace/memory; the prior default
+# here was a stale value from before the sectioned-manifest restructure and
+# nothing actually consumed it. Fixing so callers can rely on this constant.
+export CHAD_MEMORY_DIR="${CHAD_MEMORY_DIR:-/sandbox/.openclaw/workspace/memory}"
+
+# Structured event log for today (one JSON object per line). Resolved at
+# call-time so cron jobs that span midnight always write to the right file.
+chad_events_file_today() {
+  printf '%s/events-%s.jsonl\n' "$CHAD_MEMORY_DIR" "$(date -u +%Y-%m-%d)"
+}

@@ -1,0 +1,314 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * PGLite schema — derived from schema-embedded.ts (Postgres schema).
+ *
+ * Differences from Postgres:
+ * - No RLS block (no role system in embedded PGLite)
+ * - No access_tokens / mcp_request_log (local-only, no remote auth)
+ * - No files table (file attachments require Supabase Storage)
+ * - No pg_advisory_lock (single connection)
+ *
+ * Everything else is identical: same tables, triggers, indexes, pgvector HNSW, tsvector GIN.
+ *
+ * DRIFT WARNING: When schema-embedded.ts changes, update this file to match.
+ * test/edge-bundle.test.ts has a drift detection test.
+ *
+ * GBRAIN_EMBED_DIMENSIONS env var (default 1536) sets the vector column size.
+ * Must match the embedder configured in src/core/embedding.ts; mismatched dims
+ * will fail at INSERT time with a vector-length error.
+ */
+
+const EMBED_DIM = parseInt(process.env.GBRAIN_EMBED_DIMENSIONS || '1536', 10);
+const EMBED_MODEL_DEFAULT = process.env.GBRAIN_EMBED_MODEL || 'text-embedding-3-large';
+
+export const PGLITE_SCHEMA_SQL = `
+-- GBrain PGLite schema (local embedded Postgres)
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- ============================================================
+-- pages: the core content table
+-- ============================================================
+CREATE TABLE IF NOT EXISTS pages (
+  id            SERIAL PRIMARY KEY,
+  slug          TEXT    NOT NULL UNIQUE,
+  type          TEXT    NOT NULL,
+  title         TEXT    NOT NULL,
+  compiled_truth TEXT   NOT NULL DEFAULT '',
+  timeline      TEXT    NOT NULL DEFAULT '',
+  frontmatter   JSONB   NOT NULL DEFAULT '{}',
+  content_hash  TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
+CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
+CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
+
+-- ============================================================
+-- content_chunks: chunked content with embeddings
+-- ============================================================
+CREATE TABLE IF NOT EXISTS content_chunks (
+  id            SERIAL PRIMARY KEY,
+  page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  chunk_index   INTEGER NOT NULL,
+  chunk_text    TEXT    NOT NULL,
+  chunk_source  TEXT    NOT NULL DEFAULT 'compiled_truth',
+  embedding     vector(${EMBED_DIM}),
+  model         TEXT    NOT NULL DEFAULT '${EMBED_MODEL_DEFAULT}',
+  token_count   INTEGER,
+  embedded_at   TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_page_index ON content_chunks(page_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_chunks_page ON content_chunks(page_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops);
+
+-- ============================================================
+-- links: cross-references between pages
+-- ============================================================
+-- See src/schema.sql for full design notes on link_source + origin_page_id.
+CREATE TABLE IF NOT EXISTS links (
+  id             SERIAL PRIMARY KEY,
+  from_page_id   INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  to_page_id     INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  link_type      TEXT    NOT NULL DEFAULT '',
+  context        TEXT    NOT NULL DEFAULT '',
+  link_source    TEXT    CHECK (link_source IS NULL OR link_source IN ('markdown', 'frontmatter', 'manual')),
+  origin_page_id INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+  origin_field   TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT links_from_to_type_source_origin_unique
+    UNIQUE NULLS NOT DISTINCT (from_page_id, to_page_id, link_type, link_source, origin_page_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_from ON links(from_page_id);
+CREATE INDEX IF NOT EXISTS idx_links_to ON links(to_page_id);
+CREATE INDEX IF NOT EXISTS idx_links_source ON links(link_source);
+CREATE INDEX IF NOT EXISTS idx_links_origin ON links(origin_page_id);
+
+-- ============================================================
+-- tags
+-- ============================================================
+CREATE TABLE IF NOT EXISTS tags (
+  id      SERIAL PRIMARY KEY,
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  tag     TEXT    NOT NULL,
+  UNIQUE(page_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+CREATE INDEX IF NOT EXISTS idx_tags_page_id ON tags(page_id);
+
+-- ============================================================
+-- raw_data: sidecar data
+-- ============================================================
+CREATE TABLE IF NOT EXISTS raw_data (
+  id         SERIAL PRIMARY KEY,
+  page_id    INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  source     TEXT    NOT NULL,
+  data       JSONB   NOT NULL,
+  fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(page_id, source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_data_page ON raw_data(page_id);
+
+-- ============================================================
+-- timeline_entries: structured timeline
+-- ============================================================
+CREATE TABLE IF NOT EXISTS timeline_entries (
+  id       SERIAL PRIMARY KEY,
+  page_id  INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  date     DATE    NOT NULL,
+  source   TEXT    NOT NULL DEFAULT '',
+  summary  TEXT    NOT NULL,
+  detail   TEXT    NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_timeline_page ON timeline_entries(page_id);
+CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_entries(date);
+-- Dedup constraint: same (page, date, summary) treated as same event
+CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_dedup ON timeline_entries(page_id, date, summary);
+
+-- ============================================================
+-- page_versions: snapshot history
+-- ============================================================
+CREATE TABLE IF NOT EXISTS page_versions (
+  id             SERIAL PRIMARY KEY,
+  page_id        INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  compiled_truth TEXT    NOT NULL,
+  frontmatter    JSONB   NOT NULL DEFAULT '{}',
+  snapshot_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_versions_page ON page_versions(page_id);
+
+-- ============================================================
+-- ingest_log
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ingest_log (
+  id            SERIAL PRIMARY KEY,
+  source_type   TEXT    NOT NULL,
+  source_ref    TEXT    NOT NULL,
+  pages_updated JSONB   NOT NULL DEFAULT '[]',
+  summary       TEXT    NOT NULL DEFAULT '',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- config: brain-level settings
+-- ============================================================
+CREATE TABLE IF NOT EXISTS config (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+INSERT INTO config (key, value) VALUES
+  ('version', '1'),
+  ('engine', 'pglite'),
+  ('embedding_model', '${EMBED_MODEL_DEFAULT}'),
+  ('embedding_dimensions', '${EMBED_DIM}'),
+  ('chunk_strategy', 'semantic')
+ON CONFLICT (key) DO NOTHING;
+
+-- ============================================================
+-- Minion Jobs: BullMQ-inspired Postgres-native job queue
+-- ============================================================
+CREATE TABLE IF NOT EXISTS minion_jobs (
+  id               SERIAL PRIMARY KEY,
+  name             TEXT        NOT NULL,
+  queue            TEXT        NOT NULL DEFAULT 'default',
+  status           TEXT        NOT NULL DEFAULT 'waiting',
+  priority         INTEGER     NOT NULL DEFAULT 0,
+  data             JSONB       NOT NULL DEFAULT '{}',
+  max_attempts     INTEGER     NOT NULL DEFAULT 3,
+  attempts_made    INTEGER     NOT NULL DEFAULT 0,
+  attempts_started INTEGER     NOT NULL DEFAULT 0,
+  backoff_type     TEXT        NOT NULL DEFAULT 'exponential',
+  backoff_delay    INTEGER     NOT NULL DEFAULT 1000,
+  backoff_jitter   REAL        NOT NULL DEFAULT 0.2,
+  stalled_counter  INTEGER     NOT NULL DEFAULT 0,
+  max_stalled      INTEGER     NOT NULL DEFAULT 3,
+  lock_token       TEXT,
+  lock_until       TIMESTAMPTZ,
+  delay_until      TIMESTAMPTZ,
+  parent_job_id    INTEGER     REFERENCES minion_jobs(id) ON DELETE SET NULL,
+  on_child_fail    TEXT        NOT NULL DEFAULT 'fail_parent',
+  tokens_input     INTEGER     NOT NULL DEFAULT 0,
+  tokens_output    INTEGER     NOT NULL DEFAULT 0,
+  tokens_cache_read INTEGER    NOT NULL DEFAULT 0,
+  depth            INTEGER     NOT NULL DEFAULT 0,
+  max_children     INTEGER,
+  timeout_ms       INTEGER,
+  timeout_at       TIMESTAMPTZ,
+  remove_on_complete BOOLEAN   NOT NULL DEFAULT FALSE,
+  remove_on_fail   BOOLEAN     NOT NULL DEFAULT FALSE,
+  idempotency_key  TEXT,
+  result           JSONB,
+  progress         JSONB,
+  error_text       TEXT,
+  stacktrace       JSONB       DEFAULT '[]',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  started_at       TIMESTAMPTZ,
+  finished_at      TIMESTAMPTZ,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT chk_status CHECK (status IN ('waiting','active','completed','failed','delayed','dead','cancelled','waiting-children','paused')),
+  CONSTRAINT chk_backoff_type CHECK (backoff_type IN ('fixed','exponential')),
+  CONSTRAINT chk_on_child_fail CHECK (on_child_fail IN ('fail_parent','remove_dep','ignore','continue')),
+  CONSTRAINT chk_jitter_range CHECK (backoff_jitter >= 0.0 AND backoff_jitter <= 1.0),
+  CONSTRAINT chk_attempts_order CHECK (attempts_made <= attempts_started),
+  CONSTRAINT chk_nonnegative CHECK (attempts_made >= 0 AND attempts_started >= 0 AND stalled_counter >= 0 AND max_attempts >= 1 AND max_stalled >= 0),
+  CONSTRAINT chk_depth_nonnegative CHECK (depth >= 0),
+  CONSTRAINT chk_max_children_positive CHECK (max_children IS NULL OR max_children > 0),
+  CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_claim ON minion_jobs (queue, priority ASC, created_at ASC) WHERE status = 'waiting';
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_status ON minion_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_stalled ON minion_jobs (lock_until) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_delayed ON minion_jobs (delay_until) WHERE status = 'delayed';
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_parent ON minion_jobs(parent_job_id);
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_timeout ON minion_jobs (timeout_at)
+  WHERE status = 'active' AND timeout_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_parent_status ON minion_jobs (parent_job_id, status)
+  WHERE parent_job_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_minion_jobs_idempotency ON minion_jobs (idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+
+-- Inbox table for sidechannel messaging
+CREATE TABLE IF NOT EXISTS minion_inbox (
+  id          SERIAL PRIMARY KEY,
+  job_id      INTEGER NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  sender      TEXT NOT NULL,
+  payload     JSONB NOT NULL,
+  sent_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  read_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_minion_inbox_unread ON minion_inbox (job_id) WHERE read_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_minion_inbox_child_done ON minion_inbox (job_id, sent_at)
+  WHERE (payload->>'type') = 'child_done';
+
+-- Attachment manifest (BYTEA inline + forward-compat storage_uri)
+CREATE TABLE IF NOT EXISTS minion_attachments (
+  id            SERIAL PRIMARY KEY,
+  job_id        INTEGER NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
+  filename      TEXT NOT NULL,
+  content_type  TEXT NOT NULL,
+  content       BYTEA,
+  storage_uri   TEXT,
+  size_bytes    INTEGER NOT NULL,
+  sha256        TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uniq_minion_attachments_job_filename UNIQUE (job_id, filename),
+  CONSTRAINT chk_attachment_storage CHECK (content IS NOT NULL OR storage_uri IS NOT NULL),
+  CONSTRAINT chk_attachment_size CHECK (size_bytes >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_minion_attachments_job ON minion_attachments (job_id);
+-- NOTE: SET STORAGE EXTERNAL is omitted on PGLite; it's a Postgres TOAST optimization
+-- and PGLite may not support it. Postgres path applies it via migration v7.
+
+-- ============================================================
+-- Trigger-based search_vector (spans pages + timeline_entries)
+-- ============================================================
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+CREATE INDEX IF NOT EXISTS idx_pages_search ON pages USING GIN(search_vector);
+
+CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger AS $$
+DECLARE
+  timeline_text TEXT;
+BEGIN
+  SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+  INTO timeline_text
+  FROM timeline_entries
+  WHERE page_id = NEW.id;
+
+  NEW.search_vector :=
+    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(NEW.compiled_truth, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
+    setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_pages_search_vector ON pages;
+CREATE TRIGGER trg_pages_search_vector
+  BEFORE INSERT OR UPDATE ON pages
+  FOR EACH ROW
+  EXECUTE FUNCTION update_page_search_vector();
+
+-- Note: timeline_entries trigger removed (v0.10.1).
+-- Structured timeline_entries power temporal queries (graph layer).
+-- pages.timeline (markdown) still feeds search_vector via trg_pages_search_vector.
+DROP TRIGGER IF EXISTS trg_timeline_search_vector ON timeline_entries;
+DROP FUNCTION IF EXISTS update_page_search_vector_from_timeline();
+`;

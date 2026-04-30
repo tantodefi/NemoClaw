@@ -37,13 +37,13 @@ put_doc_async() {
   slug="system/$(echo "$name" | tr '[:upper:]' '[:lower:]')"
   local result_file="${RESULTS}/${name}"
   if [ ! -f "$src" ]; then
-    echo "skipped (missing): ${slug}" > "$result_file"
+    echo "skipped (missing): ${slug}" >"$result_file"
     return 0
   fi
   if timeout "$PUT_TIMEOUT" gbrain put "$slug" --content "$(cat "$src")" >>"$LOG" 2>&1; then
-    echo "ok: ${slug}" > "$result_file"
+    echo "ok: ${slug}" >"$result_file"
   else
-    echo "FAILED: ${slug}" > "$result_file"
+    echo "FAILED: ${slug}" >"$result_file"
   fi
 }
 
@@ -66,9 +66,25 @@ done
 today="$(basename "$MEMORY_FILE" .md)"
 (
   if timeout "$PUT_TIMEOUT" gbrain put "memory/${today}" --content "$(cat "$MEMORY_FILE")" >>"$LOG" 2>&1; then
-    echo "ok: memory/${today}" > "${RESULTS}/__memory"
+    echo "ok: memory/${today}" >"${RESULTS}/__memory"
   else
-    echo "FAILED: memory/${today}" > "${RESULTS}/__memory"
+    echo "FAILED: memory/${today}" >"${RESULTS}/__memory"
+  fi
+) &
+
+# Today's structured event log — a parallel JSONL stream of cron + agent
+# actions. Ingesting it as its own brain page keeps the events/<date> slug
+# queryable independently of the human journal.
+EVENTS_FILE="${WORKSPACE}/memory/events-${today}.jsonl"
+(
+  if [ -s "$EVENTS_FILE" ]; then
+    if timeout "$PUT_TIMEOUT" gbrain put "events/${today}" --content "$(cat "$EVENTS_FILE")" >>"$LOG" 2>&1; then
+      echo "ok: events/${today}" >"${RESULTS}/__events"
+    else
+      echo "FAILED: events/${today}" >"${RESULTS}/__events"
+    fi
+  else
+    echo "skipped (no events): events/${today}" >"${RESULTS}/__events"
   fi
 ) &
 
@@ -88,7 +104,7 @@ wait
   echo ""
   echo "### Doctor"
   timeout 10 gbrain doctor 2>&1 | tail -3 || echo "doctor: FAILED or timed out"
-} >> "$MEMORY_FILE"
+} >>"$MEMORY_FILE"
 
 # Detach slow steps. embed --stale walks all pages (~1s/page over 1000+);
 # extract links is LLM-driven (60s+). They write their own logs and the
@@ -97,14 +113,14 @@ wait
 TS_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
 EMBED_LOG="/tmp/chad-gbrain-embed-${TS_TAG}.log"
 LINK_LOG="/tmp/chad-gbrain-extract-links-${TS_TAG}.log"
-nohup bash -c "gbrain embed --stale" >"$EMBED_LOG" 2>&1 < /dev/null &
+nohup bash -c "gbrain embed --stale" >"$EMBED_LOG" 2>&1 </dev/null &
 disown 2>/dev/null || true
-nohup bash -c "gbrain extract links --source db" >"$LINK_LOG" 2>&1 < /dev/null &
+nohup bash -c "gbrain extract links --source db" >"$LINK_LOG" 2>&1 </dev/null &
 disown 2>/dev/null || true
 {
   echo "embed --stale: detached (log: ${EMBED_LOG})"
   echo "extract links: detached (log: ${LINK_LOG})"
-} >> "$MEMORY_FILE"
+} >>"$MEMORY_FILE"
 
 rm -rf "$RESULTS" "$LOG"
 echo "gbrain dream complete → ${MEMORY_FILE}"

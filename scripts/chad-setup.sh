@@ -39,7 +39,10 @@ NC='\033[0m'
 step() { echo -e "\n${CYAN}==>${NC} $1"; }
 info() { echo -e "${GREEN}[setup]${NC} $1"; }
 warn() { echo -e "${YELLOW}[setup]${NC} $1"; }
-fail() { echo -e "${RED}[setup]${NC} $1" >&2; exit 1; }
+fail() {
+  echo -e "${RED}[setup]${NC} $1" >&2
+  exit 1
+}
 
 usage() {
   cat <<EOF
@@ -94,16 +97,16 @@ dry_run=0
 
 for arg in "${@:2}"; do
   case "$arg" in
-    --skip-restore)      skip_restore=1 ;;
-    --skip-skills)       skip_skills=1 ;;
-    --skip-creds)        skip_creds=1 ;;
-    --skip-gh-auth)      skip_gh_auth=1 ;;
-    --skip-crons)        skip_crons=1 ;;
+    --skip-restore) skip_restore=1 ;;
+    --skip-skills) skip_skills=1 ;;
+    --skip-creds) skip_creds=1 ;;
+    --skip-gh-auth) skip_gh_auth=1 ;;
+    --skip-crons) skip_crons=1 ;;
     --skip-clone-source) skip_clone_source=1 ;;
-    --skip-gbrain)       skip_gbrain=1 ;;
-    --skip-policies)     skip_policies=1 ;;
-    --dry-run)           dry_run=1 ;;
-    -h|--help)           usage ;;
+    --skip-gbrain) skip_gbrain=1 ;;
+    --skip-policies) skip_policies=1 ;;
+    --dry-run) dry_run=1 ;;
+    -h | --help) usage ;;
     *) fail "Unknown argument: $arg" ;;
   esac
 done
@@ -144,7 +147,7 @@ if [ "$skip_restore" -eq 0 ]; then
   fi
 else
   info "Skipping workspace restore (--skip-restore)"
-  local_restore_done=1  # treat as "don't try the fallback either"
+  local_restore_done=1 # treat as "don't try the fallback either"
 fi
 
 # ── Step 2: Sync skills ────────────────────────────────────────────────────
@@ -181,7 +184,7 @@ if [ "$skip_skills" -eq 0 ]; then
         else
           tar -C "$gstack_skills_src" -cf - "$skill_name" \
             | ssh "$REMOTE_HOST" \
-                "mkdir -p /sandbox/.openclaw-data/skills && \
+              "mkdir -p /sandbox/.openclaw-data/skills && \
                  tar -C /sandbox/.openclaw-data/skills -xf -" \
             && info "Synced gstack skill: $skill_name" \
             || warn "Failed to sync gstack skill: $skill_name"
@@ -244,7 +247,7 @@ print(json.dumps(out, indent=2))
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
       WRAPPER_SRC="${REPO_ROOT}/scripts/sandbox-bin/proton-tool-wrapper.sh"
       if [ -n "$SANDBOX_POD" ] && [ -f "$WRAPPER_SRC" ]; then
-        WRAPPER_B64=$(base64 < "$WRAPPER_SRC" | tr -d '\n')
+        WRAPPER_B64=$(base64 <"$WRAPPER_SRC" | tr -d '\n')
         docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
           sh -c "
             if [ ! -f /usr/local/bin/proton-tool-bin ]; then
@@ -288,7 +291,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch; do
+      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -420,7 +423,14 @@ if [ "$skip_gbrain" -eq 0 ]; then
         sh -c 'chown -R sandbox:sandbox /sandbox/.gbrain/brain.pglite 2>/dev/null; \
                rm -f /sandbox/.gbrain/brain.pglite/postmaster.pid \
                      /sandbox/.gbrain/brain.pglite/.gbrain-lock 2>/dev/null; true' || true
-      ssh "$REMOTE_HOST" 'HOME=/sandbox gbrain init 2>/dev/null || true'
+      # Pass GBRAIN_EMBED_* at init so the schema's vector(N) column matches
+      # the embedder configured in step 3b. Patched gbrain (tantodefi fork)
+      # reads these at module load — without them the column defaults to
+      # vector(1536) and embeddings at 1024 dims fail at INSERT time.
+      ssh "$REMOTE_HOST" 'HOME=/sandbox \
+        GBRAIN_EMBED_MODEL=nvidia/llama-3.2-nv-embedqa-1b-v2 \
+        GBRAIN_EMBED_DIMENSIONS=1024 \
+        gbrain init 2>/dev/null || true'
       gbrain_status="$(ssh "$REMOTE_HOST" 'gbrain doctor 2>&1 | tail -3')"
       info "gbrain init done: ${gbrain_status}"
       # gbrain is intentionally NOT registered as an MCP server.
@@ -437,10 +447,22 @@ fi
 
 # ── Step 3b: Configure gbrain embeddings ──────────────────────────────────
 #
-# Point gbrain at NVIDIA's hosted embedding API using the NVIDIA_API_KEY
-# deployed in step 3. gbrain uses the OpenAI SDK internally, so we set
-# OPENAI_BASE_URL + OPENAI_API_KEY via gbrain config. Model is
-# nvidia/nv-embedqa-e5-v5 which is available on integrate.api.nvidia.com.
+# Point gbrain at NVIDIA's hosted embedding API at integrate.api.nvidia.com.
+#
+# gbrain v0.14.x hardcodes `text-embedding-3-large` at 1536 dims in
+# src/core/embedding.ts. The patched fork at tantodefi/gbrain honors three
+# env vars (read by the wrapper from this config.json):
+#   GBRAIN_EMBED_MODEL       — model id  (default: text-embedding-3-large)
+#   GBRAIN_EMBED_DIMENSIONS  — vector dim (default: 1536; must match schema)
+#   GBRAIN_EMBED_INPUT_TYPE  — NIM-only ("passage"/"query"), sent if non-empty
+# Plus the OpenAI SDK reads OPENAI_BASE_URL / OPENAI_API_KEY directly.
+#
+# We pick nvidia/llama-3.2-nv-embedqa-1b-v2 at 1024 dims because:
+#   - matryoshka model accepts the `dimensions` parameter (free model choice)
+#   - 1024 dims keeps the vector column / HNSW index reasonably small
+#   - free with the existing NVIDIA_API_KEY; no extra account or paid OpenAI
+# The network policy preset gbrain.yaml already allows
+# integrate.api.nvidia.com:443/v1/embeddings for the gbrain binary.
 
 if [ "$skip_gbrain" -eq 0 ] && [ "$dry_run" -eq 0 ]; then
   nvidia_key="$(python3 -c "
@@ -449,24 +471,27 @@ src = json.load(open('${CREDENTIALS_SRC}'))
 print(src.get('NVIDIA_API_KEY', ''))
 " 2>/dev/null)"
 
-  # Write gbrain config.json directly — gbrain config set doesn't persist to disk.
-  # Uses LM Studio on the Docker host (host.openshell.internal:1234) for free local
-  # embeddings. text-embedding-nomic-embed-text-v1.5 must be loaded in LM Studio.
-  # Falls back to Ollama (:11434) if LM Studio isn't running.
-  ssh "$REMOTE_HOST" "python3 -c \"
-import json
+  if [ -z "$nvidia_key" ]; then
+    warn "NVIDIA_API_KEY missing in ${CREDENTIALS_SRC} — gbrain embeddings will fail"
+  fi
+
+  ssh "$REMOTE_HOST" "NVIDIA_KEY='${nvidia_key}' python3 -c \"
+import json, os
 cfg = {
   'engine': 'pglite',
   'database_path': '/sandbox/.gbrain/brain.pglite',
-  'openai_base_url': 'http://host.openshell.internal:1234/v1',
-  'openai_api_key': 'unused',
-  'embed_model': 'text-embedding-nomic-embed-text-v1.5'
+  'openai_api_key': os.environ['NVIDIA_KEY'] or 'unused',
+  'openai_base_url': 'https://integrate.api.nvidia.com/v1',
+  'embed_model': 'nvidia/llama-3.2-nv-embedqa-1b-v2',
+  'embed_dimensions': '1024',
+  'embed_input_type': 'passage',
 }
 with open('/sandbox/.gbrain/config.json', 'w') as f:
     json.dump(cfg, f, indent=2)
-print('gbrain configured for LM Studio embeddings')
+os.chmod('/sandbox/.gbrain/config.json', 0o600)
+print('gbrain configured for NVIDIA NIM embeddings (llama-3.2-nv-embedqa-1b-v2 @ 1024 dims)')
 \""
-  info "gbrain configured to use LM Studio embeddings (nomic-embed-text-v1.5 via host:1234)"
+  info "gbrain configured to use NVIDIA NIM embeddings (llama-3.2-nv-embedqa-1b-v2 @ 1024 dims)"
 
   # Install gbrain wrapper that exports OPENAI_API_KEY before invoking the
   # real binary. The OpenAI Node SDK throws if OPENAI_API_KEY is empty even
@@ -476,7 +501,7 @@ print('gbrain configured for LM Studio embeddings')
   SANDBOX_POD="${SANDBOX_POD:-$(docker exec openshell-cluster-nemoclaw kubectl get pods -n openshell \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)}"
   if [ -n "$SANDBOX_POD" ] && [ -f "$GBRAIN_WRAPPER_SRC" ]; then
-    GBRAIN_WRAPPER_B64=$(base64 < "$GBRAIN_WRAPPER_SRC" | tr -d '\n')
+    GBRAIN_WRAPPER_B64=$(base64 <"$GBRAIN_WRAPPER_SRC" | tr -d '\n')
     docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
       sh -c "
         if [ ! -f /usr/local/bin/gbrain-bin ]; then

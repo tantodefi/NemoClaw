@@ -114,6 +114,13 @@ function stageOptimizedSandboxBuildContext(
   const protonToolDst = path.join(buildCtx, ".github", "skills", "proton-calendar", "cmd", "proton-tool");
   fs.cpSync(protonToolSrc, protonToolDst, { recursive: true });
 
+  // gbrain-patches — overlaid on the bundled gbrain in the sandbox image
+  fs.cpSync(
+    path.join(rootDir, "scripts", "gbrain-patches"),
+    path.join(stagedScriptsDir, "gbrain-patches"),
+    { recursive: true },
+  );
+
   // chad-orchestrator scripts + kinds — baked into image as canonical fallback
   const orchestratorSrc = path.join(rootDir, ".github", "skills", "chad-orchestrator");
   const orchestratorDst = path.join(buildCtx, ".github", "skills", "chad-orchestrator");
