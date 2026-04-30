@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+id: T1
+name: daily-status-check
+sender: tantodefi@proton.me
+subject: "What did you do today?"
+body: |
+  hey — quick check, what did you actually get done today?
+expected:
+  path: drafter
+  decision: auto
+  rubric:
+    - reply references at least one bullet from today's memory
+    - reply does not invent work that isn't in memory
+    - reply length under 250 words
+    - reply tone is conversational (matches a peer engineer, not a customer-support bot)

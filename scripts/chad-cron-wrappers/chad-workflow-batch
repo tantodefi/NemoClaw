@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-workflow-batch — replays the named workflow scenarios catalogued in
+# docs/operations/chad-workflows.md against the live code paths and captures
+# structured output for diffing across runs.
+#
+# This is the regression harness for prompt-quality measurement. Source-
+# controlled YAML fixtures under /usr/local/share/chad/workflow-fixtures/
+# define the inbound shape; this wrapper iterates them, dispatches to the
+# right code path per `expected.path`, and writes one JSON file per
+# scenario to /sandbox/.openclaw/workspace/regressions/<UTC-ts>/.
+#
+# Currently wired paths:
+#   • drafter — invokes /usr/local/bin/chad-drafter with a single-item park
+#
+# Skipped paths (recorded as skipped in JSON, scenario does not fail):
+#   • spawn  — for `chad-spawn --kind fitness` (C1/C2 sub-agent flow)
+#   • intake — for `chad-intake` multi-spawn (C3/C4 article flows)
+#
+# Usage:
+#   chad-workflow-batch [--fixtures DIR] [--out DIR] [--only ID[,ID,...]]
+#
+# Exits 0 on success even if individual scenarios fail; failures are recorded
+# in the JSON, never raised. The scorer (chad-workflow-score) consumes the
+# captured outputs in a separate pass.
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+FIXTURES_DIR="${CHAD_WORKFLOW_FIXTURES:-/usr/local/share/chad/workflow-fixtures}"
+OUT_ROOT="${CHAD_WORKFLOW_OUT_ROOT:-/sandbox/.openclaw/workspace/regressions}"
+ONLY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fixtures) FIXTURES_DIR="$2"; shift 2 ;;
+    --out)      OUT_ROOT="$2"; shift 2 ;;
+    --only)     ONLY="$2"; shift 2 ;;
+    *)          shift ;;
+  esac
+done
+
+if [ ! -d "$FIXTURES_DIR" ]; then
+  echo "fixtures dir not found: $FIXTURES_DIR" >&2
+  exit 2
+fi
+
+RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="${OUT_ROOT}/${RUN_TS}"
+mkdir -p "$RUN_DIR"
+
+PROMPT_VERSION="$(sha256sum /usr/local/bin/chad-drafter 2>/dev/null | awk '{print substr($1,1,7)}')"
+PROMPT_VERSION="${PROMPT_VERSION:-unknown}"
+
+FIXTURES_DIR="$FIXTURES_DIR" RUN_DIR="$RUN_DIR" RUN_TS="$RUN_TS" \
+ONLY="$ONLY" PROMPT_VERSION="$PROMPT_VERSION" \
+python3 <<'PY'
+import json, os, subprocess, sys, time, glob, traceback
+
+try:
+    import yaml
+except ImportError:
+    print("PyYAML not installed in sandbox python3", file=sys.stderr)
+    sys.exit(2)
+
+fixtures_dir = os.environ["FIXTURES_DIR"]
+run_dir = os.environ["RUN_DIR"]
+run_ts = os.environ["RUN_TS"]
+prompt_version = os.environ["PROMPT_VERSION"]
+only_filter = {x.strip() for x in os.environ.get("ONLY", "").split(",") if x.strip()}
+
+paths = sorted(glob.glob(os.path.join(fixtures_dir, "*.yaml")))
+if not paths:
+    print(f"no fixtures found in {fixtures_dir}", file=sys.stderr)
+    sys.exit(2)
+
+summary = {"run_ts": run_ts, "prompt_version": prompt_version, "scenarios": []}
+
+def write_scenario(payload):
+    path = os.path.join(run_dir, f"{payload['id']}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+def run_drafter(fx):
+    """Invoke /usr/local/bin/chad-drafter with a single-item park derived from fx."""
+    inp = {"park": [{
+        "idx": 0,
+        "id": f"fixture-{fx['id']}",
+        "subject": fx.get("subject", ""),
+        "from": fx.get("sender", ""),
+        "body": fx.get("body", ""),
+        "flags": "",
+        "premium_eligible": False,
+    }]}
+    in_path = os.path.join(run_dir, f"{fx['id']}.in.json")
+    out_path = os.path.join(run_dir, f"{fx['id']}.drafter.json")
+    with open(in_path, "w") as f:
+        json.dump(inp, f)
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            ["/usr/local/bin/chad-drafter", in_path, out_path],
+            capture_output=True, text=True, timeout=180,
+        )
+        rc = proc.returncode
+        stderr_tail = (proc.stderr or "")[-2000:]
+    except subprocess.TimeoutExpired as e:
+        rc = -1
+        stderr_tail = f"timeout after 180s: {e}"
+    duration_ms = int((time.time() - t0) * 1000)
+
+    drafter_out = None
+    try:
+        with open(out_path) as f:
+            drafter_out = json.load(f)
+    except Exception as e:
+        drafter_out = {"_load_error": str(e)}
+
+    drafts = (drafter_out or {}).get("drafts") or []
+    first = drafts[0] if drafts else {}
+    drafter_error = (drafter_out or {}).get("error") or ""
+    drafter_raw = (drafter_out or {}).get("raw") or ""
+    return {
+        "rc": rc,
+        "stderr_tail": stderr_tail,
+        "duration_ms": duration_ms,
+        "model": first.get("model", ""),
+        "decision": first.get("action", "") or ("error" if drafter_error else ""),
+        "reason": first.get("reason", "") or drafter_error,
+        "output": first.get("draft", ""),
+        "drafter_error": drafter_error,
+        "drafter_raw": drafter_raw[:500] if isinstance(drafter_raw, str) else "",
+        "raw": drafter_out,
+    }
+
+for path in paths:
+    try:
+        with open(path) as f:
+            fx = yaml.safe_load(f)
+    except Exception as e:
+        print(f"failed to parse {path}: {e}", file=sys.stderr)
+        continue
+    fid = fx.get("id", os.path.basename(path).rsplit(".", 1)[0])
+    if only_filter and fid not in only_filter:
+        continue
+    expected = fx.get("expected") or {}
+    expected_path = expected.get("path", "drafter")
+
+    payload = {
+        "id": fid,
+        "name": fx.get("name", ""),
+        "sender": fx.get("sender", ""),
+        "subject": fx.get("subject", ""),
+        "expected_path": expected_path,
+        "expected_decision": expected.get("decision", ""),
+        "rubric": expected.get("rubric", []),
+        "prompt_version": prompt_version,
+        "run_ts": run_ts,
+    }
+
+    try:
+        if expected_path == "drafter":
+            r = run_drafter(fx)
+            payload.update({
+                "skipped": False,
+                "model": r["model"],
+                "decision": r["decision"],
+                "reason": r["reason"],
+                "output": r["output"],
+                "drafter_error": r["drafter_error"],
+                "drafter_raw": r["drafter_raw"],
+                "rc": r["rc"],
+                "duration_ms": r["duration_ms"],
+                "stderr_tail": r["stderr_tail"],
+            })
+        else:
+            payload.update({
+                "skipped": True,
+                "skip_reason": f"path '{expected_path}' not yet wired in chad-workflow-batch",
+            })
+    except Exception:
+        payload.update({
+            "skipped": False,
+            "rc": -2,
+            "error": traceback.format_exc(limit=3),
+        })
+
+    out_path = write_scenario(payload)
+    summary["scenarios"].append({
+        "id": fid,
+        "skipped": payload.get("skipped", False),
+        "decision": payload.get("decision", ""),
+        "duration_ms": payload.get("duration_ms", 0),
+        "file": os.path.basename(out_path),
+    })
+    print(f"{fid}: {'skipped' if payload.get('skipped') else payload.get('decision', '?')} → {out_path}")
+
+with open(os.path.join(run_dir, "_index.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+print(f"\nrun complete → {run_dir}")
+PY
+
+exit 0

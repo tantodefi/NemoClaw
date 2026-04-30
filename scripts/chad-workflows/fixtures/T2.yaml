@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+id: T2
+name: gbrain-question
+sender: tantodefi@proton.me
+subject: "What does the brain say about chad-shim?"
+body: |
+  what does the brain have on chad-shim — what is it, where does it run,
+  and what restarts it?
+expected:
+  path: drafter
+  decision: auto
+  rubric:
+    - reply cites at least one gbrain page or chunk title
+    - reply names chad-shim's role (OpenAI-compat HTTP shim around openclaw agent)
+    - reply mentions the sandbox lifecycle hooks that restart it
+    - reply does not fabricate gbrain page titles that don't exist

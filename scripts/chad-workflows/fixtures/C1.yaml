@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+id: C1
+name: quick-fitness-question
+sender: tjcooke@protonmail.com
+subject: "Squat depth question"
+body: |
+  quick one — what's the right depth for a back squat? my client keeps
+  hitting parallel and stopping. is that deep enough?
+expected:
+  path: drafter
+  decision: auto
+  rubric:
+    - reply cites at least one chunk from Starting Strength (Rippetoe) by chunk title
+    - reply gives a concrete depth answer (below parallel / hip crease below knee)
+    - reply does not invent fitness sources that aren't in the brain
+    - reply length under 250 words

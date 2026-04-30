@@ -288,7 +288,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload; do
+      for wrapper in chad-ensure-today-memory chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -369,6 +369,27 @@ print(json.dumps(out, indent=2))
           ' 2>/dev/null \
           && info "auto-actions policy seeded/preserved" \
           || warn "Could not seed auto-actions.json (kubectl exec failed)"
+      fi
+
+      # Workflow regression fixtures: source-controlled YAML files under
+      # scripts/chad-workflows/fixtures/ deployed to
+      # /usr/local/share/chad/workflow-fixtures/. Read by chad-workflow-batch
+      # to replay scenarios T1–T6, C1–C5 against the live drafter/spawn paths.
+      WORKFLOW_FIX_DIR="${REPO_ROOT}/scripts/chad-workflows/fixtures"
+      if [ -d "$WORKFLOW_FIX_DIR" ] && [ -n "$SANDBOX_POD" ]; then
+        for fx in "$WORKFLOW_FIX_DIR"/*.yaml; do
+          [ -f "$fx" ] || continue
+          fxname="$(basename "$fx")"
+          cat "$fx" | ssh "$REMOTE_HOST" \
+            "cat > /tmp/${fxname}" 2>/dev/null || {
+            warn "stage to /tmp failed — skipping $fxname"
+            continue
+          }
+          docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+            sh -c "mkdir -p /usr/local/share/chad/workflow-fixtures && cp /tmp/${fxname} /usr/local/share/chad/workflow-fixtures/${fxname} && rm -f /tmp/${fxname}" 2>/dev/null \
+            && info "${fxname} deployed to /usr/local/share/chad/workflow-fixtures/${fxname}" \
+            || warn "Could not install ${fxname} (kubectl exec failed)"
+        done
       fi
     fi
   fi
