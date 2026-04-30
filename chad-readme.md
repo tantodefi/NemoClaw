@@ -695,6 +695,24 @@ The backup set also grew on this branch:
   `isChannelConfigured` helper so the non-interactive messaging-setup
   path stops crashing when the symbol is referenced before the
   interactive branch defines it.
+- **Open WebUI chat front-end.** `scripts/openwebui/` ships a
+  docker-compose stack exposing open-webui via a Cloudflare Tunnel. Two
+  modes: `--mode=quick` (ephemeral `*.trycloudflare.com`, email/password
+  auth, MVP) and tunnel mode (managed tunnel + Cloudflare Access on a
+  real domain, header-trusted SSO). See [`docs/operations/openwebui.md`](docs/operations/openwebui.md).
+- **Chad-as-a-model.** `scripts/openwebui/chad-shim.py` is a stdlib-only
+  HTTP shim listening on `127.0.0.1:8901` inside the sandbox. It exposes
+  an OpenAI-compat `/v1/chat/completions` endpoint and translates each
+  turn into one `openclaw agent --json --agent main --session-id <hash>`
+  invocation. open-webui sees a model called `chad`; under the hood,
+  every reply benefits from gbrain context, network policies, the
+  action-gate, and premium routing. The shim is reached from the host
+  via `npm run webui:chad:up` (one-shot SSH port-forward) or
+  `webui:chad:install` (persistent launchd LaunchAgent with
+  `KeepAlive=true`). `chad-setup.sh` deploys the shim to
+  `/usr/local/bin/chad-shim.py` and starts it; `chad-restore-from-github`
+  and `chad-backup-to-github` each self-heal a crashed shim, so any cron
+  pulse keeps it alive.
 
 ---
 
@@ -759,6 +777,8 @@ These are the rules I will reject PRs over:
 - **SKILL.md** — [`/.github/skills/chad-orchestrator/SKILL.md`](.github/skills/chad-orchestrator/SKILL.md) is the operator-facing doc Chad reads at invocation time.
 - **Spawner** — [`/.github/skills/chad-orchestrator/scripts/chad-spawn.sh`](.github/skills/chad-orchestrator/scripts/chad-spawn.sh) is the canonical implementation of the contract.
 - **Setup script** — [`/scripts/chad-setup.sh`](scripts/chad-setup.sh) is the one-command-recovery path.
+- **Devflow catalog** — [`/docs/operations/chad-devflow.md`](docs/operations/chad-devflow.md) lists every wrapper, its schedule, and which symptoms point at it.
+- **Open WebUI front-end** — [`/docs/operations/openwebui.md`](docs/operations/openwebui.md) covers the chat UI, dual-provider setup, and chad-as-a-model persistence.
 - **Policies** — [`/nemoclaw-blueprint/policies/presets/subagent-*.yaml`](nemoclaw-blueprint/policies/presets/) are the kind-specific L7 rules.
 - **Dockerfile** — [`/Dockerfile`](Dockerfile) lines ~115–133 wire the orchestrator helpers into the image.
 

@@ -228,24 +228,24 @@ network policies, audit logs, the works.
 
 **Setup (first time, after `npm run webui:up:quick` is already healthy):**
 
-1. Push the shim into the sandbox:
+1. Deploy the shim into the sandbox. `chad-setup.sh` installs it to
+   `/usr/local/bin/chad-shim.py` and starts it as part of its standard
+   `install_to_usrlocal` loop, so this is usually a no-op:
 
    ```console
-   $ cat scripts/openwebui/chad-shim.py | \
-       ssh openshell-chad 'cat > /sandbox/scripts/chad-shim.py && chmod +x /sandbox/scripts/chad-shim.py'
-   ```
-
-2. Start it inside the sandbox (foreground via `nohup`; auto-start is a
-   future chad-setup.sh integration):
-
-   ```console
-   $ ssh openshell-chad 'nohup python3 /sandbox/scripts/chad-shim.py \
-       > /tmp/chad-shim.log 2>&1 &'
+   $ bash scripts/chad-setup.sh chad
+   ...
+       ✓ chad-shim.py deployed to /usr/local/bin/chad-shim.py
+       ✓ chad-shim ensured running
    $ ssh openshell-chad 'curl -sS http://127.0.0.1:8901/healthz'
    {"status": "ok", "agent": "main"}
    ```
 
-3. Open the SSH port-forward from the host:
+   For a one-off deploy without re-running setup, use the same
+   stage-then-`kubectl-cp` pattern setup uses, or just hot-patch via
+   `npm run chad:sync` (which re-runs setup).
+
+2. Open the SSH port-forward from the host:
 
    ```console
    $ npm run webui:chad:up
@@ -255,14 +255,14 @@ network policies, audit logs, the works.
        ✓ chad-shim /healthz responding
    ```
 
-4. In the open-webui browser UI:
+3. In the open-webui browser UI:
    - Click avatar → **Admin Panel** → **Settings** → **Connections**.
    - Under **OpenAI API**, click **+** to add a second provider.
    - URL: `http://host.docker.internal:8901/v1`
    - Key: `sk-no-key-required` (anything non-empty; the shim ignores it).
    - Click verify — it should hit `/v1/models` and show a `chad` entry. Save.
 
-5. Back in chat, the model picker now lists `chad` alongside the NVIDIA
+4. Back in chat, the model picker now lists `chad` alongside the NVIDIA
    models. Pick `chad` and send a message — first turn takes ~10–30 s while
    `openclaw` boots its session.
 

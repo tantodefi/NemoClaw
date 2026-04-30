@@ -80,7 +80,7 @@ Source code lives in a separate repo (`tantodefi/NemoClaw`, public). See [Backup
 
 | Script | What it does | When to run |
 |---|---|---|
-| `chad-setup.sh` | One-shot host-side bootstrapper. Restores workspace from local backup or chad-state, syncs skills, deploys credentials, installs cron wrappers, registers cron jobs, applies network policies, clones source. | First-time setup, after major upgrades, after a sandbox rebuild. |
+| `chad-setup.sh` | One-shot host-side bootstrapper. Restores workspace from local backup or chad-state, syncs skills, deploys credentials, installs cron wrappers + `chad-shim.py`, registers cron jobs, applies network policies, clones source. | First-time setup, after major upgrades, after a sandbox rebuild. |
 | `chad-sync.sh` (`npm run chad:sync`) | Single-command snapshot orchestrator: dump → backup → cron audit → summary. | Before pod resets, after meaningful changes you want durably stored, on demand. |
 | `chad-clone-source.sh` | Clones `tantodefi/NemoClaw` into `/sandbox/source/` for in-sandbox read/grep access. | Auto-invoked by `chad-setup.sh`. Standalone if you need to refresh the source clone. |
 | `backup-host.sh` | Snapshots `~/.nemoclaw/` (credentials, onboard session, sandbox metadata, draft policies, WIP skills) to `~/.nemoclaw/backups/host/<ts>/`. | Before re-onboarding, before destructive host operations, weekly. |
@@ -88,13 +88,22 @@ Source code lives in a separate repo (`tantodefi/NemoClaw`, public). See [Backup
 | `chad-dump-state.sh` | Generates a markdown state-dump (memory tail, ledger, sub-agent results, env). Local-only by default; `--tar` bundles raw logs. | Bug reports, before destructive ops, ad-hoc triage. |
 | `chad-report-bug.sh` | Files a GitHub issue with optional state-dump attachment in the chad-state repo. | When Chad behaves wrong and you want it on record. |
 
+### Host-side: open-webui front-end (chad-as-a-model)
+
+| Script | What it does | When to run |
+|---|---|---|
+| `openwebui-setup.sh` (`npm run webui:up` / `webui:up:quick`) | Brings up the open-webui container and (in tunnel mode) the Cloudflare tunnel + Access policy. | First-time setup of the chat UI. |
+| `openwebui-down.sh` (`npm run webui:down`) | Stops the open-webui stack. | Maintenance windows. |
+| `openwebui-chad-tunnel.sh` (`npm run webui:chad:{up,down,status,install,uninstall}`) | SSH port-forward `localhost:8901 → openshell-chad:8901` so the open-webui container can reach `chad-shim` via `host.docker.internal`. `install` registers a per-user launchd agent (`KeepAlive=true`) so the tunnel survives logout/reboot. | `up` for a one-shot session; `install` for always-on. |
+
 ### In-sandbox: backup & restore
 
 | Script | What it does | When to run |
 |---|---|---|
-| `chad-backup-to-github.sh` | Pushes the manifest's `[workspace]` + `[runtime]` + `[runtime-dirs]` sections plus the gbrain export to `${CHAD_STATE_REPO}`. SHA-skip optimisation avoids redundant PUTs. | Cron `workspace-backup` (every 6h). Manual via `ssh openshell-chad chad-backup-to-github`. |
-| `chad-restore-from-github.sh` | Pulls `${CHAD_STATE_REPO}` and restores workspace + runtime files/dirs. Calls `chad-cron-reload` after restoring `cron/jobs.json` to re-register entries with the gateway. | Auto-invoked by `chad-setup.sh` step 4a when no local backup exists. Manual fallback after a fresh pod. |
+| `chad-backup-to-github.sh` | Pushes the manifest's `[workspace]` + `[runtime]` + `[runtime-dirs]` sections plus the gbrain export to `${CHAD_STATE_REPO}`. SHA-skip optimisation avoids redundant PUTs. Also self-heals `chad-shim` if it isn't running. | Cron `workspace-backup` (every 6h). Manual via `ssh openshell-chad chad-backup-to-github`. |
+| `chad-restore-from-github.sh` | Pulls `${CHAD_STATE_REPO}` and restores workspace + runtime files/dirs. Calls `chad-cron-reload` after restoring `cron/jobs.json` to re-register entries with the gateway. Also self-heals `chad-shim` if it isn't running. | Auto-invoked by `chad-setup.sh` step 4a when no local backup exists. Manual fallback after a fresh pod. |
 | `chad-cron-reload` | Diffs `cron/jobs.json` against the gateway's in-memory list (`openclaw cron list --json`) and re-registers any missing entries via `openclaw cron add`. Idempotent. | Whenever cron count differs between disk and gateway. `chad-sync` flags the divergence in its audit step. |
+| `chad-shim.py` | OpenAI-compat HTTP shim around `openclaw agent`. Listens on `127.0.0.1:8901` inside the sandbox; open-webui's `chad` model talks to it via the host SSH tunnel + `host.docker.internal`. Stdlib-only. | Started by `chad-setup.sh` install step; restart blocks in `chad-restore-from-github.sh` and `chad-backup-to-github.sh` re-launch it if it crashes. |
 
 ### Cron pipeline (auto-scheduled)
 
@@ -159,6 +168,7 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 | Mail draft was sent without you asking | Check `auto-actions.json` and the action-gate decision log. The kill-switch is in the same file. |
 | `gbrain` queries return nothing or `Aborted()` | PGLite single-process lock — confirm `gbrain serve` is running and no other process holds the lock. |
 | `chad-sync` reports "cron drift" | Disk and gateway disagree. Run `ssh openshell-chad 'chad-cron-reload'`. |
+| open-webui `chad` model errors / 502 | `npm run webui:chad:status` checks both the SSH tunnel and the in-sandbox shim. Tunnel down → `webui:chad:up` (or `install` for persistence). Tunnel up but `/healthz` fails → shim crashed; the next `workspace-backup` cron will self-heal it, or `ssh openshell-chad 'HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &'`. |
 
 ## Next Steps
 
