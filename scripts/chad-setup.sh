@@ -516,58 +516,39 @@ print('gbrain configured for NVIDIA NIM embeddings (llama-3.2-nv-embedqa-1b-v2 @
   fi
 fi
 
-# ── Step 3c: Configure openclaw inference providers ───────────────────────
+# ── Step 3c: Make /sandbox/.openclaw subpaths writable for OpenClaw 2026.4.24 ──
 #
-# NVIDIA (inference.local → cloud) is the primary model; LM Studio on
-# host:1234 is the fallback via openclaw's configured-provider-fallback
-# mechanism. openclaw tries the first configured provider (inference/NVIDIA)
-# and falls back to lmstudio if the default provider isn't available.
+# The image creates /sandbox/.openclaw root:root 755 and pins openclaw.json to
+# 444 root:root for tamper protection. OpenClaw 2026.4.24 added writes the
+# gateway (running as the sandbox user) needs to perform on every WS connect:
+#   - devices/*.tmp      device-pair handler
+#   - workspace/state    acpx plugin mkdir on first start
+#   - identity/*         identity rotation
+#   - cron/jobs.json     openclaw cron add updates
+# Without these writable, every CLI WS connect closes with code 1000 (EACCES
+# from the device-pair handler). The Dockerfile bakes the same chown into the
+# image; this step keeps existing sandboxes working until they are rebuilt.
+#
+# openclaw.json itself stays root:root 444 — model routing is owned by the
+# host-side gateway (`openshell inference set` from onboard step 5), never
+# from inside the sandbox.
 
-if [ "$dry_run" -eq 0 ]; then
-  if docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- chmod 644 /sandbox/.openclaw/openclaw.json 2>/dev/null; then
-    ssh "$REMOTE_HOST" "python3 -c \"
-import json
-cfg = json.load(open('/sandbox/.openclaw/openclaw.json'))
-cfg['models'] = {
-  'mode': 'merge',
-  'providers': {
-    'inference': {
-      'baseUrl': 'https://inference.local/v1',
-      'apiKey': 'unused',
-      'api': 'openai-completions',
-      'models': [{
-        'id': 'nvidia/nemotron-3-super-120b-a12b',
-        'name': 'inference/nvidia/nemotron-3-super-120b-a12b',
-        'reasoning': False,
-        'input': ['text'],
-        'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
-        'contextWindow': 262144,
-        'maxTokens': 32768
-      }]
-    },
-    'lmstudio': {
-      'baseUrl': 'http://host.openshell.internal:1234/v1',
-      'apiKey': 'unused',
-      'api': 'openai-completions',
-      'models': [{
-        'id': 'google/gemma-4-e4b',
-        'name': 'lmstudio/google/gemma-4-e4b',
-        'reasoning': False,
-        'input': ['text'],
-        'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
-        'contextWindow': 131072,
-        'maxTokens': 8192
-      }]
-    }
-  }
-}
-json.dump(cfg, open('/sandbox/.openclaw/openclaw.json', 'w'), indent=2)
-print('done')
-\""
-    docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- chmod 444 /sandbox/.openclaw/openclaw.json 2>/dev/null || true
-    info "openclaw inference configured: NVIDIA primary, LM Studio fallback"
+if [ "$dry_run" -eq 1 ]; then
+  echo "  [dry-run] kubectl exec ${SANDBOX} -- chown sandbox /sandbox/.openclaw/{devices,workspace,workspace/state,identity,cron}"
+else
+  step "Ensuring /sandbox/.openclaw subpaths are sandbox-writable in '${SANDBOX}'"
+  if docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- bash -c '
+    set -e
+    mkdir -p /sandbox/.openclaw/workspace/state
+    chown -R sandbox:sandbox /sandbox/.openclaw/devices \
+                              /sandbox/.openclaw/workspace \
+                              /sandbox/.openclaw/identity \
+                              /sandbox/.openclaw/cron
+  ' 2>&1; then
+    info "openclaw subpaths chowned to sandbox:sandbox"
   else
-    warn "Could not chmod openclaw.json — inference provider config skipped"
+    warn "Could not chown openclaw subpaths — gateway WS connects may fail with EACCES"
+    warn "Diagnose: ssh ${REMOTE_HOST} 'tail /sandbox/.openclaw-data/logs/config-audit.jsonl'"
   fi
 fi
 

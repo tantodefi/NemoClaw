@@ -13,14 +13,29 @@ DIRS=(memory)
 # next to this script. Falls back to a hardcoded list if the file is missing
 # (e.g. running from a partial checkout). Both this script and the in-sandbox
 # chad-backup-to-github.sh read the same file so the lists can never drift.
+#
+# Manifest is sectioned: only [workspace] entries are downloaded here. The
+# memory/ directory is handled separately via the DIRS array (recursive). The
+# [runtime] / [runtime-dirs] sections are owned by chad-backup-to-github.sh.
+# Section headers and trailing-slash dir entries are skipped.
 FILES_LIST="${BACKUP_FILES_LIST:-$(dirname "$0")/chad-workspace-files.txt}"
 FILES=()
 if [ -r "$FILES_LIST" ]; then
+  current_section=""
   while IFS= read -r line; do
     line="${line%%#*}"
-    line="${line//[$'\t\r\n ']/}"
-    [ -n "$line" ] && FILES+=("$line")
-  done < "$FILES_LIST"
+    line="${line//[$'\t\r\n']/}"
+    line="${line## }"
+    line="${line%% }"
+    [ -z "$line" ] && continue
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      current_section="${BASH_REMATCH[1]}"
+      continue
+    fi
+    [ "$current_section" = "workspace" ] || continue
+    [[ "$line" == */ ]] && continue
+    FILES+=("$line")
+  done <"$FILES_LIST"
 fi
 if [ "${#FILES[@]}" -eq 0 ]; then
   FILES=(SOUL.md USER.md IDENTITY.md AGENTS.md MEMORY.md HEARTBEAT.md TOOLS.md EMAIL-POLICY.md)
@@ -89,13 +104,8 @@ do_backup() {
     fi
   done
 
-  # Capture cron manifest via openclaw cron list (best-effort)
-  # (proton-tool is baked into the image — no binary backup needed)
-  if command -v nemoclaw >/dev/null 2>&1; then
-    nemoclaw "$sandbox" exec -- openclaw cron list > "${dest}/cron-manifest.txt" 2>/dev/null \
-      && { count=$((count + 1)); info "Backed up cron manifest"; } \
-      || warn "Skipped cron manifest (openclaw cron list failed)"
-  fi
+  # cron jobs.json on disk is canonical — backed up via the [runtime] section
+  # of chad-backup-to-github.sh, no need to capture a CLI snapshot here.
 
   if [ "$count" -eq 0 ]; then
     rmdir "$dest" 2>/dev/null || true

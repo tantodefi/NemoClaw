@@ -22,7 +22,11 @@
 set -uo pipefail
 
 JOBS_FILE="${CHAD_CRON_JOBS:-/sandbox/.openclaw-data/cron/jobs.json}"
-GATEWAY_URL="${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18790}"
+
+# Setting OPENCLAW_GATEWAY_URL would route the CLI through the "gateway url
+# override" auth path, which requires --token. Letting openclaw resolve the
+# default (ws://127.0.0.1:18789 from openclaw.json) uses the local device-pair
+# credentials and just works.
 
 DRY_RUN=0
 if [ "${1:-}" = "--dry-run" ]; then
@@ -40,8 +44,7 @@ if ! command -v openclaw >/dev/null 2>&1; then
 fi
 
 # Names of jobs already registered with the gateway (in-memory).
-existing_names="$(OPENCLAW_GATEWAY_URL="$GATEWAY_URL" \
-  openclaw cron list --all --json 2>/dev/null \
+existing_names="$(openclaw cron list --all --json 2>/dev/null \
   | python3 -c 'import json,sys
 try:
     data = json.load(sys.stdin)
@@ -57,7 +60,8 @@ except Exception:
 
 # For each enabled job in jobs.json, emit the openclaw cron add invocation
 # unless its name already appears in the gateway's list.
-to_register="$(python3 - "$JOBS_FILE" <<'PY'
+to_register="$(
+  python3 - "$JOBS_FILE" <<'PY'
 import json, sys
 path = sys.argv[1]
 try:
@@ -94,7 +98,7 @@ while IFS= read -r entry; do
   [ -z "$entry" ] && continue
   name="$(echo "$entry" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["name"])')"
   expr="$(echo "$entry" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["expr"])')"
-  msg="$(echo "$entry"  | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["msg"])')"
+  msg="$(echo "$entry" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["msg"])')"
   target="$(echo "$entry" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["target"])')"
 
   if echo "$existing_names" | grep -Fxq "$name"; then
@@ -109,19 +113,19 @@ while IFS= read -r entry; do
     continue
   fi
 
-  if OPENCLAW_GATEWAY_URL="$GATEWAY_URL" openclaw cron add \
-       --name "$name" \
-       --cron "$expr" \
-       --session "$target" \
-       --message "$msg" \
-       >/dev/null 2>&1; then
+  if openclaw cron add \
+    --name "$name" \
+    --cron "$expr" \
+    --session "$target" \
+    --message "$msg" \
+    >/dev/null 2>&1; then
     added=$((added + 1))
     echo "[cron-reload] added: ${name}"
   else
     errors=$((errors + 1))
     echo "[cron-reload] ERROR adding ${name}" >&2
   fi
-done <<< "$to_register"
+done <<<"$to_register"
 
 echo "[cron-reload] added=${added} skipped=${skipped} errors=${errors}"
 [ "$errors" -eq 0 ]

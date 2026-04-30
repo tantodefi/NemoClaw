@@ -531,7 +531,17 @@ RUN chown root:root /sandbox/.openclaw \
     && rm -rf /root/.npm /sandbox/.npm \
     && find /sandbox/.openclaw -mindepth 1 -maxdepth 1 -exec chown -h root:root {} + \
     && chmod 755 /sandbox/.openclaw \
-    && chmod 444 /sandbox/.openclaw/openclaw.json
+    && chmod 444 /sandbox/.openclaw/openclaw.json \
+    # OpenClaw 2026.4.24 needs these subdirs writable by the gateway (sandbox
+    # user). Without these, every WS connect closes 1000 (EACCES from
+    # devices/*.tmp). Parent dir stays root:root 755, so the agent still
+    # cannot replace top-level entries (symlink-swap protection retained).
+    && mkdir -p /sandbox/.openclaw/workspace/state \
+    && chown sandbox:sandbox /sandbox/.openclaw/devices \
+                              /sandbox/.openclaw/workspace \
+                              /sandbox/.openclaw/workspace/state \
+                              /sandbox/.openclaw/identity \
+                              /sandbox/.openclaw/cron
 
 # Pin config hash at build time so the entrypoint can verify integrity.
 # Prevents the agent from creating a copy with a tampered config and

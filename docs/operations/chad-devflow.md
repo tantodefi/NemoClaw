@@ -169,6 +169,7 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 | `gbrain` queries return nothing or `Aborted()` | PGLite single-process lock — confirm `gbrain serve` is running and no other process holds the lock. |
 | `chad-sync` reports "cron drift" | Disk and gateway disagree. Run `ssh openshell-chad 'chad-cron-reload'`. |
 | open-webui `chad` model errors / 502 | `npm run webui:chad:status` checks both the SSH tunnel and the in-sandbox shim. Tunnel down → `webui:chad:up` (or `install` for persistence). Tunnel up but `/healthz` fails → shim crashed; the next `workspace-backup` cron will self-heal it, or `ssh openshell-chad 'HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &'`. |
+| `openclaw` CLI commands fail with `gateway closed (1000): no close reason` (dashboard still works) | The gateway can't write its device-pair tmp files. Check `tail /sandbox/.openclaw-data/logs/config-audit.jsonl` for `EACCES` on `/sandbox/.openclaw/devices/*.tmp`. Re-run `bash scripts/chad-setup.sh chad --skip-restore` (step 3c chowns the writable subpaths). Permanent fix is baked into the Dockerfile — only resurfaces on sandboxes built before that change. |
 
 ## Next Steps
 
