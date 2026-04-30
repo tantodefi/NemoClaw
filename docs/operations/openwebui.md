@@ -29,10 +29,13 @@ from any browser, gated by an email allowlist.
 
 ## Architecture at a glance
 
+Two upstreams are wired in. The model picker in the chat UI lets the user
+choose between them per conversation:
+
 ```
    browser
       │
-      ▼  https://<sub>.<domain>           (TLS terminated at CF edge)
+      ▼  https://<sub>.<domain>                (TLS terminated at CF edge)
    ┌──────────────────────────┐
    │   Cloudflare Access      │  email-OTP allowlist (ADMIN_EMAILS)
    └──────────┬───────────────┘
@@ -42,23 +45,45 @@ from any browser, gated by an email allowlist.
    │   Cloudflare Tunnel      │  outbound from host, no inbound ports
    └──────────┬───────────────┘
               │
-   ───────────┼───────────────────  host (your laptop or server)
+   ───────────┼─────────────────────────────────  host (your laptop or server)
               ▼
    ┌──────────────────────────┐    ┌────────────────────────┐
    │  cloudflared (docker)    │───►│  open-webui  (docker)  │
    └──────────────────────────┘    │  127.0.0.1:3000 only   │
-                                   └─────────┬──────────────┘
-                                             │  OPENAI_API_BASE_URL
-                                             ▼
-                                   ┌────────────────────────┐
-                                   │  NemoClaw inference    │
-                                   │  (K2.5 OpenAI shim)    │
-                                   └────────────────────────┘
+                                   └────┬─────────────┬─────┘
+                       OpenAI provider 1│             │OpenAI provider 2
+                                        ▼             ▼
+                            ┌────────────────────┐  ┌──────────────────────┐
+                            │ NVIDIA Build       │  │ host:8901            │
+                            │ /v1 (kimi-k2.5,    │  │ (SSH port-forward)   │
+                            │  raw inference)    │  └──────────┬───────────┘
+                            └────────────────────┘             │
+                                                ──host─────────┼────────────
+                                                               ▼
+                                              ┌────────────────────────────┐
+                                              │  OpenShell sandbox         │
+                                              │  127.0.0.1:8901 chad-shim  │
+                                              │  → openclaw agent (main)   │
+                                              │  → gbrain + policies       │
+                                              │  → action-gate + premium   │
+                                              │  → NVIDIA Build            │
+                                              └────────────────────────────┘
 ```
 
 Open-webui binds to `127.0.0.1` only — the cloudflared sidecar is the sole
 inbound path. Cloudflare Access sits in front of that and verifies the user
 against `ADMIN_EMAILS` before any traffic reaches the tunnel.
+
+**Provider 1 (raw NVIDIA Build)** is the default — chat goes straight to
+`integrate.api.nvidia.com` from the host with the `NVIDIA_API_KEY`. Same model
+Chad uses (`moonshotai/kimi-k2.5`), but no agent stack between you and the LLM.
+
+**Provider 2 (`chad` model)** routes each turn through `chad-shim` running
+**inside** the sandbox, which translates `POST /v1/chat/completions` into
+`openclaw agent --json --agent main --session-id <hash> --message <text>`.
+Replies come back with full Chad context: gbrain memory, network policies,
+action-gate, premium routing, the lot. Slower (10–30 s per turn) but it's
+"actually Chad" instead of "an LLM that happens to use the same key."
 
 ## Primary commands
 
@@ -69,6 +94,9 @@ against `ADMIN_EMAILS` before any traffic reaches the tunnel.
 | `npm run webui:down` | Stop containers (both profiles); leave Cloudflare config in place. |
 | `bash scripts/openwebui-down.sh --purge` | Stop containers **and** delete the tunnel, DNS record, and Access app from Cloudflare. |
 | `npm run webui:logs` | Tail logs from open-webui + cloudflared. |
+| `npm run webui:chad:up` | Open SSH port-forward `host:8901 → sandbox:8901` so the `chad` model becomes reachable. Idempotent. |
+| `npm run webui:chad:down` | Close the SSH port-forward. The shim inside the sandbox keeps running. |
+| `npm run webui:chad:status` | Report tunnel pid + `chad-shim /healthz`. |
 
 ## Modes
 
@@ -171,17 +199,113 @@ The Access policy is recreated with the new email list.
 To remove a user's open-webui account (separate from Access), an admin
 deletes them from the open-webui Settings → Users panel.
 
-## Inference endpoint
+## Inference endpoints
 
-`OPENAI_API_BASE_URL` controls where chat completions go. Two common setups:
+### Provider 1 — raw NVIDIA Build
 
-- **Local NemoClaw inference** — `http://host.docker.internal:8000/v1` if
-  `openclaw agent --local` is running on the host. The compose file ships
-  with a `host.docker.internal:host-gateway` mapping so this resolves on
-  Linux as well as macOS.
-- **Sandbox-hosted inference** — point at the openshell sandbox via an
-  SSH port-forward from the host (`ssh -L 8000:localhost:8000 openshell-chad`)
-  and use `host.docker.internal:8000` as the URL.
+Set in `scripts/openwebui/.env`:
+
+```bash
+OPENAI_API_BASE_URL=https://integrate.api.nvidia.com/v1
+OPENAI_API_KEY=<NVIDIA_API_KEY from /sandbox/.openclaw-data/credentials/credentials.json>
+```
+
+The model picker shows every model in your NVIDIA Build catalog
+(`moonshotai/kimi-k2.5`, the various NIMs, etc.). No sandbox dependency —
+chat works even if the OpenShell sandbox is down.
+
+> Note: Cloudflare passes the user's email through to open-webui in tunnel
+> mode, but **NVIDIA Build sees no per-user identity** beyond your shared
+> key. Per-user quota or audit must happen at the open-webui layer (admin
+> panel → Users → restrict models per user).
+
+### Provider 2 — Chad as a model (sandbox-backed)
+
+Routes `chat` model requests through `chad-shim` inside the sandbox, which
+turns each turn into `openclaw agent --json` against the `main` agent.
+Replies carry full Chad context: gbrain, action-gate, premium routing,
+network policies, audit logs, the works.
+
+**Setup (first time, after `npm run webui:up:quick` is already healthy):**
+
+1. Push the shim into the sandbox:
+
+   ```console
+   $ cat scripts/openwebui/chad-shim.py | \
+       ssh openshell-chad 'cat > /sandbox/scripts/chad-shim.py && chmod +x /sandbox/scripts/chad-shim.py'
+   ```
+
+2. Start it inside the sandbox (foreground via `nohup`; auto-start is a
+   future chad-setup.sh integration):
+
+   ```console
+   $ ssh openshell-chad 'nohup python3 /sandbox/scripts/chad-shim.py \
+       > /tmp/chad-shim.log 2>&1 &'
+   $ ssh openshell-chad 'curl -sS http://127.0.0.1:8901/healthz'
+   {"status": "ok", "agent": "main"}
+   ```
+
+3. Open the SSH port-forward from the host:
+
+   ```console
+   $ npm run webui:chad:up
+       ✓ tunnel up: localhost:8901 → openshell-chad:8901
+   $ npm run webui:chad:status
+       ✓ ssh tunnel pid=… (localhost:8901 → openshell-chad:8901)
+       ✓ chad-shim /healthz responding
+   ```
+
+4. In the open-webui browser UI:
+   - Click avatar → **Admin Panel** → **Settings** → **Connections**.
+   - Under **OpenAI API**, click **+** to add a second provider.
+   - URL: `http://host.docker.internal:8901/v1`
+   - Key: `sk-no-key-required` (anything non-empty; the shim ignores it).
+   - Click verify — it should hit `/v1/models` and show a `chad` entry. Save.
+
+5. Back in chat, the model picker now lists `chad` alongside the NVIDIA
+   models. Pick `chad` and send a message — first turn takes ~10–30 s while
+   `openclaw` boots its session.
+
+**Smoke test from the host (no browser):**
+
+```console
+$ curl -sS -X POST http://127.0.0.1:8901/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"chad","messages":[{"role":"user","content":"reply with PONG only"}]}' \
+    | jq -r '.choices[0].message.content'
+PONG
+```
+
+**Persistence caveats** (current MVP — improvements tracked separately):
+
+- The SSH tunnel is `ssh -fN` with `ServerAliveInterval=30`. It survives
+  brief network blips but dies on host sleep, reboot, or VPN flap. Re-run
+  `npm run webui:chad:up` after any of those.
+- The shim inside the sandbox is `nohup`'d. It dies on sandbox restart and
+  is not (yet) re-launched by `chad-setup.sh` or workspace restore. Re-run
+  step 2 after any sandbox cycle.
+- Session continuity: `chad-shim` derives a stable `--session-id` by
+  hashing the conversation's *first* message. New chat → new openclaw
+  session. Editing earlier turns in open-webui ("regenerate from here") will
+  hit the same openclaw session, so its memory may diverge from what the UI
+  shows. Live with it for now; revisit once we want strict consistency.
+
+### Choosing per-user
+
+Cloudflare Access (tunnel mode) passes the user's email in
+`Cf-Access-Authenticated-User-Email`. Inside open-webui, you can scope which
+users see which providers via *Admin Panel → Settings → Users → Permissions*.
+A typical split for the NemoClaw two-admin setup:
+
+| User | Sees `chad` model | Sees raw `kimi-k2.5` |
+|---|---|---|
+| `tantodefi@proton.me` | ✓ | ✓ |
+| `tjcooke@protonmail.com` | ✓ (free flows only — premium gated by `auto-actions.json`) | ✓ |
+
+The premium boundary lives in the sandbox's `auto-actions.json`, not in
+open-webui — so even when TJ chats `chad`, any tool call into `/premium`
+flows is rejected by the action-gate. open-webui is the trust *display*;
+the sandbox is the trust *enforcer*.
 
 `OPENAI_API_KEY` is required by open-webui's client even if the upstream
 shim ignores it — the default `sk-no-key-required` placeholder is fine.
@@ -207,6 +331,10 @@ input handling. Read-only `gbrain` is the conservative default.
 | 530 / "Argo tunnel error" | cloudflared can't reach the tunnel ingress target | `npm run webui:logs`; check open-webui is healthy |
 | Browser loops on Access login | Email not in `ADMIN_EMAILS`, or policy didn't apply | Re-run setup; verify policy in CF Zero Trust dashboard |
 | 502 from open-webui | `OPENAI_API_BASE_URL` is wrong or upstream is down | `curl $OPENAI_API_BASE_URL/models` from host to test |
+| `chad` model picker shows but chat 502s | SSH tunnel down OR shim crashed | `npm run webui:chad:status` first; restart tunnel and/or `ssh openshell-chad 'pgrep -af chad-shim.py'` |
+| `chad` model not in picker | Connection 2 not added in admin UI, or `/v1/models` 404 | Re-add provider in *Admin → Connections*; verify `curl http://127.0.0.1:8901/v1/models` returns the `chad` entry |
+| `chad` reply is `[chad-shim] empty reply (stopReason=…)` | openclaw produced no text payloads (tool-only turn, or model declined) | Look at `/tmp/chad-shim.log` and the openclaw session log; some turns Chad delegates to a sub-agent and the immediate reply is empty |
+| `chad` reply takes >100 s and times out | cloudflared quick-tunnel HTTP idle timeout | Use streaming (open-webui defaults to `stream:true`) — keeps the SSE connection live; or move to tunnel mode which has no quick-tunnel idle limit |
 | First login lands as "pending" | `DEFAULT_USER_ROLE` was overridden | Set back to `user`; CF Access is the trust boundary |
 | Tunnel never connects | `CF_TUNNEL_TOKEN` truncated / wrong | `bash scripts/openwebui-down.sh --purge` then re-run setup |
 | LAN-reachable on host IP | Port binding regressed to `0.0.0.0` | Verify `ports:` in `docker-compose.yml` is `127.0.0.1:…` |
@@ -230,6 +358,14 @@ setup creates a fresh tunnel.
 - 24-hour JWT expiry; forgotten browsers re-auth daily.
 - `cloudflared` runs in a sidecar container with only the connector token,
   no host filesystem mount.
+- `chad-shim` listens only on `127.0.0.1` *inside the sandbox*. The single
+  reachable path is the SSH tunnel from your host — if the tunnel is down,
+  the shim is unreachable from anywhere, including the open-webui container.
+  No port is published to the LAN, the OpenShell network, or Cloudflare.
+- The shim does not call out to the network itself (stdlib-only); it only
+  spawns `openclaw` as a subprocess. The L7 trust boundary keeps applying
+  because `openclaw` makes the upstream calls under its own binary
+  identity, exactly as it does for cron-driven Chad.
 
 For the broader threat model — what's safe to expose, what isn't — see
 [Backup Policy](../resources/backup-policy.md) and the trust boundary
