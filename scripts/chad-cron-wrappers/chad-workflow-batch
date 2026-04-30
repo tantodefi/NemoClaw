@@ -3,28 +3,41 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # chad-workflow-batch — replays the named workflow scenarios catalogued in
-# docs/operations/chad-workflows.md against the live code paths and captures
-# structured output for diffing across runs.
+# docs/operations/chad-workflows.md as a (fixture × variant × model × sample)
+# matrix, with bounded parallelism. Each cell becomes one sub-agent Chad
+# (a fresh `openclaw agent --local --session-id …` run inside chad-drafter)
+# that produces one captured draft. Outputs land under a nested directory
+# tree so the comparison aggregator can pivot on any axis.
 #
-# This is the regression harness for prompt-quality measurement. Source-
-# controlled YAML fixtures under /usr/local/share/chad/workflow-fixtures/
-# define the inbound shape; this wrapper iterates them, dispatches to the
-# right code path per `expected.path`, and writes one JSON file per
-# scenario to /sandbox/.openclaw/workspace/regressions/<UTC-ts>/.
+# Output layout (per run):
+#   regressions/<UTC-ts>/
+#     jobs.jsonl                                # manifest, updated as run progresses
+#     _index.json                               # final summary (matrix shape + status counts)
+#     <fixture>/<variant>/<model_safe>/<sample>.json    # one cell's captured output
 #
 # Currently wired paths:
 #   • drafter — invokes /usr/local/bin/chad-drafter with a single-item park
 #
 # Skipped paths (recorded as skipped in JSON, scenario does not fail):
-#   • spawn  — for `chad-spawn --kind fitness` (C1/C2 sub-agent flow)
+#   • spawn  — for `chad-spawn --kind fitness` (C2 sub-agent flow)
 #   • intake — for `chad-intake` multi-spawn (C3/C4 article flows)
 #
 # Usage:
 #   chad-workflow-batch [--fixtures DIR] [--out DIR] [--only ID[,ID,...]]
+#                       [--variants V1[,V2,...]]    (default: current)
+#                       [--models  M1[,M2,...]]     (default: drafter default)
+#                       [--samples N]               (default: 1; 3 recommended for noise-averaging)
+#                       [--parallel N]              (default: 3; cap on simultaneous sub-agent Chads)
 #
-# Exits 0 on success even if individual scenarios fail; failures are recorded
-# in the JSON, never raised. The scorer (chad-workflow-score) consumes the
-# captured outputs in a separate pass.
+# Variants: for v1, only `current` is meaningful — uses the deployed
+# /usr/local/bin/chad-drafter as-is. Future candidate prompt variants
+# will live at /usr/local/share/chad/prompt-variants/<name>/chad-drafter
+# and the runner will pick that binary by name. The variant label is
+# always recorded in output JSON so downstream comparison works today.
+#
+# Exits 0 even if individual cells fail; failures are recorded in the cell's
+# JSON, never raised. The scorer (chad-workflow-score) consumes captured
+# outputs in a separate pass.
 
 set -uo pipefail
 
@@ -33,13 +46,22 @@ set -uo pipefail
 
 FIXTURES_DIR="${CHAD_WORKFLOW_FIXTURES:-/usr/local/share/chad/workflow-fixtures}"
 OUT_ROOT="${CHAD_WORKFLOW_OUT_ROOT:-/sandbox/.openclaw/workspace/regressions}"
+VARIANTS_DIR="${CHAD_WORKFLOW_VARIANTS:-/usr/local/share/chad/prompt-variants}"
 ONLY=""
+VARIANTS="current"
+MODELS=""
+SAMPLES="1"
+PARALLEL="3"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --fixtures) FIXTURES_DIR="$2"; shift 2 ;;
     --out)      OUT_ROOT="$2"; shift 2 ;;
     --only)     ONLY="$2"; shift 2 ;;
+    --variants) VARIANTS="$2"; shift 2 ;;
+    --models)   MODELS="$2"; shift 2 ;;
+    --samples)  SAMPLES="$2"; shift 2 ;;
+    --parallel) PARALLEL="$2"; shift 2 ;;
     *)          shift ;;
   esac
 done
@@ -58,8 +80,11 @@ PROMPT_VERSION="${PROMPT_VERSION:-unknown}"
 
 FIXTURES_DIR="$FIXTURES_DIR" RUN_DIR="$RUN_DIR" RUN_TS="$RUN_TS" \
 ONLY="$ONLY" PROMPT_VERSION="$PROMPT_VERSION" \
+VARIANTS="$VARIANTS" MODELS="$MODELS" SAMPLES="$SAMPLES" PARALLEL="$PARALLEL" \
+VARIANTS_DIR="$VARIANTS_DIR" \
 python3 <<'PY'
-import json, os, subprocess, sys, time, glob, traceback
+import json, os, re, subprocess, sys, time, glob, threading, traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import yaml
@@ -67,46 +92,120 @@ except ImportError:
     print("PyYAML not installed in sandbox python3", file=sys.stderr)
     sys.exit(2)
 
-fixtures_dir = os.environ["FIXTURES_DIR"]
-run_dir = os.environ["RUN_DIR"]
-run_ts = os.environ["RUN_TS"]
+fixtures_dir   = os.environ["FIXTURES_DIR"]
+run_dir        = os.environ["RUN_DIR"]
+run_ts         = os.environ["RUN_TS"]
 prompt_version = os.environ["PROMPT_VERSION"]
-only_filter = {x.strip() for x in os.environ.get("ONLY", "").split(",") if x.strip()}
+variants_dir   = os.environ["VARIANTS_DIR"]
+only_filter    = {x.strip() for x in os.environ.get("ONLY", "").split(",") if x.strip()}
+variants_csv   = os.environ.get("VARIANTS", "current").strip() or "current"
+models_csv     = os.environ.get("MODELS", "").strip()
+samples        = max(1, int(os.environ.get("SAMPLES", "1") or "1"))
+parallel       = max(1, int(os.environ.get("PARALLEL", "3") or "3"))
+
+variants = [v.strip() for v in variants_csv.split(",") if v.strip()]
+models   = [m.strip() for m in models_csv.split(",") if m.strip()] or [""]   # "" = drafter default
 
 paths = sorted(glob.glob(os.path.join(fixtures_dir, "*.yaml")))
 if not paths:
     print(f"no fixtures found in {fixtures_dir}", file=sys.stderr)
     sys.exit(2)
 
-summary = {"run_ts": run_ts, "prompt_version": prompt_version, "scenarios": []}
+# Load fixtures
+fixtures = []
+for path in paths:
+    try:
+        with open(path) as f:
+            fx = yaml.safe_load(f)
+    except Exception as e:
+        print(f"failed to parse {path}: {e}", file=sys.stderr)
+        continue
+    fid = fx.get("id", os.path.basename(path).rsplit(".", 1)[0])
+    if only_filter and fid not in only_filter:
+        continue
+    fx["_id"] = fid
+    fixtures.append(fx)
 
-def write_scenario(payload):
-    path = os.path.join(run_dir, f"{payload['id']}.json")
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-    return path
+if not fixtures:
+    print("no fixtures matched filter", file=sys.stderr)
+    sys.exit(2)
 
-def run_drafter(fx):
-    """Invoke /usr/local/bin/chad-drafter with a single-item park derived from fx."""
+# Resolve drafter binary per variant. `current` → system /usr/local/bin/chad-drafter.
+def variant_drafter(name):
+    if name == "current":
+        return "/usr/local/bin/chad-drafter"
+    p = os.path.join(variants_dir, name, "chad-drafter")
+    return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
+
+def safe_path_seg(s):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", s) if s else "_default_"
+
+# Build the matrix.
+matrix = []
+for fx in fixtures:
+    expected_path = (fx.get("expected") or {}).get("path", "drafter")
+    for variant in variants:
+        for model in models:
+            for sample in range(samples):
+                matrix.append({
+                    "fixture_id": fx["_id"],
+                    "expected_path": expected_path,
+                    "variant": variant,
+                    "model": model,
+                    "sample": sample,
+                    "fx": fx,
+                })
+
+# Pre-write jobs.jsonl manifest (one line per cell, status=queued).
+jobs_path = os.path.join(run_dir, "jobs.jsonl")
+job_lock = threading.Lock()
+jobs_index = {}
+with open(jobs_path, "w") as f:
+    for i, cell in enumerate(matrix):
+        rec = {
+            "job_id": i,
+            "fixture": cell["fixture_id"],
+            "variant": cell["variant"],
+            "model": cell["model"] or "(default)",
+            "sample": cell["sample"],
+            "expected_path": cell["expected_path"],
+            "status": "queued",
+            "out_file": None,
+        }
+        jobs_index[i] = rec
+        f.write(json.dumps(rec) + "\n")
+
+def update_job(job_id, **fields):
+    with job_lock:
+        jobs_index[job_id].update(fields)
+        # Rewrite manifest atomically (small file, atomic enough for our needs).
+        tmp = jobs_path + ".tmp"
+        with open(tmp, "w") as f:
+            for jid in sorted(jobs_index):
+                f.write(json.dumps(jobs_index[jid]) + "\n")
+        os.replace(tmp, jobs_path)
+
+# Run a single drafter cell. Each cell == one sub-agent Chad.
+def run_drafter_cell(cell, drafter_bin, out_path, in_path):
+    fx = cell["fx"]
     inp = {"park": [{
         "idx": 0,
-        "id": f"fixture-{fx['id']}",
+        "id": f"fixture-{fx['_id']}-s{cell['sample']}",
         "subject": fx.get("subject", ""),
         "from": fx.get("sender", ""),
         "body": fx.get("body", ""),
         "flags": "",
         "premium_eligible": False,
     }]}
-    in_path = os.path.join(run_dir, f"{fx['id']}.in.json")
-    out_path = os.path.join(run_dir, f"{fx['id']}.drafter.json")
+    drafter_out_path = out_path + ".drafter.json"
     with open(in_path, "w") as f:
         json.dump(inp, f)
+    cmd = [drafter_bin, in_path, drafter_out_path]
+    if cell["model"]:
+        cmd += ["--model", cell["model"]]
     t0 = time.time()
     try:
-        proc = subprocess.run(
-            ["/usr/local/bin/chad-drafter", in_path, out_path],
-            capture_output=True, text=True, timeout=180,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         rc = proc.returncode
         stderr_tail = (proc.stderr or "")[-2000:]
     except subprocess.TimeoutExpired as e:
@@ -116,7 +215,7 @@ def run_drafter(fx):
 
     drafter_out = None
     try:
-        with open(out_path) as f:
+        with open(drafter_out_path) as f:
             drafter_out = json.load(f)
     except Exception as e:
         drafter_out = {"_load_error": str(e)}
@@ -129,80 +228,140 @@ def run_drafter(fx):
         "rc": rc,
         "stderr_tail": stderr_tail,
         "duration_ms": duration_ms,
-        "model": first.get("model", ""),
+        "model": first.get("model", "") or cell["model"] or "",
         "decision": first.get("action", "") or ("error" if drafter_error else ""),
         "reason": first.get("reason", "") or drafter_error,
         "output": first.get("draft", ""),
         "drafter_error": drafter_error,
         "drafter_raw": drafter_raw[:500] if isinstance(drafter_raw, str) else "",
-        "raw": drafter_out,
     }
 
-for path in paths:
-    try:
-        with open(path) as f:
-            fx = yaml.safe_load(f)
-    except Exception as e:
-        print(f"failed to parse {path}: {e}", file=sys.stderr)
-        continue
-    fid = fx.get("id", os.path.basename(path).rsplit(".", 1)[0])
-    if only_filter and fid not in only_filter:
-        continue
-    expected = fx.get("expected") or {}
-    expected_path = expected.get("path", "drafter")
+def run_cell(cell):
+    fx = cell["fx"]
+    variant = cell["variant"]
+    model_seg = safe_path_seg(cell["model"]) or "_default_"
+    cell_dir = os.path.join(run_dir, fx["_id"], variant, model_seg)
+    os.makedirs(cell_dir, exist_ok=True)
+    out_path = os.path.join(cell_dir, f"{cell['sample']}.json")
+    in_path  = os.path.join(cell_dir, f"{cell['sample']}.in.json")
 
     payload = {
-        "id": fid,
+        "fixture_id": fx["_id"],
         "name": fx.get("name", ""),
         "sender": fx.get("sender", ""),
         "subject": fx.get("subject", ""),
-        "expected_path": expected_path,
-        "expected_decision": expected.get("decision", ""),
-        "rubric": expected.get("rubric", []),
+        "variant": variant,
+        "model": cell["model"] or "",
+        "sample": cell["sample"],
+        "expected_path": cell["expected_path"],
+        "expected_decision": (fx.get("expected") or {}).get("decision", ""),
+        "rubric": (fx.get("expected") or {}).get("rubric", []),
         "prompt_version": prompt_version,
         "run_ts": run_ts,
     }
 
+    update_job(cell["_job_id"], status="running")
+
     try:
-        if expected_path == "drafter":
-            r = run_drafter(fx)
-            payload.update({
-                "skipped": False,
-                "model": r["model"],
-                "decision": r["decision"],
-                "reason": r["reason"],
-                "output": r["output"],
-                "drafter_error": r["drafter_error"],
-                "drafter_raw": r["drafter_raw"],
-                "rc": r["rc"],
-                "duration_ms": r["duration_ms"],
-                "stderr_tail": r["stderr_tail"],
-            })
-        else:
+        if cell["expected_path"] != "drafter":
             payload.update({
                 "skipped": True,
-                "skip_reason": f"path '{expected_path}' not yet wired in chad-workflow-batch",
+                "skip_reason": f"path '{cell['expected_path']}' not yet wired",
             })
+            update_job(cell["_job_id"], status="skipped", out_file=out_path)
+        else:
+            drafter_bin = variant_drafter(variant)
+            if drafter_bin is None:
+                payload.update({
+                    "skipped": True,
+                    "skip_reason": f"variant '{variant}' has no drafter binary",
+                })
+                update_job(cell["_job_id"], status="skipped", out_file=out_path)
+            else:
+                r = run_drafter_cell(cell, drafter_bin, out_path, in_path)
+                payload.update({
+                    "skipped": False,
+                    "model": r["model"] or cell["model"] or "",
+                    "decision": r["decision"],
+                    "reason": r["reason"],
+                    "output": r["output"],
+                    "drafter_error": r["drafter_error"],
+                    "drafter_raw": r["drafter_raw"],
+                    "rc": r["rc"],
+                    "duration_ms": r["duration_ms"],
+                    "stderr_tail": r["stderr_tail"],
+                })
+                final_status = "done" if r["decision"] not in ("error", "") else "error"
+                update_job(cell["_job_id"], status=final_status, out_file=out_path,
+                           decision=r["decision"], duration_ms=r["duration_ms"])
     except Exception:
         payload.update({
             "skipped": False,
             "rc": -2,
             "error": traceback.format_exc(limit=3),
         })
+        update_job(cell["_job_id"], status="error", out_file=out_path)
 
-    out_path = write_scenario(payload)
-    summary["scenarios"].append({
-        "id": fid,
-        "skipped": payload.get("skipped", False),
-        "decision": payload.get("decision", ""),
-        "duration_ms": payload.get("duration_ms", 0),
-        "file": os.path.basename(out_path),
-    })
-    print(f"{fid}: {'skipped' if payload.get('skipped') else payload.get('decision', '?')} → {out_path}")
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return payload
 
+# Tag each cell with its job_id for the manifest updater.
+for i, cell in enumerate(matrix):
+    cell["_job_id"] = i
+
+print(f"matrix: {len(fixtures)} fixtures × {len(variants)} variants × "
+      f"{len(models)} models × {samples} samples = {len(matrix)} cells "
+      f"(parallel={parallel})")
+
+# Fan out with bounded concurrency. Each running future == one sub-agent Chad.
+done_ct = 0
+err_ct = 0
+skip_ct = 0
+with ThreadPoolExecutor(max_workers=parallel) as pool:
+    futures = {pool.submit(run_cell, cell): cell for cell in matrix}
+    for fut in as_completed(futures):
+        cell = futures[fut]
+        try:
+            payload = fut.result()
+            if payload.get("skipped"):
+                skip_ct += 1
+                tag = "skip"
+            elif payload.get("decision") in ("error", ""):
+                err_ct += 1
+                tag = "error"
+            else:
+                done_ct += 1
+                tag = payload.get("decision", "?")
+        except Exception as e:
+            err_ct += 1
+            tag = f"crash: {e}"
+        print(f"  [{cell['fixture_id']}/{cell['variant']}/"
+              f"{cell['model'] or 'default'}/s{cell['sample']}] {tag}")
+
+# Final summary index.
+summary = {
+    "run_ts": run_ts,
+    "prompt_version": prompt_version,
+    "matrix": {
+        "fixtures": [fx["_id"] for fx in fixtures],
+        "variants": variants,
+        "models":   [m or "(default)" for m in models],
+        "samples":  samples,
+        "parallel": parallel,
+    },
+    "totals": {
+        "cells": len(matrix),
+        "done":  done_ct,
+        "error": err_ct,
+        "skipped": skip_ct,
+    },
+}
 with open(os.path.join(run_dir, "_index.json"), "w") as f:
     json.dump(summary, f, indent=2)
+
 print(f"\nrun complete → {run_dir}")
+print(f"totals: done={done_ct} error={err_ct} skipped={skip_ct} (of {len(matrix)})")
 PY
 
 exit 0

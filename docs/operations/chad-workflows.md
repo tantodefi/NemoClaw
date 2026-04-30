@@ -110,21 +110,48 @@ The rubric is fed to a separate scoring model pass (Tier 2.5 below).
 
 #### Runner contract
 
-`scripts/chad-cron-wrappers/chad-workflow-batch` (new wrapper, in-sandbox):
+`scripts/chad-cron-wrappers/chad-workflow-batch` (in-sandbox) is a **matrix runner**, not a sequence:
 
-- Iterates fixtures, invokes the right code path per `expected.path`.
-- Writes each output to `/sandbox/.openclaw/workspace/regressions/<UTC-ts>/<scenario>.json`:
-  ```json
-  { "id": "T1", "model": "kimi-k2.5", "prompt_version": "abc1234",
-    "output": "...", "decision": "auto", "tokens_in": …, "tokens_out": …,
-    "duration_ms": …, "ts": "2026-04-29T18:30:00Z" }
-  ```
-- Idempotent — re-running with the same prompts and inputs produces the same output (modulo model nondeterminism, which we accept and average over).
-- Exits 0 always; failures are recorded in the JSON, not raised.
+```
+matrix = fixtures × variants × models × samples
+```
+
+Each cell is one sub-agent Chad — a fresh `openclaw agent --local --session-id …` invocation through `chad-drafter` (or `chad-spawn` for spawn paths once wired). Cells fan out via a thread pool with bounded concurrency (default `--parallel 3`) so one run can have many parallel sub-agent Chads in flight without saturating the inference budget.
+
+```text
+chad-workflow-batch \
+  --variants current,candidate-A \
+  --models   moonshotai/kimi-k2.5,anthropic/claude-sonnet-4-6 \
+  --samples  3 \
+  --parallel 3
+```
+
+**Variants** live at `/usr/local/share/chad/prompt-variants/<name>/chad-drafter` (alternate drafter binaries). The sentinel `current` resolves to the deployed `/usr/local/bin/chad-drafter`. Variants without a binary are recorded as `skipped`, not raised — so adding a candidate is non-disruptive.
+
+**Samples** absorb model nondeterminism (k2.5 with reasoning ON has nontrivial variance). The aggregator averages within `(fixture, variant, model)` cells across samples.
+
+**Output layout** per run:
+```text
+regressions/<UTC-ts>/
+  jobs.jsonl                                       # manifest, status updated as run progresses
+  _index.json                                      # matrix shape + done/error/skipped totals
+  <fixture>/<variant>/<model_safe>/<sample>.json   # one captured cell
+```
+
+Each cell JSON carries `fixture_id, variant, model, sample, prompt_version (sha7 of installed drafter), decision, output, drafter_error, drafter_raw, duration_ms, rubric` — everything the scorer + aggregator need.
+
+The runner exits 0 even when individual cells fail; failures are recorded in the cell's JSON, never raised. Idempotent up to model nondeterminism, which is exactly why samples > 1 matters.
 
 #### Scoring (Tier 2.5)
 
-A second pass — `chad-workflow-score` — runs the rubric for each scenario through a single-turn LLM call (no tools, no MCP) and emits a pass/fail/score per rubric line. Rolled up into `regressions/<run-ts>/summary.md` with per-scenario results and a delta-from-last-run table. This is what the user actually reads.
+A second pass — `chad-workflow-score` — runs the rubric for each captured cell through a single-turn LLM call (no tools, no MCP) and emits a pass/fail/score per rubric line. Critically the **scorer model ≠ drafter model**, so we don't grade homework with the same model that wrote it. Per-cell scores roll up into `(fixture, variant, model)` cells (mean-pass-rate, mean-rubric-score) and the aggregator writes `regressions/<run-ts>/summary.md` with:
+
+- one row per `(fixture, variant, model)` group
+- mean pass-rate across samples
+- mean duration-ms
+- delta vs the most recent prior run (whichever variant matched)
+
+This is the document the user actually reads.
 
 ### Improvement loop
 
