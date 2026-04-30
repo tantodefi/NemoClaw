@@ -176,4 +176,5 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 - [Workspace Files](../workspace/workspace-files.md) — what each file does and the sectioned manifest format
 - [Backup Policy](../resources/backup-policy.md) — full inventory across all four state layers
 - [Open WebUI Front-End](openwebui.md) — chat UI exposed via Cloudflare Tunnel + Access
+- [Workflow Scenarios](chad-workflows.md) — named email scenarios + regression spec
 - [Log Locations](log-locations.md) — where each log stream lives

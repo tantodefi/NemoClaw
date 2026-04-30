@@ -778,6 +778,7 @@ These are the rules I will reject PRs over:
 - **Spawner** — [`/.github/skills/chad-orchestrator/scripts/chad-spawn.sh`](.github/skills/chad-orchestrator/scripts/chad-spawn.sh) is the canonical implementation of the contract.
 - **Setup script** — [`/scripts/chad-setup.sh`](scripts/chad-setup.sh) is the one-command-recovery path.
 - **Devflow catalog** — [`/docs/operations/chad-devflow.md`](docs/operations/chad-devflow.md) lists every wrapper, its schedule, and which symptoms point at it.
+- **Workflow scenarios** — [`/docs/operations/chad-workflows.md`](docs/operations/chad-workflows.md) names the 10 expected inbound email scenarios and how each flows through the pipeline.
 - **Open WebUI front-end** — [`/docs/operations/openwebui.md`](docs/operations/openwebui.md) covers the chat UI, dual-provider setup, and chad-as-a-model persistence.
 - **Policies** — [`/nemoclaw-blueprint/policies/presets/subagent-*.yaml`](nemoclaw-blueprint/policies/presets/) are the kind-specific L7 rules.
 - **Dockerfile** — [`/Dockerfile`](Dockerfile) lines ~115–133 wire the orchestrator helpers into the image.
