@@ -37,13 +37,14 @@ OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "openclaw")
 TIMEOUT_SEC = int(os.environ.get("CHAD_SHIM_TIMEOUT", "300"))
 
 
-def _extract_json(stderr_text: str) -> str | None:
-    """openclaw prints node UNDICI warnings before the JSON; find the first
-    line that starts with '{' and treat the rest as the JSON document."""
-    for i, line in enumerate(stderr_text.splitlines(keepends=True)):
+def _extract_json(text: str) -> str | None:
+    """`openclaw agent --json` prints the JSON document on stdout. The runtime
+    may interleave node UNDICI proxy warnings on stdout in some configs, so
+    skip lines until we find one that begins with '{'."""
+    for i, line in enumerate(text.splitlines(keepends=True)):
         if line.startswith("{"):
-            offset = sum(len(s) for s in stderr_text.splitlines(keepends=True)[:i])
-            return stderr_text[offset:]
+            offset = sum(len(s) for s in text.splitlines(keepends=True)[:i])
+            return text[offset:]
     return None
 
 
@@ -58,18 +59,23 @@ def run_openclaw(session_id: str, message: str) -> str:
         ],
         capture_output=True, text=True, timeout=TIMEOUT_SEC + 30,
     )
-    raw = _extract_json(proc.stderr or "")
+    # OpenClaw 2026.4.24+ emits --json on stdout (was stderr in 2026.4.9).
+    # Try stdout first, fall back to stderr for older runtimes.
+    raw = _extract_json(proc.stdout or "") or _extract_json(proc.stderr or "")
     if raw is None:
         return f"[chad-shim] openclaw produced no JSON (rc={proc.returncode})\n{(proc.stderr or '')[-1500:]}"
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         return f"[chad-shim] JSON parse failed: {e}\n{raw[:1500]}"
-    payloads = data.get("payloads") or []
+    # 2026.4.24+ wraps the response under "result"; older runtimes had it
+    # at the root. Walk both and use whichever has payloads.
+    result = data.get("result") if isinstance(data.get("result"), dict) else data
+    payloads = result.get("payloads") or []
     parts = [p.get("text", "") for p in payloads if isinstance(p, dict) and p.get("text")]
     if parts:
         return "\n".join(parts)
-    stop = (data.get("meta") or {}).get("stopReason")
+    stop = (result.get("meta") or {}).get("stopReason")
     return f"[chad-shim] empty reply (stopReason={stop!r}); openclaw returned no text payloads."
 
 
