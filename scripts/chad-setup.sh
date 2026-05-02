@@ -514,6 +514,39 @@ print('gbrain configured for NVIDIA NIM embeddings (llama-3.2-nv-embedqa-1b-v2 @
   elif [ ! -f "$GBRAIN_WRAPPER_SRC" ]; then
     warn "gbrain wrapper source missing: ${GBRAIN_WRAPPER_SRC}"
   fi
+
+  # Defensive re-write: if the user (or this script's step 3a above) ever
+  # ran `gbrain init` AFTER the config block was written, init silently
+  # overwrites config.json to a bare-minimum {engine, database_path} stub
+  # — dropping openai_api_key and embed_* fields. The wrapper then falls
+  # back to OPENAI_API_KEY=unused on next call, breaking embeddings with a
+  # 401. Re-applying the full config here makes the gbrain section
+  # idempotent: re-running chad-setup always leaves a working config.
+  # See: feedback_gbrain_init_clobbers_config in auto-memory.
+  ssh "$REMOTE_HOST" "NVIDIA_KEY='${nvidia_key}' python3 -c \"
+import json, os
+needs_rewrite = False
+try:
+    cfg = json.load(open('/sandbox/.gbrain/config.json'))
+    if not cfg.get('openai_api_key') or not cfg.get('embed_dimensions'):
+        needs_rewrite = True
+except Exception:
+    needs_rewrite = True
+if needs_rewrite:
+    cfg = {
+      'engine': 'pglite',
+      'database_path': '/sandbox/.gbrain/brain.pglite',
+      'openai_api_key': os.environ['NVIDIA_KEY'] or 'unused',
+      'openai_base_url': 'https://integrate.api.nvidia.com/v1',
+      'embed_model': 'nvidia/llama-3.2-nv-embedqa-1b-v2',
+      'embed_dimensions': '1024',
+      'embed_input_type': 'passage',
+    }
+    with open('/sandbox/.gbrain/config.json', 'w') as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod('/sandbox/.gbrain/config.json', 0o600)
+    print('gbrain config restored after init clobber')
+\"" 2>&1 | grep -v '^$' || true
 fi
 
 # ── Step 3c: Make /sandbox/.openclaw subpaths writable for OpenClaw 2026.4.24 ──

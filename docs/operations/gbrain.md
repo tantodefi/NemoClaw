@@ -159,9 +159,32 @@ gbrain doctor
 ```
 
 If `doctor` reports an embedder error, the most common causes are: bad
-`OPENAI_API_KEY`, wrong model id (model removed from gateway), or dim mismatch
+`OPENAI_API_KEY`, wrong model id (model removed from gateway), dim mismatch
 between `GBRAIN_EMBED_DIMENSIONS` and the schema (vector column is fixed at
-init time).
+init time), or the L7 binary allowlist not including `bun` (see below).
+
+### L7 policy / binary identity
+
+The OpenShell L7 proxy pins egress allowlist by `/proc/self/exe`. The
+`gbrain` command on `$PATH` is a shell wrapper that execs
+`/usr/local/bin/gbrain-bin`, which itself execs
+`bun /…/cli.ts`. The TLS dial to NVIDIA NIM happens from the **bun**
+process — not from `gbrain` or `gbrain-bin`. The `gbrain.yaml` policy
+preset's `binaries:` list must include all three paths:
+
+```yaml
+binaries:
+  - { path: /usr/local/bin/gbrain }
+  - { path: /usr/local/bin/gbrain-bin }
+  - { path: /usr/local/bin/bun }
+```
+
+Symptom when `bun` is missing from the allowlist: `curl: (56) CONNECT
+tunnel failed, response 403` on every embed call. Confirm by tailing
+`/sandbox/.openclaw-data/logs/config-audit.jsonl` (or running
+`gbrain embed --stale` and watching the error). Same lesson as the
+`feedback_openshell_l7_binary_identity` rule — wrapper paths must always
+include the wrapped binary.
 
 ## Recovery: corrupt or wrong-dim brain
 
@@ -172,27 +195,49 @@ with zero chunks. Recover by reinitializing:
 ```bash
 # Inside the sandbox (or via kubectl exec as root):
 mv /sandbox/.gbrain/brain.pglite /sandbox/.gbrain/brain.pglite.broken-$(date -u +%FT%TZ)
+rm -f /sandbox/.gbrain/postmaster.pid /sandbox/.gbrain/.gbrain-lock
 
 HOME=/sandbox \
   GBRAIN_EMBED_MODEL=nvidia/llama-3.2-nv-embedqa-1b-v2 \
   GBRAIN_EMBED_DIMENSIONS=1024 \
   gbrain init
 
-# Reapply config (init strips unknown fields, so write embedder config AFTER init)
+# CRITICAL: gbrain init silently overwrites config.json to bare minimum
+# ({"engine": ..., "database_path": ...}). The wrapper relies on
+# openai_api_key + embed_* fields being present, so re-write the config
+# AFTER every init or the next call goes out as `OPENAI_API_KEY=unused`
+# and gets a 401.
 cat > /sandbox/.gbrain/config.json <<'JSON'
 {
+  "engine": "pglite",
+  "database_path": "/sandbox/.gbrain/brain.pglite",
   "openai_api_key": "<NIM key>",
   "openai_base_url": "https://integrate.api.nvidia.com/v1",
   "embed_model": "nvidia/llama-3.2-nv-embedqa-1b-v2",
-  "embed_dimensions": 1024,
+  "embed_dimensions": "1024",
   "embed_input_type": "passage"
 }
 JSON
 chmod 0600 /sandbox/.gbrain/config.json
 ```
 
-Then re-import. A full 990-page textbook ingest takes ~3 minutes against NVIDIA
-NIM (verified 2026-04-29).
+Then re-import. A full 990-chunk fitness-books ingest takes ~3 min against
+NVIDIA NIM (verified 2026-05-02). Verify the round-trip with:
+
+```bash
+ssh openshell-chad 'gbrain stats'
+# Pages: 990  Chunks: 991  Embedded: 991   ← embedded == chunks means OK
+ssh openshell-chad 'gbrain query "supple leopard hip mobility"'
+# expect 0.65+ similarity hits returned within 1s
+ssh openshell-chad 'gbrain doctor 2>&1 | grep embeddings'
+# [OK] embeddings: 100% coverage, 0 missing
+```
+
+The canonical entry point for re-ingesting fitness reference content is
+`/usr/local/bin/chad-ingest-fitness-books` (deployed by `chad-setup.sh`).
+That script downloads OCR text from archive.org and chunks it into
+~1500-char pages tagged `fitness, starting-strength, book-chunk` or
+`fitness, supple-leopard, book-chunk`.
 
 ## Why we patched
 
