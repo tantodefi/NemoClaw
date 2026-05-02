@@ -166,10 +166,17 @@ class Handler(BaseHTTPRequestHandler):
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         now = int(time.time())
         if body.get("stream"):
+            # SSE stream:
+            # - Connection: close so the client knows EOF after [DONE] and
+            #   stops the spinner. keep-alive made open-webui's frontend
+            #   wait the full ~60s read timeout per turn.
+            # - Flush each event so the chunk lands as soon as it's written
+            #   instead of buffering until the connection closes (Python's
+            #   BufferedWriter default behavior on BaseHTTPRequestHandler).
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self.end_headers()
             chunk = {
                 "id": cid, "object": "chat.completion.chunk",
@@ -177,6 +184,7 @@ class Handler(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply}, "finish_reason": None}],
             }
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.flush()
             done = {
                 "id": cid, "object": "chat.completion.chunk",
                 "created": now, "model": MODEL_ID,
@@ -184,6 +192,10 @@ class Handler(BaseHTTPRequestHandler):
             }
             self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            # Explicitly mark connection as not-reusable so BaseHTTPRequestHandler
+            # tears down the TCP socket immediately after this handler returns.
+            self.close_connection = True
             return
 
         self._send_json(200, {
