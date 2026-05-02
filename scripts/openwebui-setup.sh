@@ -303,25 +303,53 @@ fi
 ok "Access app id=${APP_ID}"
 
 # ── 8. Access policy: email allowlist ───────────────────────────────
-step "Creating Access policy (allowlist: ${ADMIN_EMAILS})"
+# Idempotent: on first run we POST a new policy; on re-run we look up the
+# existing admin-allowlist policy and PUT the current ${ADMIN_EMAILS} list
+# so adding/removing an admin is a single .env edit + re-run away.
+step "Reconciling Access policy (allowlist: ${ADMIN_EMAILS})"
 INCLUDE_RULES="$(python3 -c "
 import json, sys
 emails = '${ADMIN_EMAILS}'.split(',')
 print(json.dumps([{'email': {'email': e.strip()}} for e in emails if e.strip()]))")"
 
-POLICY_BODY="$(cat <<JSON
+EXISTING_POLICY_ID="$(cf_api \
+  "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/access/apps/${APP_ID}/policies" \
+  | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    for p in d.get("result", []):
+        if p.get("name") == "admin-allowlist":
+            print(p.get("id", ""))
+            break
+except Exception:
+    pass')"
+
+if [ -n "$EXISTING_POLICY_ID" ]; then
+  POLICY_BODY="$(cat <<JSON
+{"name":"admin-allowlist","decision":"allow","include":${INCLUDE_RULES},"exclude":[],"require":[]}
+JSON
+)"
+  POLICY_RESP="$(cf_api -X PUT \
+    "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/access/apps/${APP_ID}/policies/${EXISTING_POLICY_ID}" \
+    -d "$POLICY_BODY" 2>&1 || true)"
+  if echo "$POLICY_RESP" | grep -q '"success":true'; then
+    ok "policy updated (allowlist now: ${ADMIN_EMAILS})"
+  else
+    warn "policy update response: $POLICY_RESP"
+  fi
+else
+  POLICY_BODY="$(cat <<JSON
 {"name":"admin-allowlist","decision":"allow","include":${INCLUDE_RULES}}
 JSON
 )"
-POLICY_RESP="$(cf_api -X POST \
-  "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/access/apps/${APP_ID}/policies" \
-  -d "$POLICY_BODY" 2>&1 || true)"
-if echo "$POLICY_RESP" | grep -q '"success":true'; then
-  ok "policy created"
-elif echo "$POLICY_RESP" | grep -qi "already exists\|duplicate"; then
-  ok "policy already exists (skipping)"
-else
-  warn "policy create response: $POLICY_RESP"
+  POLICY_RESP="$(cf_api -X POST \
+    "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/access/apps/${APP_ID}/policies" \
+    -d "$POLICY_BODY" 2>&1 || true)"
+  if echo "$POLICY_RESP" | grep -q '"success":true'; then
+    ok "policy created"
+  else
+    warn "policy create response: $POLICY_RESP"
+  fi
 fi
 
 # ── 9. Bring up compose ─────────────────────────────────────────────

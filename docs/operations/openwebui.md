@@ -171,8 +171,9 @@ The URL changes on every `cloudflared` restart — quick mode is for short-lived
        ✓ DNS record created
    ==> Creating Cloudflare Access application
        ✓ Access app id=…
-   ==> Creating Access policy (allowlist: tantodefi@proton.me,tjcooke@example.com)
-       ✓ policy created
+   ==> Reconciling Access policy (allowlist: tantodefi@proton.me,tjcooke@example.com)
+       ✓ policy created           # first run; PUT-updates on subsequent runs
+   ==> Setting trusted-header SSO + locking signup for tunnel mode
    ==> Starting docker compose
        ✓ open-webui + cloudflared running
    ==> Setup complete
@@ -180,24 +181,70 @@ The URL changes on every `cloudflared` restart — quick mode is for short-lived
        Admin emails: tantodefi@proton.me,tjcooke@example.com
    ```
 
-3. Visit `https://<sub>.<domain>` from any browser. Cloudflare Access will
-   prompt for an allowlisted email, send a one-time code, and (after entry)
-   pass you through to open-webui where you'll be auto-provisioned.
+3. Visit `https://<sub>.<domain>` from any browser. Cloudflare Access prompts
+   for an allowlisted email, mails a 6-digit code, and (after entry) forwards
+   the request to the tunnel with `Cf-Access-Authenticated-User-Email: <you>`
+   injected. open-webui's trusted-header SSO matches that email against its
+   user table, auto-provisions on first hit, and lands you logged in. **No
+   password prompt** beyond the Cloudflare OTP.
+
+## How the sign-in flow works
+
+```text
+browser ──► chad.example.dev ──► Cloudflare Access (OTP gate)
+                                       │ (cookie minted)
+                                       ▼
+                                 cloudflared tunnel
+                                       │ injects Cf-Access-Authenticated-User-Email
+                                       ▼
+                                 open-webui  ──── reads trusted header
+                                       │          ├── existing user → resume session
+                                       │          └── new email     → auto-provision
+                                       ▼                              (DEFAULT_USER_ROLE=user)
+                                 logged-in chat UI
+```
+
+`ENABLE_SIGNUP=False` in tunnel mode is intentional: Cloudflare Access is
+the trust boundary, so open-webui's native sign-up form would be redundant
+and dilute the security model. **Don't flip it.** The trusted-header path
+auto-creates accounts for any allowlisted email on first sign-in.
+
+The native open-webui sign-in form still appears if you hit the local
+debug URL `http://127.0.0.1:3000` (which bypasses Cloudflare Access and
+therefore has no trusted header). That's expected — use it only for
+verifying the container is healthy, not as an auth path.
 
 ## Adding or removing an admin
 
-Edit `ADMIN_EMAILS` in `scripts/openwebui/.env`, then re-run setup:
+Admin emails are sourced from one place — `scripts/openwebui/.env`'s
+`ADMIN_EMAILS=` line. **No script, Dockerfile, or compose file hard-codes
+emails.** To change the allowlist:
 
 ```console
-$ $EDITOR scripts/openwebui/.env       # change ADMIN_EMAILS=
-$ npm run webui:up                     # re-runs idempotently; re-applies policy
+$ $EDITOR scripts/openwebui/.env       # update ADMIN_EMAILS=email1,email2,...
+$ npm run webui:up                     # idempotent; PUTs the live Access policy
 ```
 
-Setup is idempotent — re-running won't create duplicate tunnels or apps.
-The Access policy is recreated with the new email list.
+Re-running setup looks up the existing `admin-allowlist` policy by name
+and PUTs the current `ADMIN_EMAILS` list to it. Adding or removing
+someone is a single `.env` edit + re-run away. No duplicate policies are
+created. The change takes effect within seconds — Cloudflare Access
+propagates policy updates globally.
 
-To remove a user's open-webui account (separate from Access), an admin
-deletes them from the open-webui Settings → Users panel.
+To grant an existing user the **admin** role inside open-webui itself
+(separate from Access access), edit them in `Settings → Users` from any
+admin account, or directly in the SQLite DB:
+
+```console
+$ sqlite3 ~/.nemoclaw/openwebui/data/webui.db \
+    "UPDATE user SET role='admin' WHERE email='tjcooke@protonmail.com';"
+$ docker restart nemoclaw-openwebui
+```
+
+To revoke open-webui access entirely, remove from `ADMIN_EMAILS` AND
+delete the user from `Settings → Users`. Removing only the email from
+Access leaves the open-webui account dormant but intact (no harm — the
+trusted header is the only way in, and they can't pass Access anymore).
 
 ## Inference endpoints
 
