@@ -200,6 +200,39 @@ if [ "$skip_skills" -eq 0 ]; then
   else
     warn "sync-skills-to-sandbox.sh not found — skipping skill sync"
   fi
+
+  # Register the deployed skills with OpenClaw's skill discovery.
+  #
+  # Skills land in /sandbox/.openclaw-data/skills/ (chosen because it's
+  # sandbox-writable and survives openclaw upgrades), but OpenClaw's
+  # loadSkillEntries (workspace-7Uj_FaPS.js:526-660) only scans:
+  #   - /sandbox/.openclaw/skills/                  (managed)
+  #   - /sandbox/.agents/skills/                    (personal)
+  #   - <workspaceDir>/.agents/skills/              (project)
+  #   - <workspaceDir>/skills/                      (workspace)
+  #   - skills.load.extraDirs from openclaw.json    (extra)
+  #
+  # Without registering the data dir as an extraDir, our skills exist
+  # on disk but never appear in `openclaw skills list` or the dashboard
+  # GUI, and — critically — their SKILL.md descriptions never reach the
+  # agent's <available_skills> prompt block. Chad still has access via
+  # the /usr/local/bin/chad-spawn shim and via MEMORY.md hints, but
+  # discretionary delegation degrades to "Chad has to remember the
+  # script path" instead of "OpenClaw matches description and routes."
+  #
+  # Idempotent: openclaw config set is a no-op if the value is already
+  # the same. Gateway needs a restart to surface the change in the
+  # dashboard; the CLI (and the agent's skill index) picks it up on
+  # next invocation regardless.
+  if [ "$dry_run" -eq 0 ]; then
+    info "Registering /sandbox/.openclaw-data/skills/ as openclaw extraDir"
+    # shellcheck disable=SC2029
+    ssh "$REMOTE_HOST" \
+      "openclaw config set skills.load.extraDirs --strict-json '[\"/sandbox/.openclaw-data/skills\"]'" \
+      >/dev/null 2>&1 \
+      && info "extraDir registered — skills now visible to discovery" \
+      || warn "extraDir registration failed — skills will be invisible to dashboard until next manual config set"
+  fi
 else
   info "Skipping skill sync (--skip-skills)"
 fi
