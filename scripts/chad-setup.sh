@@ -706,12 +706,22 @@ if [ "$skip_crons" -eq 0 ]; then
     else
       b64="$(printf '%s' "$message" | base64 | tr -d '\n')"
     fi
+    # --no-deliver --best-effort-deliver are LOAD-BEARING: the chad sandbox's
+    # messagingChannels list is empty (no Telegram/Discord/etc bound), so the
+    # default `--announce --channel last` resolves to nothing and fail-closes
+    # every cron with "Channel is required ...". Worse, the agent then loops
+    # trying to recover: we've seen email-check spend 5 hours and 1.8M tokens
+    # in a single run before timing out. The wrappers themselves write their
+    # output to memory and to detached background jobs — there's nothing to
+    # actually deliver via cron channels. Disable delivery globally; the
+    # "summary" the agent emits is the cron's ack, not a deliverable.
+    local default_flags="--no-deliver --best-effort-deliver"
     if [ "$dry_run" -eq 1 ]; then
-      echo "  [dry-run] ssh $REMOTE_HOST 'openclaw cron add --name $name --cron \"$schedule\" --session isolated $extra_flags --message <base64 decoded>'"
+      echo "  [dry-run] ssh $REMOTE_HOST 'openclaw cron add --name $name --cron \"$schedule\" --session isolated $default_flags $extra_flags --message <base64 decoded>'"
       return 0
     fi
     # shellcheck disable=SC2029
-    ssh "$REMOTE_HOST" "msg=\"\$(echo '$b64' | base64 -d)\" && openclaw cron add --name '$name' --cron '$schedule' --session isolated $extra_flags --message \"\$msg\""
+    ssh "$REMOTE_HOST" "msg=\"\$(echo '$b64' | base64 -d)\" && openclaw cron add --name '$name' --cron '$schedule' --session isolated $default_flags $extra_flags --message \"\$msg\""
   }
 
   # Email-check: hourly during daytime UTC (06:00–23:00) + one overnight
@@ -722,7 +732,7 @@ if [ "$skip_crons" -eq 0 ]; then
     warn "email-check cron already registered — skipping"
   else
     info "Registering email-check cron (hourly 06-23 UTC + 02:00 overnight)"
-    register_cron_via_ssh "email-check" "0 2,6-23 * * *" "--announce --channel last" "$email_check_message"
+    register_cron_via_ssh "email-check" "0 2,6-23 * * *" "" "$email_check_message"
   fi
 
   if echo "$existing_crons" | grep -q "workspace-backup"; then
@@ -770,6 +780,23 @@ if [ "$skip_crons" -eq 0 ]; then
   else
     info "Registering chad-budget-audit cron (weekly Mon 04:00 UTC)"
     register_cron_via_ssh "chad-budget-audit" "0 4 * * 1" "" "$budget_audit_message"
+  fi
+
+  # Idempotent migration: pre-existing crons (registered before --no-deliver
+  # was the default) still carry `announce -> last`, which fail-closes against
+  # the empty messagingChannels list. Patch every chad-owned cron to disable
+  # delivery on every run. This is a no-op on already-migrated jobs.
+  if [ "$dry_run" -eq 0 ]; then
+    info "Patching existing crons to --no-deliver --best-effort-deliver"
+    # shellcheck disable=SC2029
+    ssh "$REMOTE_HOST" '
+      for name in email-check workspace-backup gbrain-dream issue-triage self-improve chad-budget-audit; do
+        id="$(openclaw cron list 2>/dev/null | awk -v n="$name" "\$2==n {print \$1}")"
+        if [ -n "$id" ]; then
+          openclaw cron edit "$id" --no-deliver --best-effort-deliver >/dev/null 2>&1 || true
+        fi
+      done
+    ' >/dev/null 2>&1 || true
   fi
 
   info "Cron jobs registered"
