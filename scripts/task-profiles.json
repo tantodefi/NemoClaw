@@ -23,7 +23,7 @@
         "maxItems": 8,
         "usePremium": false,
         "premiumModel": "claude-sonnet-4-6",
-        "_premiumDisabledReason": "Anthropic premium routing is a placeholder until the account is funded. Default path uses K2.5 via NVIDIA free inference (openclaw agent --local). Flip usePremium back to true once /sandbox/.nemoclaw/credentials.json carries an ANTHROPIC_API_KEY tied to a funded account."
+        "_premiumDisabledReason": "Anthropic premium routing is a placeholder until the account is funded. Default path uses Nemotron 3 Super 120B via NVIDIA free inference (openclaw agent --local). Flip usePremium back to true once /sandbox/.nemoclaw/credentials.json carries an ANTHROPIC_API_KEY tied to a funded account."
       }
     },
 
@@ -65,7 +65,7 @@
         "maxItems": 8,
         "usePremium": false,
         "premiumModel": "claude-sonnet-4-6",
-        "_premiumDisabledReason": "See email-check.drafter — Anthropic premium is a placeholder until the account is funded. Default path uses K2.5 via NVIDIA free inference."
+        "_premiumDisabledReason": "See email-check.drafter — Anthropic premium is a placeholder until the account is funded. Default path uses the registry default model (Nemotron 3 Super 120B as of 2026-04-30) via NVIDIA free inference."
       }
     },
 
