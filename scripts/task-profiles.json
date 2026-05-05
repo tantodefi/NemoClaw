@@ -1,7 +1,7 @@
 {
   "$schema": "./task-profiles.schema.json",
   "_comment": "Per-task budget profiles. Each profile names a model (resolved via model-registry.json) and the runtime guardrails for that task. Wrappers and chad-setup.sh consume this; chad-budget-audit compares actual telemetry against it.",
-  "_modelInheritance": "Profiles that omit \"model\" inherit model-registry.json:defaults.primary (moonshotai/kimi-k2.5). Profiles MUST set \"model\" explicitly when (a) they want a non-default upstream (premium-* and *-premium profiles point at claude-* models) or (b) the routing layer should not fall back. Consumers that read profile['model'] should `or` against the registry default.",
+  "_modelInheritance": "Profiles that omit \"model\" inherit model-registry.json:defaults.primary (nvidia/nemotron-3-super-120b-a12b — Kimi K2.5 was deprecated 2026-04-29). Profiles MUST set \"model\" explicitly when (a) they want a non-default upstream (premium-* and *-premium profiles point at claude-* models) or (b) the routing layer should not fall back. Consumers that read profile['model'] should `or` against the registry default.",
   "_last_verified": "2026-04-29",
 
   "profiles": {
@@ -15,7 +15,7 @@
       "reason": "Wrapper invocation only — agent calls chad-email-check-cron and confirms a summary line. Recent canary: 90s, 133 output tokens. 2048-out cap is 5x p95 measured; 120s timeout is ~30% headroom over p95 90s. minBudget=30k matches chad-mail-check internal gate. thinking=off here is LOAD-BEARING: the cron-payload runs K2.5 with the openclaw `Bash` tool to invoke the wrapper, and K2.5+tools+reasoning has a known multi-turn regression that explodes to 550k tokens. The intelligence happens in the `drafter` block below (single-turn, no tools — safe). Inherits model from registry default.",
       "drafter": {
         "_comment": "Optional single-turn LLM draft pass kicked off by the cron WRAPPER (not the cron payload). chad-drafter is called once with no MCP and no tools — K2.5-safe by construction even with thinking on, because there are no tool calls to round-trip. Drafts append to today's memory under '### Draft replies' and are NEVER auto-sent.",
-        "model": "moonshotai/kimi-k2.5",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
         "thinking": "high",
         "maxOutputTokens": 4096,
         "timeoutSeconds": 90,
@@ -57,7 +57,7 @@
       "reason": "Wrapper enforces budget gate then detaches sub-agents. The cron-payload agent only acks the detach. Heavy minBudget=140k because the *detached* sub-agents (researcher/coder per issue) need ~70k each — gating happens at the wrapper, not here. thinking=off LOAD-BEARING for the same reason as email-check (K2.5+tools regression). The `drafter` block below runs the single-turn draft pass with thinking on. Inherits model from registry default.",
       "drafter": {
         "_comment": "Single-turn LLM draft of triage decisions (skip / comment-draft / close-stale) for the top-N open issues. Runs BEFORE the heavy detach. Drafts append under '### Issue triage drafts' and are NEVER posted. K2.5-safe (no tools).",
-        "model": "moonshotai/kimi-k2.5",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
         "thinking": "high",
         "maxOutputTokens": 4096,
         "timeoutSeconds": 90,
@@ -91,7 +91,7 @@
 
     "issue-triage-researcher-subagent": {
       "kind": "subagent-direct",
-      "model": "moonshotai/kimi-k2.5",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
       "maxOutputTokens": 16384,
       "timeoutSeconds": 600,
       "thinking": "high",
@@ -101,7 +101,7 @@
 
     "issue-triage-coder-subagent": {
       "kind": "subagent-direct",
-      "model": "moonshotai/kimi-k2.5",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
       "maxOutputTokens": 32768,
       "timeoutSeconds": 900,
       "thinking": "high",
@@ -111,7 +111,7 @@
 
     "chad-bug-intake-orchestrator": {
       "kind": "subagent-direct",
-      "model": "moonshotai/kimi-k2.5",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
       "maxOutputTokens": 16384,
       "timeoutSeconds": 600,
       "thinking": "high",
@@ -121,7 +121,7 @@
 
     "content-generation": {
       "kind": "subagent-direct",
-      "model": "moonshotai/kimi-k2.5",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
       "maxOutputTokens": 32768,
       "timeoutSeconds": 900,
       "thinking": "high",
@@ -180,7 +180,7 @@
       "thinking": "high",
       "minBudgetTokens": 0,
       "requiresAuthContext": true,
-      "reason": "Premium variant of issue-triage-coder. Used when an issue mentions @supachad — wrapper attaches AuthContext and the coder subagent picks this profile instead of the default kimi-k2.5 one. thinking=high because patches that go through this path are the higher-stakes ones (explicit human escalation)."
+      "reason": "Premium variant of issue-triage-coder. Used when an issue mentions @supachad — wrapper attaches AuthContext and the coder subagent picks this profile instead of the default Nemotron 3 Super 120B one. thinking=high because patches that go through this path are the higher-stakes ones (explicit human escalation)."
     },
 
     "chad-bug-intake-premium": {
