@@ -34,3 +34,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/node }
+      # gbrain query path needs bun + the wrapper chain on the allowlist.
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/gbrain-bin }
+      - { path: /usr/local/bin/bun }

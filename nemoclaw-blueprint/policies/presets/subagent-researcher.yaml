@@ -34,6 +34,13 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/node }
+      # gbrain query path: gbrain wrapper → gbrain-bin → bun /…/cli.ts.
+      # Researcher sub-agents query gbrain for context before web fetches;
+      # without bun on the allowlist the L7 proxy rejects with `403
+      # CONNECT tunnel failed`. See feedback_openshell_l7_binary_identity.
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/gbrain-bin }
+      - { path: /usr/local/bin/bun }
 
   subagent_researcher_github:
     name: subagent_researcher_github
