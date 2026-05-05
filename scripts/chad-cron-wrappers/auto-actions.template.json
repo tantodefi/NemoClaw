@@ -62,7 +62,8 @@
     "tjcooke@protonmail.com": "auto",
     "tjcooke@pm.me":          "auto",
     "tantodefi@proton.me":    "auto",
-    "supachad@proton.me":     "auto"
+    "_comment_supachad":      "supachad@proton.me is Chad's own outbound address. Auto-replying to Chad's own emails would create a feedback loop (verified live 2026-05-03). Block self-replies.",
+    "supachad@proton.me":     "block"
   },
   "email_send_new":            { "_default": "block" },
   "email_forward":             { "_default": "block" },
@@ -97,7 +98,7 @@
   "external_upload":           { "_default": "block" },
 
   "spawn_subagent":            { "_default": "auto" },
-  "spawn_premium":             { "_default": "block", "tantodefi@proton.me": "auto", "supachad@proton.me": "auto" },
+  "spawn_premium":             { "_default": "block", "tantodefi@proton.me": "auto" },
   "gbrain_write":              { "_default": "auto" },
   "gbrain_delete":             { "_default": "block" },
 
