@@ -30,12 +30,22 @@ BOOK="both"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --dry-run) DRY_RUN=1; shift ;;
-    --book) BOOK="$2"; shift 2 ;;
-    -h|--help)
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --book)
+      BOOK="$2"
+      shift 2
+      ;;
+    -h | --help)
       sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
-    *) echo "chad-ingest-fitness-books: unknown argument: $1" >&2; exit 2 ;;
+      exit 0
+      ;;
+    *)
+      echo "chad-ingest-fitness-books: unknown argument: $1" >&2
+      exit 2
+      ;;
   esac
 done
 
@@ -51,20 +61,29 @@ ingest_item() {
   local item_id="$1"
   local book_title="$2"
   local tag="$3"
+  # Optional 4th arg: regex pattern that the file name must match. archive.org
+  # bundle items can hold dozens of unrelated PDFs/OCR txt files (e.g. the
+  # Starting Strength 2011 item is actually a strength-training bundle with
+  # 116 files). Without a pattern, the picker grabs the alphabetically-first
+  # *_djvu.txt and you end up indexing FEROCIOUS FITNESS by Phil Ross instead
+  # of the Mark Rippetoe book that the slug suggests.
+  local name_pattern="${4:-}"
 
   echo "==> $book_title ($item_id)"
 
   DRY_RUN_FLAG="$DRY_RUN" \
-  ITEM_ID="$item_id" \
-  BOOK_TITLE="$book_title" \
-  BOOK_TAG="$tag" \
-  python3 << 'PYEOF'
+    ITEM_ID="$item_id" \
+    BOOK_TITLE="$book_title" \
+    BOOK_TAG="$tag" \
+    NAME_PATTERN="$name_pattern" \
+    python3 <<'PYEOF'
 import json, os, re, subprocess, sys, urllib.parse
 
-item_id   = os.environ["ITEM_ID"]
-title     = os.environ["BOOK_TITLE"]
-tag       = os.environ["BOOK_TAG"]
-dry_run   = os.environ["DRY_RUN_FLAG"] == "1"
+item_id      = os.environ["ITEM_ID"]
+title        = os.environ["BOOK_TITLE"]
+tag          = os.environ["BOOK_TAG"]
+dry_run      = os.environ["DRY_RUN_FLAG"] == "1"
+name_pattern = os.environ.get("NAME_PATTERN", "") or None
 
 CHUNK_CHARS = 1500
 OVERLAP_PARAS = 1  # carry last paragraph into next chunk for context
@@ -89,21 +108,48 @@ except Exception as exc:
 
 files    = meta.get("files", [])
 
-# Prefer *_djvu.txt (OCR), fall back to any .txt
+# Pick the OCR text file:
+#   1. If NAME_PATTERN is set, prefer *_djvu.txt files whose name (case-
+#      insensitive) matches the pattern. This lets us scope to a specific
+#      title in a multi-book archive item.
+#   2. Fall back to any *_djvu.txt with the pattern in the name (any
+#      extension).
+#   3. Final fallback: first *_djvu.txt at all (legacy behavior).
+pattern_re = re.compile(name_pattern, re.IGNORECASE) if name_pattern else None
+
+def _match(name, want_djvu):
+    if want_djvu and not name.endswith("_djvu.txt"):
+        return False
+    if not want_djvu and (name.endswith("_djvu.txt") or not name.endswith(".txt")):
+        return False
+    if pattern_re and not pattern_re.search(name):
+        return False
+    return True
+
 text_file = None
-for f in files:
-    if f.get("name", "").endswith("_djvu.txt"):
-        text_file = f["name"]
-        break
-if not text_file:
+for want_djvu in (True, False):
     for f in files:
         n = f.get("name", "")
-        if n.endswith(".txt") and "_djvu" not in n.lower():
+        if _match(n, want_djvu):
             text_file = n
+            break
+    if text_file:
+        break
+
+# Legacy fallback: first *_djvu.txt (no pattern) — keeps single-book
+# items working when caller didn't pass a pattern.
+if not text_file and not pattern_re:
+    for f in files:
+        if f.get("name", "").endswith("_djvu.txt"):
+            text_file = f["name"]
             break
 
 if not text_file:
-    print(f"  [WARN] No OCR text file found for {title} — skipping", file=sys.stderr)
+    msg = f"  [WARN] No OCR text file found for {title}"
+    if pattern_re:
+        msg += f" (pattern: {name_pattern})"
+    msg += " — skipping"
+    print(msg, file=sys.stderr)
     sys.exit(0)
 
 # Use canonical archive.org download URL (goes through archive.org, not CDN subdomains)
@@ -166,10 +212,14 @@ PYEOF
 
 case "$BOOK" in
   starting-strength)
+    # archive item is a strength-training bundle (~116 files); pin the
+    # picker to Rippetoe's Starting Strength specifically, not the
+    # alphabetically-first FEROCIOUS FITNESS_djvu.txt.
     ingest_item \
       "mark-rippetoe-starting-strength-3rd-edition-the-aasgaard-company-2011" \
       "Starting Strength" \
-      "starting-strength"
+      "starting-strength" \
+      'Mark Rippetoe.*Starting Strength'
     ;;
   supple-leopard)
     ingest_item \
@@ -181,7 +231,8 @@ case "$BOOK" in
     ingest_item \
       "mark-rippetoe-starting-strength-3rd-edition-the-aasgaard-company-2011" \
       "Starting Strength" \
-      "starting-strength"
+      "starting-strength" \
+      'Mark Rippetoe.*Starting Strength'
     ingest_item \
       "pdfy-PRTcysrLI4Malz8h" \
       "Supple Leopard" \
