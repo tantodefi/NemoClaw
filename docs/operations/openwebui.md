@@ -246,6 +246,32 @@ delete the user from `Settings → Users`. Removing only the email from
 Access leaves the open-webui account dormant but intact (no harm — the
 trusted header is the only way in, and they can't pass Access anymore).
 
+## Curated model picker (`seed-models.sql` + `loader.js`)
+
+The dropdown shows a curated 14-model list (Chad agent + Nemotron 3
+Super 120B + Llama 3.1/3.3 + Mixtral + Gemma 3 27B + GPT-OSS 20B/120B
++ Phi-4 Multimodal + Qwen3 Coder + GLM-5.1 + MiniMax M2.5) plus
+hover-tooltip use-case descriptions. Two pieces drive that:
+
+- `scripts/openwebui/seed-models.sql` — INSERT-OR-REPLACE statements
+  that populate the `model` table in `webui.db`. Re-applied
+  automatically by `openwebui-setup.sh` after every container start;
+  idempotent, never duplicates rows, COALESCEs `user_id` to preserve
+  ownership on existing entries.
+- `scripts/openwebui/static/loader.js` — browser-side script that
+  patches each tippy.js tooltip in the model-picker dropdown to show
+  `meta.description` instead of the default `label (id)`. Setup
+  `docker cp`s it into the container at `/app/backend/open_webui/static/loader.js` on every run.
+
+If you edit the curated set or descriptions via the admin UI and want
+the changes to survive a container wipe, dump the live state back into
+the source tree:
+
+```console
+$ bash scripts/openwebui/regen-seed-models.sh
+$ git add scripts/openwebui/seed-models.sql && git commit -m "..."
+```
+
 ## Inference endpoints
 
 ### Provider 1 — raw NVIDIA Build
