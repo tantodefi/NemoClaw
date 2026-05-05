@@ -40,6 +40,14 @@ services:
       WEBUI_NAME: "${WEBUI_NAME:-Chad}"
       OPENAI_API_BASE_URL: "${OPENAI_API_BASE_URL}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-sk-no-key-required}"
+      # Force SQLite DELETE journal mode — WAL flakes on Docker Desktop's
+      # macOS bind-mount ("fakeowner" fs), surfacing as SQLITE_IOERR on
+      # both reads and writes. The lookup-by-email exception was being
+      # silently swallowed by Users.get_user_by_email, falling through to
+      # signup, which then 401'd every browser request. DELETE is the
+      # original SQLite default and works everywhere; the perf delta on
+      # webui.db's workload is in the noise.
+      DATABASE_ENABLE_SQLITE_WAL: "False"
     networks:
       - openwebui-net
     extra_hosts:

@@ -426,6 +426,37 @@ if [ "$DRY_RUN" -eq 0 ] && [ -f "$SEED_SQL" ] && [ -f "$WEBUI_DB" ]; then
   fi
 fi
 
+# ── 9d. Pin journal_mode=DELETE on webui.db ─────────────────────────
+#
+# Docker Desktop's macOS bind-mount filesystem ("fakeowner") flakes under
+# SQLite WAL: the SHM coordination file can return SQLITE_IOERR ("disk
+# I/O error") on reads, which OpenWebUI's `Users.get_user_by_email`
+# silently swallows (returns None). Trusted-header SSO then falls
+# through to signup, which exposes the same I/O error on INSERT and
+# returns 401 to the browser — locking the user out even though the
+# account exists. DELETE journal mode is the original SQLite default
+# and works reliably on bind-mounts.
+#
+# `PRAGMA journal_mode=DELETE` is persistent on the file, but apply on
+# every setup run for safety: an alembic migration or upstream change
+# could flip it back to WAL.
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$WEBUI_DB" ]; then
+  step "Pinning webui.db journal_mode=DELETE (bind-mount safety)"
+  current_mode="$(sqlite3 "$WEBUI_DB" 'PRAGMA journal_mode;' 2>/dev/null || echo 'unknown')"
+  if [ "$current_mode" = "delete" ]; then
+    ok "journal_mode already DELETE"
+  else
+    docker stop nemoclaw-openwebui >/dev/null 2>&1 || true
+    new_mode="$(sqlite3 "$WEBUI_DB" 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;' 2>/dev/null | tail -1)"
+    docker start nemoclaw-openwebui >/dev/null 2>&1 || true
+    if [ "$new_mode" = "delete" ]; then
+      ok "journal_mode switched ${current_mode} → DELETE"
+    else
+      warn "journal_mode switch returned: ${new_mode} (signin may still 401)"
+    fi
+  fi
+fi
+
 # ── 10. Summary ─────────────────────────────────────────────────────
 step "Setup complete"
 info "  URL:          https://${WEBUI_FQDN}"
