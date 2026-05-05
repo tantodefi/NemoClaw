@@ -311,7 +311,7 @@ COPY .github/skills/chad-orchestrator/scripts/chad-route.sh         /usr/local/b
 COPY .github/skills/chad-orchestrator/scripts/chad-collect.sh       /usr/local/bin/chad-collect
 COPY .github/skills/chad-orchestrator/scripts/chad-intake.sh        /usr/local/bin/chad-intake
 COPY .github/skills/chad-orchestrator/scripts/chad-spawn-status.sh  /usr/local/bin/chad-spawn-status
-COPY .github/skills/chad-orchestrator/scripts/chad-self-improve.sh  /usr/local/bin/chad-self-improve
+COPY scripts/chad-cron-wrappers/chad-self-improve  /usr/local/bin/chad-self-improve
 COPY .github/skills/chad-orchestrator/scripts/chad-issue-triage.sh  /usr/local/bin/chad-issue-triage
 COPY .github/skills/chad-orchestrator/kinds/ /opt/chad-orchestrator/kinds/
 RUN chmod 755 /usr/local/bin/chad-spawn \

@@ -291,7 +291,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch; do
+      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -672,9 +672,10 @@ if [ "$skip_crons" -eq 0 ]; then
   # The budget guard at the top short-circuits the whole run when
   # remaining tokens are below 30000, so a bad day can't drain the pool.
   # The wrapper does the deterministic work (chad-mail-check + parse + batch
-  # mark-read + memory append). Replies and chad-intake routing are deferred
-  # to a human or a future agent run while the Kimi-K2.5 multi-turn tool-call
-  # regression is unresolved — see project_chad_cron_pattern memory.
+  # mark-read + memory append). Replies and chad-intake routing run through
+  # chad-drafter (single-turn, no tools — safe across model swaps) and
+  # chad-autosend-replies; see project_chad_cron_pattern memory for the
+  # original K2.5-era cron-payload constraints that drove this design.
   email_check_message='Run `chad-email-check-cron`. The wrapper sweeps the inbox, batch-marks-read everything that does not need a human reply, drafts replies for admins via the drafter pass, and auto-sends drafts whose sender policy is `auto` in `/sandbox/.openclaw-data/auto-actions.json` (currently tantodefi + tjcooke). Confirm it printed `email-check: total=... marked-read=... pending=... drafts=... drafter=... autosend=...`, then exit. Do not write replies yourself — every memory section (`### Auto-sent replies`, `### Draft replies`, `### Drafts blocked/deferred`) is produced by the wrapper.'
 
   workspace_backup_message='Run `chad-workspace-backup`. The wrapper detaches the slow git push and returns in <1s. Confirm it printed a `workspace-backup detached` line, then exit. Do not poll or follow up — the result lands in todays memory file when the background job finishes.'

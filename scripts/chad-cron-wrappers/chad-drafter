@@ -20,7 +20,9 @@
 #               "draft":str?,"model":str,"premium":bool}, ...],
 #    "error":str?}
 #
-# Why this is safe re: K2.5 multi-turn tool-call regression:
+# Why this is safe across cloud-model swaps (originally written for the
+# Kimi K2.5 multi-turn tool-call regression; equally applies to the
+# Nemotron 3 Super 120B default we moved to 2026-04-30):
 #   • No MCP servers attached.
 #   • No tools defined.
 #   • Prompt explicitly forbids tool use.
@@ -30,7 +32,8 @@
 # This wrapper NEVER auto-sends. Drafts go to memory for human review.
 #
 # Routing:
-#   • Local path  (default): `openclaw agent --local` → K2.5 via gateway.
+#   • Local path  (default): `openclaw agent --local` → registry default
+#     model via the host gateway (currently Nemotron 3 Super 120B).
 #   • Premium path (--use-premium AND CHAD_AUTH_CONTEXT_PATH set): pipes
 #     the prompt to `chad-premium-client --stdin --model <model>` so
 #     drafts route through Sonnet/Opus when the parked sender qualifies.
@@ -52,12 +55,27 @@ MAX_TOKENS="${CHAD_DRAFTER_MAX_TOKENS:-4096}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --kind)         KIND="$2"; shift 2 ;;
-    --use-premium)  USE_PREMIUM=1; shift ;;
-    --model)        MODEL="$2"; shift 2 ;;
-    --timeout)      TIMEOUT="$2"; shift 2 ;;
-    --max-tokens)   MAX_TOKENS="$2"; shift 2 ;;
-    *)              shift ;;
+    --kind)
+      KIND="$2"
+      shift 2
+      ;;
+    --use-premium)
+      USE_PREMIUM=1
+      shift
+      ;;
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --timeout)
+      TIMEOUT="$2"
+      shift 2
+      ;;
+    --max-tokens)
+      MAX_TOKENS="$2"
+      shift 2
+      ;;
+    *) shift ;;
   esac
 done
 
@@ -86,8 +104,8 @@ META_FILE="$(mktemp)"
 trap 'rm -f "$PROMPT_FILE" "$META_FILE"' EXIT
 
 INPUT="$INPUT" KIND="$KIND" USE_PREMIUM="$USE_PREMIUM" MODEL="$MODEL" \
-PROMPT_FILE="$PROMPT_FILE" META_FILE="$META_FILE" \
-python3 <<'PY'
+  PROMPT_FILE="$PROMPT_FILE" META_FILE="$META_FILE" \
+  python3 <<'PY'
 import json, os, sys
 src = json.load(open(os.environ["INPUT"]))
 park = src.get("park") or []
@@ -121,7 +139,11 @@ if explicit_model:
 elif use_premium and any_premium:
     model = "claude-sonnet-4-6"
 else:
-    model = "moonshotai/kimi-k2.5"
+    # Default cloud model. Kimi K2.5 was retired from NVIDIA Endpoints
+    # 2026-04-29 (returns 410 GONE); replaced with Nemotron 3 Super 120B
+    # which is reasoningSafe=true, so the K2.5 multi-turn tool-call
+    # regression noted elsewhere in this file no longer applies.
+    model = "nvidia/nemotron-3-super-120b-a12b"
 
 if kind == "issue":
     persona = (
@@ -181,28 +203,29 @@ trap 'rm -f "$PROMPT_FILE" "$META_FILE" "$RESP_FILE" "$ERR_FILE"' EXIT
 # Local path: openclaw agent --local with thinking ON, no MCP, no tools.
 if [ "$PREMIUM_ROUTING" -eq 1 ] && [ -x /usr/local/bin/chad-premium-client ]; then
   if /usr/local/bin/chad-premium-client \
-        --model "$EFFECTIVE_MODEL" \
-        --max-tokens "$MAX_TOKENS" \
-        --timeout "$TIMEOUT" \
-        --stdin \
-        --system "Respond with one valid JSON object on a single line. Do not call tools. Do not use code fences." \
-        < "$PROMPT_FILE" > "$RESP_FILE" 2> "$ERR_FILE"; then
+    --model "$EFFECTIVE_MODEL" \
+    --max-tokens "$MAX_TOKENS" \
+    --timeout "$TIMEOUT" \
+    --stdin \
+    --system "Respond with one valid JSON object on a single line. Do not call tools. Do not use code fences." \
+    <"$PROMPT_FILE" >"$RESP_FILE" 2>"$ERR_FILE"; then
     INVOKE_STATUS="ok"
   else
     INVOKE_STATUS="failed"
   fi
 else
-  # openclaw agent --local: K2.5 via gateway. thinking=on is safe here
-  # because there are no tools to round-trip. --no-mcp would be ideal
+  # openclaw agent --local: registry default model via gateway (Nemotron
+  # 3 Super 120B post-K2.5-deprecation). thinking=on is safe here because
+  # there are no tools to round-trip. --no-mcp would be ideal
   # but is not exposed on 2026.4.x; the prompt itself forbids tool use,
   # which the agent honors when no tool definitions are surfaced.
   PROMPT_BODY="$(cat "$PROMPT_FILE")"
   if env HOME=/sandbox \
-       timeout --kill-after=5 "${TIMEOUT}s" \
-       openclaw agent --agent main --local \
-         --session-id "drafter-$(date -u +%s)" \
-         -m "$PROMPT_BODY" \
-       > "$RESP_FILE" 2> "$ERR_FILE"; then
+    timeout --kill-after=5 "${TIMEOUT}s" \
+    openclaw agent --agent main --local \
+    --session-id "drafter-$(date -u +%s)" \
+    -m "$PROMPT_BODY" \
+    >"$RESP_FILE" 2>"$ERR_FILE"; then
     INVOKE_STATUS="ok"
   else
     INVOKE_STATUS="failed"
@@ -211,11 +234,11 @@ fi
 
 # ── Parse ────────────────────────────────────────────────────────────
 RESP_FILE="$RESP_FILE" ERR_FILE="$ERR_FILE" \
-INVOKE_STATUS="$INVOKE_STATUS" \
-EFFECTIVE_MODEL="$EFFECTIVE_MODEL" \
-PREMIUM_ROUTING="$PREMIUM_ROUTING" \
-OUTPUT="$OUTPUT" \
-python3 <<'PY'
+  INVOKE_STATUS="$INVOKE_STATUS" \
+  EFFECTIVE_MODEL="$EFFECTIVE_MODEL" \
+  PREMIUM_ROUTING="$PREMIUM_ROUTING" \
+  OUTPUT="$OUTPUT" \
+  python3 <<'PY'
 import json, os, re, sys
 resp = open(os.environ["RESP_FILE"]).read()
 err = open(os.environ["ERR_FILE"]).read() if os.path.isfile(os.environ["ERR_FILE"]) else ""

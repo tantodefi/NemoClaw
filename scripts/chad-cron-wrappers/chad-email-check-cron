@@ -338,9 +338,11 @@ fi
 #   1. profile defines a `drafter` block
 #   2. PARK_COUNT > 0 (something to draft)
 #   3. remaining_tokens >= drafter.minBudgetTokens
-# Single-turn, no MCP, no tools — K2.5-safe by construction. NEVER
-# auto-sends; drafts append to memory under "### Draft replies (review
-# before sending)" for human gating. Failures here are non-fatal.
+# Single-turn, no MCP, no tools — model-swap-safe by construction
+# (originally written for the K2.5 multi-turn regression; equally
+# applies to the Nemotron 3 Super 120B default). NEVER auto-sends;
+# drafts append to memory under "### Draft replies (review before
+# sending)" for human gating. Failures here are non-fatal.
 DRAFT_COUNT=0
 DRAFTER_STATUS="not-configured"
 

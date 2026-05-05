@@ -104,11 +104,15 @@ def build_config(env: dict | None = None) -> dict:
     # for per-model limits). Env vars NEMOCLAW_CONTEXT_WINDOW / NEMOCLAW_MAX_TOKENS
     # / NEMOCLAW_REASONING still override — the registry just removes the need
     # to pass them when running a known model.
-    # NOTE: keep reasoning=False for Kimi-K2.5. Flipping to True changes the
-    # openclaw harness's tool-call parsing; K2.5 emits tool calls in a form
-    # that doesn't round-trip — runs end up with "Tool  not found" errors and
-    # the agent loops on empty toolUse stops. The registry's reasoningSafe
-    # flag drives this default.
+    # NOTE: reasoning is gated on the registry's `reasoningSafe` flag.
+    # Historical reason: Kimi K2.5 (deprecated 2026-04-29) emitted tool
+    # calls in a form that didn't round-trip when reasoning=True — runs
+    # ended up with "Tool not found" errors and looped on empty toolUse
+    # stops. The current default model (Nemotron 3 Super 120B) is
+    # reasoningSafe=true, so this gate now permits reasoning by default;
+    # a model with reasoningSafe=false (a future K2.5-style regression
+    # or any model that fails the same parsing test) still gets
+    # reasoning=False here without code changes.
     _reg = _registry_defaults(model, env)
     _ctx_default = str(_reg.get("contextWindow", 131072))
     _max_default = str(_reg.get("maxOutputTokens", 4096))

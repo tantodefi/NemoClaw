@@ -52,11 +52,23 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --days)          days="$2";          shift 2 ;;
-    --dry-run)       dry_run=1;          shift ;;
-    --budget-tokens) budget_tokens="$2"; shift 2 ;;
-    -h|--help)       usage ;;
-    *) echo "chad-self-improve: unknown arg: $1" >&2; exit 2 ;;
+    --days)
+      days="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --budget-tokens)
+      budget_tokens="$2"
+      shift 2
+      ;;
+    -h | --help) usage ;;
+    *)
+      echo "chad-self-improve: unknown arg: $1" >&2
+      exit 2
+      ;;
   esac
 done
 
@@ -71,7 +83,7 @@ if [ "$dry_run" -eq 0 ] && command -v chad-budget >/dev/null 2>&1; then
   needed=$((budget_tokens * 2))
   if [ "${remaining:-0}" -lt "$needed" ]; then
     echo "chad-self-improve: remaining=${remaining} < ${needed} (2× budget) — skipping weekly run" >&2
-    echo "_(skipped: budget too low on $(date -u +%Y-%m-%dT%H:%M:%SZ))_" >> "$PROPOSALS_FILE"
+    echo "_(skipped: budget too low on $(date -u +%Y-%m-%dT%H:%M:%SZ))_" >>"$PROPOSALS_FILE"
     exit 0
   fi
 fi
@@ -83,11 +95,11 @@ fi
 task_file="$(mktemp /tmp/self-improve.XXXXXX.md)"
 
 CHAD_SI_DAYS="$days" \
-CHAD_SI_QUEUE_FILE="$QUEUE_FILE" \
-CHAD_SI_SUBAGENTS_DIR="$SUBAGENTS_DIR" \
-CHAD_SI_WORKSPACE="$WORKSPACE" \
-CHAD_SI_TASK_FILE="$task_file" \
-python3 <<'PY'
+  CHAD_SI_QUEUE_FILE="$QUEUE_FILE" \
+  CHAD_SI_SUBAGENTS_DIR="$SUBAGENTS_DIR" \
+  CHAD_SI_WORKSPACE="$WORKSPACE" \
+  CHAD_SI_TASK_FILE="$task_file" \
+  python3 <<'PY'
 import os, json, datetime, pathlib
 
 _UTC = getattr(datetime, "UTC", datetime.timezone.utc)
@@ -226,8 +238,8 @@ if ! command -v chad-spawn >/dev/null 2>&1; then
 fi
 
 task_id="$(chad-spawn --kind researcher --task-file "$task_file" \
-             --budget-tokens "$budget_tokens" \
-             --timeout 300 2>&1)" || {
+  --budget-tokens "$budget_tokens" \
+  --timeout 300 2>&1)" || {
   echo "chad-self-improve: spawn failed: $task_id" >&2
   exit 3
 }
@@ -250,6 +262,6 @@ report_file="${workdir}/report.md"
     printf '\n### Report\n\n'
     cat "$report_file"
   fi
-} >> "$PROPOSALS_FILE"
+} >>"$PROPOSALS_FILE"
 
 echo "$task_id"
