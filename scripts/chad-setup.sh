@@ -182,7 +182,10 @@ if [ "$skip_skills" -eq 0 ]; then
         if [ "$dry_run" -eq 1 ]; then
           echo "  [dry-run] Would sync gstack skill: $skill_name"
         else
-          tar -C "$gstack_skills_src" -cf - "$skill_name" \
+          # --exclude='._*' strips macOS AppleDouble metadata files —
+          # see sync-skills-to-sandbox.sh for the same guard.
+          tar -C "$gstack_skills_src" --exclude='._*' --exclude='.DS_Store' \
+              -cf - "$skill_name" \
             | ssh "$REMOTE_HOST" \
               "mkdir -p /sandbox/.openclaw-data/skills && \
                  tar -C /sandbox/.openclaw-data/skills -xf -" \

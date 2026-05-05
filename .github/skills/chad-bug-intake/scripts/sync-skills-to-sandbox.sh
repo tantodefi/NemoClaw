@@ -76,7 +76,12 @@ for skill in "${skills[@]}"; do
   # valid kinds/ tree. Previously the `rm -rf; tar xf -` sequence left
   # a half-populated skill dir if extraction failed.
   # Use tar pipeline instead of scp — sandbox may lack sftp-server.
-  tar -C "$repo_root/.github/skills" -cf - "$skill" \
+  # --exclude='._*' strips macOS AppleDouble metadata files. They
+  # accumulated 48 stale entries in /sandbox/.openclaw-data/skills/
+  # before this guard; without it, every Finder browse on the host
+  # ./skills/ tree can plant new ._<file> siblings that get carried
+  # along on the next sync.
+  tar -C "$repo_root/.github/skills" --exclude='._*' --exclude='.DS_Store' -cf - "$skill" \
     | ssh "$remote_host" "
         set -e
         staging=\"\$(mktemp -d '$remote_dir/.sync-$skill.XXXXXX')\"
