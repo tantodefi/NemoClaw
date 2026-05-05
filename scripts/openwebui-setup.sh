@@ -33,14 +33,26 @@ DRY_RUN=0
 MODE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --dry-run)     DRY_RUN=1; shift ;;
-    --mode=*)      MODE="${1#--mode=}"; shift ;;
-    --mode)        MODE="$2"; shift 2 ;;
-    -h|--help)
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --mode=*)
+      MODE="${1#--mode=}"
+      shift
+      ;;
+    --mode)
+      MODE="$2"
+      shift 2
+      ;;
+    -h | --help)
       sed -n '4,25p' "$0" | sed 's|^# *||'
       exit 0
       ;;
-    *) echo "openwebui-setup: unknown arg: $1" >&2; exit 2 ;;
+    *)
+      echo "openwebui-setup: unknown arg: $1" >&2
+      exit 2
+      ;;
   esac
 done
 
@@ -52,9 +64,12 @@ BLUE='\033[0;34m'
 RESET='\033[0m'
 step() { echo -e "${BLUE}==>${RESET} $*"; }
 info() { echo -e "    $*"; }
-ok()   { echo -e "${GREEN}    ✓${RESET} $*"; }
+ok() { echo -e "${GREEN}    ✓${RESET} $*"; }
 warn() { echo -e "${YELLOW}    !${RESET} $*"; }
-fail() { echo -e "${RED}    ✗${RESET} $*" >&2; exit 1; }
+fail() {
+  echo -e "${RED}    ✗${RESET} $*" >&2
+  exit 1
+}
 
 # ── 1. .env preflight ──────────────────────────────────────────────
 if [ ! -f "$ENV_FILE" ]; then
@@ -65,12 +80,14 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 
 # shellcheck source=/dev/null
-set -a; . "$ENV_FILE"; set +a
+set -a
+. "$ENV_FILE"
+set +a
 
 # CLI --mode overrides .env WEBUI_MODE; default to tunnel.
 MODE="${MODE:-${WEBUI_MODE:-tunnel}}"
 case "$MODE" in
-  tunnel|quick) ;;
+  tunnel | quick) ;;
   *) fail "invalid --mode '$MODE' (expected: tunnel | quick)" ;;
 esac
 
@@ -99,7 +116,7 @@ fi
 
 # ── 2. Tooling preflight ────────────────────────────────────────────
 command -v docker >/dev/null || fail "docker not installed"
-command -v curl   >/dev/null || fail "curl not installed"
+command -v curl >/dev/null || fail "curl not installed"
 command -v python3 >/dev/null || fail "python3 not installed (used to parse JSON responses)"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -208,7 +225,7 @@ else
   TUNNEL_RESP="$(cf_api -X POST \
     "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
     -d "$(printf '{"name":"%s","tunnel_secret":"%s","config_src":"cloudflare"}' \
-            "$TUNNEL_NAME" "$TUNNEL_SECRET")")"
+      "$TUNNEL_NAME" "$TUNNEL_SECRET")")"
   CF_TUNNEL_ID="$(echo "$TUNNEL_RESP" \
     | python3 -c 'import json,sys
 try:
@@ -234,7 +251,8 @@ fi
 
 # ── 5. Tunnel ingress ───────────────────────────────────────────────
 step "Configuring tunnel ingress → http://open-webui:8080"
-INGRESS_BODY="$(cat <<JSON
+INGRESS_BODY="$(
+  cat <<JSON
 {"config":{"ingress":[
   {"hostname":"${WEBUI_FQDN}","service":"http://open-webui:8080"},
   {"service":"http_status:404"}
@@ -249,7 +267,8 @@ ok "ingress: ${WEBUI_FQDN} → open-webui:8080"
 
 # ── 6. DNS CNAME ────────────────────────────────────────────────────
 step "Creating DNS CNAME ${WEBUI_FQDN} → ${CF_TUNNEL_ID}.cfargotunnel.com"
-DNS_BODY="$(cat <<JSON
+DNS_BODY="$(
+  cat <<JSON
 {"type":"CNAME","name":"${WEBUI_SUBDOMAIN}","content":"${CF_TUNNEL_ID}.cfargotunnel.com","proxied":true}
 JSON
 )"
@@ -266,7 +285,8 @@ fi
 
 # ── 7. Cloudflare Access application ────────────────────────────────
 step "Creating Cloudflare Access application"
-APP_BODY="$(cat <<JSON
+APP_BODY="$(
+  cat <<JSON
 {
   "name":"${TUNNEL_NAME}",
   "domain":"${WEBUI_FQDN}",
@@ -325,10 +345,11 @@ except Exception:
     pass')"
 
 if [ -n "$EXISTING_POLICY_ID" ]; then
-  POLICY_BODY="$(cat <<JSON
+  POLICY_BODY="$(
+    cat <<JSON
 {"name":"admin-allowlist","decision":"allow","include":${INCLUDE_RULES},"exclude":[],"require":[]}
 JSON
-)"
+  )"
   POLICY_RESP="$(cf_api -X PUT \
     "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/access/apps/${APP_ID}/policies/${EXISTING_POLICY_ID}" \
     -d "$POLICY_BODY" 2>&1 || true)"
@@ -338,10 +359,11 @@ JSON
     warn "policy update response: $POLICY_RESP"
   fi
 else
-  POLICY_BODY="$(cat <<JSON
+  POLICY_BODY="$(
+    cat <<JSON
 {"name":"admin-allowlist","decision":"allow","include":${INCLUDE_RULES}}
 JSON
-)"
+  )"
   POLICY_RESP="$(cf_api -X POST \
     "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/access/apps/${APP_ID}/policies" \
     -d "$POLICY_BODY" 2>&1 || true)"
@@ -365,6 +387,43 @@ else
   (cd "$WEBUI_DIR" && docker compose --env-file "$ENV_FILE" --profile tunnel up -d) \
     || fail "docker compose up failed"
   ok "open-webui + cloudflared running"
+fi
+
+# ── 9b. Deploy static loader.js (model dropdown tooltip injector) ────
+#
+# Open-webui serves /static/* from /app/backend/open_webui/static/ inside
+# the container. We ship a tiny browser-side script that adds tooltip
+# descriptions to the model picker; without this auto-deploy the file is
+# only present locally and a fresh container loses it on every boot.
+# Idempotent: docker cp overwrites if the source changed.
+LOADER_SRC="${WEBUI_DIR}/static/loader.js"
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$LOADER_SRC" ]; then
+  step "Deploying static/loader.js into open-webui container"
+  if docker cp "$LOADER_SRC" nemoclaw-openwebui:/app/backend/open_webui/static/loader.js 2>&1; then
+    ok "loader.js deployed (model dropdown tooltips active)"
+  else
+    warn "loader.js deploy failed — model picker will still work, just no tooltips"
+  fi
+fi
+
+# ── 9c. Seed curated model records into webui.db ─────────────────────
+#
+# The 14-model curated picker (Chad agent + Nemotron + Llama family +
+# Mixtral + Gemma + GPT-OSS + Phi-4 + Qwen3 Coder + GLM + MiniMax) lives
+# in webui.db's `model` table. A fresh DB or a `--purge`-style teardown
+# wipes them. seed-models.sql is INSERT-OR-REPLACE so re-applying never
+# duplicates and never overwrites user_id assignments.
+SEED_SQL="${WEBUI_DIR}/seed-models.sql"
+WEBUI_DB="${WEBUI_DATA_DIR:-${HOME}/.nemoclaw/openwebui/data}/webui.db"
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$SEED_SQL" ] && [ -f "$WEBUI_DB" ]; then
+  step "Seeding curated model records (idempotent)"
+  if sqlite3 "$WEBUI_DB" <"$SEED_SQL" 2>&1; then
+    count="$(sqlite3 "$WEBUI_DB" 'SELECT COUNT(*) FROM model;' 2>/dev/null || echo '?')"
+    ok "model records seeded (${count} total in webui.db)"
+    docker restart nemoclaw-openwebui >/dev/null 2>&1 || true
+  else
+    warn "seed-models.sql apply failed — admin UI > Models still works for manual entry"
+  fi
 fi
 
 # ── 10. Summary ─────────────────────────────────────────────────────
