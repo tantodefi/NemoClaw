@@ -645,6 +645,44 @@ else
   fi
 fi
 
+# ── Step 3d: Patch memory-lancedb plugin for NVIDIA embedder compat ──────
+#
+# memory-lancedb sends `dimensions` in every embeddings request whenever the
+# config sets a non-default vector dim (required for unknown models like
+# nvidia/nv-embed-v1). NVIDIA's integrate.api.nvidia.com/v1/embeddings
+# rejects that param with extra_forbidden, so memory_recall and ltm search
+# fail at the first call.
+#
+# The same patch is in Dockerfile (Patch 5). This step self-heals existing
+# sandboxes built before that patch landed. Idempotent: silent skip when
+# the patch is already in place.
+
+if [ "$dry_run" -eq 1 ]; then
+  echo "  [dry-run] kubectl exec ${SANDBOX} -- patch memory-lancedb"
+elif [ -n "${SANDBOX_POD:-}" ]; then
+  step "Ensuring memory-lancedb plugin is patched for NVIDIA embedder"
+  if docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- sh -c '
+    set -e
+    F=/usr/local/lib/node_modules/openclaw/dist/extensions/memory-lancedb/index.js
+    [ -r "$F" ] || { echo "memory-lancedb plugin not found"; exit 0; }
+    if grep -q "nemoclaw: dimensions stripped" "$F"; then
+      echo "already patched"
+    else
+      sed -i "s|if (this\.dimensions) params\.dimensions = this\.dimensions;|/* nemoclaw: dimensions stripped for NVIDIA-compat */ void this.dimensions;|" "$F"
+      grep -q "nemoclaw: dimensions stripped" "$F" || { echo "patch failed"; exit 1; }
+      # Force plugin-runtime-deps to re-extract on next openclaw invocation
+      rm -rf /sandbox/.openclaw/plugin-runtime-deps/openclaw-* 2>/dev/null || true
+      mkdir -p /sandbox/.openclaw/plugin-runtime-deps
+      chown sandbox:sandbox /sandbox/.openclaw/plugin-runtime-deps
+      echo "patched + cache cleared"
+    fi
+  ' 2>&1 | grep -v "^$" >/dev/null; then
+    info "memory-lancedb embedder patch in place"
+  else
+    warn "Could not apply memory-lancedb patch — ltm operations may fail with extra_forbidden"
+  fi
+fi
+
 # ── Step 4: Authenticate gh ───────────────────────────────────────────────
 
 if [ "$skip_gh_auth" -eq 0 ]; then

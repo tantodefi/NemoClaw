@@ -209,13 +209,17 @@ RUN set -eu; \
 # Patch 2: drop when OpenClaw fixes assertExplicitProxyAllowed to skip the
 #   target hostname allowlist for the proxy hostname check (or exposes config
 #   to disable the check).
+# Patch 5: drop when OpenClaw memory-lancedb plugin gates the OpenAI
+#   `dimensions` param by provider capability or adds a `provider: "nvidia"`
+#   profile that knows NVIDIA's embeddings API rejects it.
 #
 # SYNC WITH OPENCLAW: these patches grep for specific exports and function
 # definitions in the compiled OpenClaw dist (withStrictGuardedFetchMode,
-# assertExplicitProxyAllowed). If OpenClaw renames, removes, or restructures
-# either symbol in a future release, the grep will fail and the build will
-# abort. When bumping OPENCLAW_VERSION, verify both symbols still exist in
-# the new dist and update the regex / sed replacement accordingly.
+# assertExplicitProxyAllowed, memory-lancedb embed param). If OpenClaw renames,
+# removes, or restructures either symbol in a future release, the grep will
+# fail and the build will abort. When bumping OPENCLAW_VERSION, verify both
+# symbols still exist in the new dist and update the regex / sed replacement
+# accordingly.
 #
 # Both patches fail-close: if grep finds no targets, the build aborts so
 # the next maintainer reviewing an OPENCLAW_VERSION bump knows to revisit.
@@ -265,7 +269,21 @@ RUN set -eu; \
     rcf_file="$(grep -RIlE --include='*.js' 'async function replaceConfigFile\(params\)' "$OC_DIST" | head -n 1)"; \
     test -n "$rcf_file" || { echo "ERROR: replaceConfigFile function not found in OpenClaw dist" >&2; exit 1; }; \
     python3 -c "import sys; p=sys.argv[1]; f=open(p); src=f.read(); f.close(); old='\tif (!await tryWriteSingleTopLevelIncludeMutation({\n\t\tsnapshot,\n\t\tnextConfig: params.nextConfig\n\t})) await writeConfigFile(params.nextConfig, {\n\t\tbaseSnapshot: snapshot,\n\t\t...writeOptions,\n\t\t...params.writeOptions\n\t});'; new='\ttry { if (!await tryWriteSingleTopLevelIncludeMutation({\n\t\tsnapshot,\n\t\tnextConfig: params.nextConfig\n\t})) await writeConfigFile(params.nextConfig, {\n\t\tbaseSnapshot: snapshot,\n\t\t...writeOptions,\n\t\t...params.writeOptions\n\t}); } catch(_rcfErr) { if (process.env.OPENSHELL_SANDBOX === \"1\" && _rcfErr.code === \"EACCES\") { console.error(\"[nemoclaw] Config is read-only in sandbox \\u2014 plugin metadata not persisted (plugins auto-load from extensions/)\"); } else { throw _rcfErr; } }'; assert old in src, 'tryWriteSingleTopLevelIncludeMutation/writeConfigFile pattern not found in replaceConfigFile'; f=open(p,'w'); f.write(src.replace(old,new,1)); f.close()" "$rcf_file"; \
-    grep -REq --include='*.js' 'OPENSHELL_SANDBOX.*EACCES' "$rcf_file" || { echo "ERROR: Patch 4 (replaceConfigFile EACCES) not applied" >&2; exit 1; }
+    grep -REq --include='*.js' 'OPENSHELL_SANDBOX.*EACCES' "$rcf_file" || { echo "ERROR: Patch 4 (replaceConfigFile EACCES) not applied" >&2; exit 1; }; \
+    # Patch 5: memory-lancedb sends `dimensions` in the OpenAI embeddings \
+    # request whenever the config sets a non-default vector dim.  NVIDIA's \
+    # `integrate.api.nvidia.com/v1/embeddings` endpoint rejects that param \
+    # with `extra_forbidden`, breaking memory-lancedb against any NVIDIA \
+    # embedder.  The schema requires `dimensions` for unknown models so we \
+    # cannot just omit it from config — the LanceDB table init still needs \
+    # the vector size locally.  Strip the param at the API boundary. \
+    # \
+    # Drop when OpenClaw upstream gates the dimensions param by provider \
+    # capability (or when memory-lancedb adds a `provider: "nvidia"` profile). \
+    mlb_file="$OC_DIST/extensions/memory-lancedb/index.js"; \
+    test -r "$mlb_file" || { echo "ERROR: memory-lancedb plugin not found at $mlb_file" >&2; exit 1; }; \
+    sed -i 's|if (this\.dimensions) params\.dimensions = this\.dimensions;|/* nemoclaw: dimensions stripped for NVIDIA-compat */ void this.dimensions;|' "$mlb_file"; \
+    grep -q 'nemoclaw: dimensions stripped' "$mlb_file" || { echo "ERROR: Patch 5 (memory-lancedb dimensions strip) not applied" >&2; exit 1; }
 
 # Set up blueprint for local resolution.
 # Blueprints are immutable at runtime; DAC protection (root ownership) is applied
