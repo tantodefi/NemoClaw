@@ -123,9 +123,22 @@ cat <<'NEXT'
 
 ==> Next steps (run by hand on the operator host):
 
-  # Set the API keys the runner needs (per-kind):
-  gh secret set OPENAI_API_KEY     --repo tantodefi/chad-state --body "$YOUR_OPENAI_KEY"
-  gh secret set ANTHROPIC_API_KEY  --repo tantodefi/chad-state --body "$YOUR_ANTHROPIC_KEY"
+  # Set whatever provider keys you have. Provider routing in agent-job.yml:
+  #   codex / opencode  → OPENAI_API_KEY primary, NVIDIA_API_KEY fallback
+  #                       (NVIDIA path uses integrate.api.nvidia.com/v1
+  #                        OpenAI-compatible endpoint + Nemotron model)
+  #   claude            → ANTHROPIC_API_KEY only (Anthropic-only, no fallback)
+  #
+  # If you only set NVIDIA_API_KEY, codex / opencode kinds will work via
+  # the NVIDIA fallback path. claude kinds will fail until ANTHROPIC_API_KEY is set.
+
+  gh secret set NVIDIA_API_KEY     --repo tantodefi/chad-state --body "$YOUR_NVIDIA_KEY"
+  gh secret set OPENAI_API_KEY     --repo tantodefi/chad-state --body "$YOUR_OPENAI_KEY"     # optional
+  gh secret set ANTHROPIC_API_KEY  --repo tantodefi/chad-state --body "$YOUR_ANTHROPIC_KEY"  # optional
+
+  # Optional NVIDIA fallback overrides:
+  gh secret set NVIDIA_BASE_URL       --repo tantodefi/chad-state --body "https://integrate.api.nvidia.com/v1"
+  gh secret set NVIDIA_DEFAULT_MODEL  --repo tantodefi/chad-state --body "nvidia/nemotron-3-super-120b-a12b"
 
   # Verify the workflow exists:
   gh workflow list --repo tantodefi/chad-state | grep agent-job
@@ -135,6 +148,8 @@ cat <<'NEXT'
 
   # Test a gha-substrate spawn from inside Chad's sandbox:
   ssh openshell-chad 'echo "Write a haiku about a sandbox" > /tmp/t.md && \
-    chad-spawn --kind codex --task-file /tmp/t.md --substrate gha'
+    chad-spawn --kind codex --task-file /tmp/t.md'
+  # codex defaults to substrate=gha; the runner will pick OpenAI if
+  # OPENAI_API_KEY is set, NVIDIA otherwise.
 
 NEXT

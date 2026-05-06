@@ -11,12 +11,25 @@
 # Lives in tantodefi/chad-state/.github/workflows/. Installed by the
 # `chad-state-bootstrap` script (one-shot setup from the operator host).
 #
-# Required GitHub Actions secrets in chad-state:
-#   OPENAI_API_KEY     — for codex
-#   ANTHROPIC_API_KEY  — for claude (if claude kind is gha-substrate)
+# Provider routing:
+#   codex / opencode  → primary OPENAI_API_KEY, fallback NVIDIA_API_KEY
+#                        (NVIDIA path uses integrate.api.nvidia.com/v1
+#                        OpenAI-compatible endpoint + Nemotron model)
+#   claude            → ANTHROPIC_API_KEY only (no NVIDIA fallback)
+#
+# So you can set just NVIDIA_API_KEY and codex/opencode kinds will run.
+# claude kinds require ANTHROPIC_API_KEY since Anthropic-only.
+#
+# Optional GitHub Actions secrets in chad-state (set whichever you have):
+#   OPENAI_API_KEY     — codex / opencode (primary path)
+#   NVIDIA_API_KEY     — codex / opencode fallback; reuses Chad's nvapi-* key
+#   ANTHROPIC_API_KEY  — claude (no fallback; Anthropic-only)
+#   NVIDIA_BASE_URL    — override (default: https://integrate.api.nvidia.com/v1)
+#   NVIDIA_DEFAULT_MODEL — override (default: nvidia/nemotron-3-super-120b-a12b)
 #
 # Add via:
 #   gh secret set OPENAI_API_KEY     --repo tantodefi/chad-state --body "$KEY"
+#   gh secret set NVIDIA_API_KEY     --repo tantodefi/chad-state --body "$KEY"
 #   gh secret set ANTHROPIC_API_KEY  --repo tantodefi/chad-state --body "$KEY"
 
 name: agent-job
@@ -99,11 +112,69 @@ jobs:
           npm install -g @anthropic-ai/claude-code
           which claude
 
+      - name: Resolve provider + endpoint
+        id: provider
+        env:
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          NVIDIA_API_KEY:    ${{ secrets.NVIDIA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NVIDIA_BASE_URL:      ${{ secrets.NVIDIA_BASE_URL }}
+          NVIDIA_DEFAULT_MODEL: ${{ secrets.NVIDIA_DEFAULT_MODEL }}
+        run: |
+          set -e
+          binary="${{ steps.manifest.outputs.binary }}"
+          # Defaults for the NVIDIA fallback path
+          nv_base="${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}"
+          nv_model="${NVIDIA_DEFAULT_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
+
+          provider=""; reason=""
+          case "$binary" in
+            *codex*|*opencode*)
+              if [ -n "$OPENAI_API_KEY" ]; then
+                provider="openai"; reason="OPENAI_API_KEY set"
+              elif [ -n "$NVIDIA_API_KEY" ]; then
+                provider="nvidia"; reason="NVIDIA_API_KEY set (OPENAI_API_KEY absent)"
+              else
+                echo "::error::no key for $binary (need OPENAI_API_KEY or NVIDIA_API_KEY)"
+                exit 3
+              fi
+              ;;
+            *claude*)
+              if [ -n "$ANTHROPIC_API_KEY" ]; then
+                provider="anthropic"; reason="ANTHROPIC_API_KEY set"
+              else
+                echo "::error::claude needs ANTHROPIC_API_KEY (no NVIDIA fallback for claude — Anthropic-only)"
+                exit 3
+              fi
+              ;;
+            *)
+              # Unknown binary: best-effort with whatever's set, NVIDIA preferred
+              if [ -n "$NVIDIA_API_KEY" ]; then
+                provider="nvidia"; reason="unknown binary; NVIDIA_API_KEY set"
+              elif [ -n "$OPENAI_API_KEY" ]; then
+                provider="openai"; reason="unknown binary; OPENAI_API_KEY set"
+              elif [ -n "$ANTHROPIC_API_KEY" ]; then
+                provider="anthropic"; reason="unknown binary; ANTHROPIC_API_KEY set"
+              else
+                echo "::error::no provider keys set"; exit 3
+              fi
+              ;;
+          esac
+
+          {
+            echo "provider=$provider"
+            echo "reason=$reason"
+            echo "nvidia_base_url=$nv_base"
+            echo "nvidia_default_model=$nv_model"
+          } >> "$GITHUB_OUTPUT"
+          echo "Provider routing: $binary → $provider ($reason)"
+
       - name: Run sub-agent
         id: run
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NVIDIA_API_KEY:    ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           spawn_dir="${{ steps.validate.outputs.spawn_dir }}"
@@ -114,6 +185,21 @@ jobs:
             /usr/local/bin/opencode|/usr/bin/opencode) binary="$(which opencode)" ;;
             /usr/local/bin/claude|/usr/bin/claude)     binary="$(which claude)"   ;;
           esac
+
+          # Apply provider routing from the previous step. NVIDIA path
+          # uses the OpenAI-compatible endpoint at integrate.api.nvidia.com
+          # so any binary that honors OPENAI_BASE_URL (codex, opencode)
+          # transparently routes to NVIDIA inference.
+          provider="${{ steps.provider.outputs.provider }}"
+          if [ "$provider" = "nvidia" ]; then
+            export OPENAI_BASE_URL="${{ steps.provider.outputs.nvidia_base_url }}"
+            export OPENAI_API_KEY="$NVIDIA_API_KEY"
+            export OPENAI_DEFAULT_MODEL="${{ steps.provider.outputs.nvidia_default_model }}"
+            # codex / opencode also read these aliases in some versions
+            export OPENAI_API_BASE="$OPENAI_BASE_URL"
+            export OPENAI_MODEL="$OPENAI_DEFAULT_MODEL"
+            echo "Routing $binary -> NVIDIA at $OPENAI_BASE_URL (model: $OPENAI_DEFAULT_MODEL)"
+          fi
           if [ -z "$binary" ] || [ ! -x "$binary" ]; then
             echo '{"status":"failed","summary":"binary not installed on runner","exit_code":127}' \
               > "$spawn_dir/result.json"
@@ -154,6 +240,7 @@ jobs:
           AGENT_TASK_ID="${{ inputs.task_id }}" \
           AGENT_KIND="${{ steps.manifest.outputs.kind }}" \
           AGENT_EXIT="$exit_code" \
+          AGENT_PROVIDER="${{ steps.provider.outputs.provider }}" \
           AGENT_OUT="$spawn_dir/result.json" \
           python3 <<'PY'
           import json, os
@@ -173,10 +260,11 @@ jobs:
               }
           parsed.setdefault("status", "failed" if exit_code != 0 else "done")
           parsed.update({
-              "task_id": os.environ["AGENT_TASK_ID"],
-              "kind": os.environ["AGENT_KIND"],
+              "task_id":   os.environ["AGENT_TASK_ID"],
+              "kind":      os.environ["AGENT_KIND"],
               "exit_code": exit_code,
               "substrate": "gha",
+              "provider":  os.environ.get("AGENT_PROVIDER", "unknown"),
           })
           with open(os.environ["AGENT_OUT"], "w") as f:
               json.dump(parsed, f, indent=2)
@@ -202,6 +290,7 @@ jobs:
             echo
             echo "**Kind:** ${{ steps.manifest.outputs.kind }}"
             echo "**Binary:** ${{ steps.manifest.outputs.binary }}"
+            echo "**Provider:** ${{ steps.provider.outputs.provider }} — ${{ steps.provider.outputs.reason }}"
             echo "**Branch:** \`${{ inputs.branch }}\`"
             echo "**Exit:** ${{ steps.run.outputs.exit_code }}"
             echo

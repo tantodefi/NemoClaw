@@ -171,6 +171,36 @@ would free Chad's local cycles AND give the curator more reasoning
 depth than embedded Nemotron offers. Keep this in mind when Phase B
 lands — the curator could be the first non-stub gha-substrate consumer.
 
+## Provider routing in the gha runner
+
+Chad's primary inference is NVIDIA Nemotron via
+`integrate.api.nvidia.com/v1` (OpenAI-compatible endpoint). The
+agent-job runner uses that as a fallback so the substrate works even
+without OpenAI / Anthropic keys configured:
+
+| Binary | Primary | Fallback | Notes |
+|---|---|---|---|
+| `codex` | `OPENAI_API_KEY` | `NVIDIA_API_KEY` via OpenAI-compat | Sets `OPENAI_BASE_URL` + `OPENAI_DEFAULT_MODEL` (Nemotron) |
+| `opencode` | `OPENAI_API_KEY` | `NVIDIA_API_KEY` via OpenAI-compat | Same env override pattern |
+| `claude` | `ANTHROPIC_API_KEY` | **none** | Anthropic-only; fails fast if missing |
+| (unknown) | best-effort | `NVIDIA_API_KEY` first | Generic OpenAI-compat path tried |
+
+The "Resolve provider + endpoint" step in `agent-job.yml` picks at run
+time: if `OPENAI_API_KEY` is set use it, else fall back to
+`NVIDIA_API_KEY` with `OPENAI_BASE_URL` pointing at
+`integrate.api.nvidia.com/v1` and `OPENAI_DEFAULT_MODEL` set to the
+configured Nemotron model. Result.json carries the resolved provider
+back to Chad so chad-collect knows which model produced the output.
+
+This matches Chad's host-side inference posture: the same
+`NVIDIA_API_KEY` Chad already has in `/sandbox/.nemoclaw/credentials.json`
+can be re-used as a chad-state GHA secret with no additional account
+setup. For coding work specifically: codex's responses API may not be
+fully supported by NVIDIA's OpenAI-compat endpoint — the operator will
+get a clear error from the binary if so, at which point setting
+`OPENAI_API_KEY` upgrades the path to real OpenAI without changing
+anything else.
+
 ## Open questions
 
 1. **Secret management.** Anthropic / OpenAI keys in GitHub Actions
