@@ -47,6 +47,7 @@ timeout_secs=""
 budget_tokens=""
 dry_run=0
 override_id=""
+substrate_override=""
 
 usage() {
   cat <<'EOF'
@@ -61,6 +62,9 @@ Options:
   --budget-tokens N      override the kind default token budget
   --dry-run              don't execute the sub-agent, write a synthetic result
   --id ID                override the generated task id
+  --substrate S          execution substrate: local (in-container) or gha
+                         (GitHub Actions runner). Overrides the kind
+                         manifest's `substrate` field. Default: local.
   -h, --help             show this help
 EOF
   exit 2
@@ -76,6 +80,7 @@ while [ "$#" -gt 0 ]; do
     --budget-tokens) budget_tokens="$2"; shift 2 ;;
     --dry-run)       dry_run=1; shift ;;
     --id)            override_id="$2"; shift 2 ;;
+    --substrate)     substrate_override="$2"; shift 2 ;;
     -h|--help)       usage ;;
     *) echo "chad-spawn: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -155,6 +160,7 @@ fields = [
     ("network_policy_preset", ""),
     ("default_timeout",       600),
     ("default_budget_tokens", 20000),
+    ("substrate",             "local"),
 ]
 for k, default in fields:
     print(f"manifest_{k}={shlex.quote(str(m.get(k, default)))}")
@@ -316,11 +322,79 @@ PY
   exit 0
 fi
 
+# ── Resolve effective substrate ────────────────────────────────────
+# CLI --substrate wins, then kind manifest's `substrate` field, then
+# default "local". Validate to avoid passing garbage to the dispatcher.
+effective_substrate="${substrate_override:-${manifest_substrate:-local}}"
+case "$effective_substrate" in
+  local|gha) ;;
+  *) echo "chad-spawn: invalid substrate: $effective_substrate (must be local|gha)" >&2; exit 2 ;;
+esac
+
 # ── Run the sub-agent ──────────────────────────────────────────────
 ledger_append running
 
 stdout_log="${workdir}/stdout.log"
 stderr_log="${workdir}/stderr.log"
+
+if [ "$effective_substrate" = "gha" ]; then
+  # GHA substrate: chad-spawn-gha handles branch push, workflow_dispatch,
+  # poll for result.json, copy back. Sync mode (matches local contract).
+  # See docs/design/spawn-as-github-run.md for the architecture.
+  set +e
+  CHAD_GHA_TASK_ID="$task_id" \
+  CHAD_GHA_KIND="$kind" \
+  CHAD_GHA_WORKDIR="$workdir" \
+  CHAD_GHA_RESULT_FILE="$result_file" \
+  CHAD_GHA_PROMPT_FILE="$prompt_file" \
+  CHAD_GHA_TASK_FILE="$task_file" \
+  CHAD_GHA_MANIFEST_FILE="$manifest_file" \
+  CHAD_GHA_BINARY="$manifest_binary" \
+  CHAD_GHA_INVOCATION="$manifest_invocation" \
+  CHAD_GHA_TIMEOUT="$timeout_secs" \
+  CHAD_GHA_BUDGET_TOKENS="$budget_tokens" \
+    "${ORCH_DIR}/scripts/chad-spawn-gha.sh"
+  helper_rc=$?
+  set -e
+
+  # On helper failure with no result.json, synthesize one so chad-collect
+  # has something to merge. On success, the helper has already populated
+  # result.json from the runner's commit.
+  if [ "$helper_rc" -ne 0 ] && [ ! -s "$result_file" ]; then
+    CHAD_GHA_RC="$helper_rc" \
+    CHAD_GHA_TID="$task_id" \
+    CHAD_GHA_KND="$kind" \
+    CHAD_GHA_OUT="$result_file" \
+    CHAD_GHA_ERR="$stderr_log" \
+    python3 <<'PY'
+import os, json
+json.dump({
+    "status": "failed",
+    "task_id": os.environ["CHAD_GHA_TID"],
+    "kind": os.environ["CHAD_GHA_KND"],
+    "exit_code": int(os.environ["CHAD_GHA_RC"]),
+    "substrate": "gha",
+    "summary": f"chad-spawn-gha helper failed (exit {os.environ['CHAD_GHA_RC']}); see {os.environ['CHAD_GHA_ERR']}",
+}, open(os.environ["CHAD_GHA_OUT"], "w"), indent=2)
+PY
+  fi
+
+  exit_code="$(CHAD_GHA_RES="$result_file" python3 -c '
+import json, os, sys
+try:
+    print(json.load(open(os.environ["CHAD_GHA_RES"])).get("exit_code", 0))
+except Exception:
+    print(1)
+' 2>/dev/null || echo "$helper_rc")"
+
+  final_status="done"
+  [ "$exit_code" -eq 0 ] || final_status="failed"
+  ledger_append "$final_status"
+  echo "$task_id"
+  exit "$exit_code"
+fi
+
+# Local substrate: existing in-container execution path.
 export CHAD_RESULT_WORKDIR="$workdir"
 export CHAD_TASK_ID="$task_id"
 

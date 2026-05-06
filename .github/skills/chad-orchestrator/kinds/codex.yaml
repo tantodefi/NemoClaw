@@ -17,12 +17,19 @@
 # the binary exists, chad-spawn will fail-fast with a useful message.
 
 kind: codex
-description: "OpenAI Codex CLI as alternate code/research backend. Brain-first like other kinds. Stub: requires codex binary at /usr/local/bin/codex."
+description: "OpenAI Codex CLI as alternate code/research backend. Brain-first like other kinds. Default substrate: gha (runs on a GitHub Actions runner — no in-sandbox codex binary required). Override with `chad-spawn --substrate local` if a local codex binary is installed."
 
 binary: /usr/local/bin/codex
 invocation: prompt-stdin
 
 network_policy_preset: subagent-codex
+
+# Default execution substrate. `gha` runs the kind on a GitHub Actions
+# runner (popebot-style, see docs/design/spawn-as-github-run.md) so we
+# don't need codex installed in the sandbox image. Override per-spawn
+# with `chad-spawn --substrate local` (requires the binary above to
+# exist in the sandbox).
+substrate: gha
 
 default_timeout: 600
 default_budget_tokens: 50000
