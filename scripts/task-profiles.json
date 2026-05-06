@@ -86,7 +86,27 @@
       "thinking": "off",
       "minBudgetTokens": 5000,
       "schedule": "0 4 * * 1",
-      "reason": "Weekly Monday 04:00 UTC — wrapper computes p95 telemetry per task and writes a markdown recommendation report to memory/feedback-proposals.md. Agent only confirms the wrapper printed a summary. Pure shell+python work, minimal token cost. Inherits model from registry default."
+      "reason": "Weekly Monday 04:00 UTC — wrapper computes p95 telemetry per task and writes a markdown recommendation report (plus a structured JSON block consumed by chad-proposal-apply) to memory/feedback-proposals.md. Agent only confirms the wrapper printed a summary. Pure shell+python work, minimal token cost. Inherits model from registry default."
+    },
+
+    "chad-proposal-apply": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 60,
+      "thinking": "off",
+      "minBudgetTokens": 5000,
+      "schedule": "30 4 * * *",
+      "reason": "Daily 04:30 UTC — closes the autonomy loop on cron telemetry. Reads the latest structured proposals JSON block from feedback-proposals.md, validates each entry against the safe-list (timeoutSeconds | maxOutputTokens, ±2× bound, last-run ok, gated by chad-action-gate chad_self_modify_cron), applies via `openclaw cron edit`, and appends an `## Applied` block. Anything riskier stays draft-only. Pure shell+python work, no LLM call inside the wrapper — agent only confirms the printed summary. Inherits model from registry default."
+    },
+
+    "chad-skill-watch": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 60,
+      "thinking": "off",
+      "minBudgetTokens": 5000,
+      "schedule": "0 9 * * *",
+      "reason": "Daily 09:00 UTC — diffs `openclaw skills list --json` against /sandbox/.openclaw-data/state/skills-snapshot.json and surfaces added/removed/changed skills into todays memory file. Closes the gap where new gstack skills land silently and chad keeps using older patterns until manually told. Pure shell+python work, no LLM call inside the wrapper. Inherits model from registry default."
     },
 
     "issue-triage-researcher-subagent": {

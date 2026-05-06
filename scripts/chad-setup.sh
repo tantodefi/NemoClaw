@@ -351,7 +351,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve; do
+      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve chad-proposal-apply chad-skill-watch; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -830,13 +830,42 @@ if [ "$skip_crons" -eq 0 ]; then
   # to memory/feedback-proposals.md. Light-touch — wrapper is shell+python,
   # cron payload only acks the summary line. See task-profiles.json for the
   # canonical schedule (0 4 * * 1 = Mon 04:00 UTC).
-  budget_audit_message='Run `chad-budget-audit`. The wrapper computes p95 telemetry per cron, compares against task-profiles.json, and writes a recommendation block to memory/feedback-proposals.md. Confirm it printed `budget-audit: N findings, M crons, ...`, then exit. Do NOT apply any recommendations — they are reviewed by a human.'
+  budget_audit_message='Run `chad-budget-audit`. The wrapper computes p95 telemetry per cron, compares against task-profiles.json, and writes a recommendation block to memory/feedback-proposals.md. Confirm it printed `budget-audit: N findings, M applies, K crons, ...`, then exit. Do NOT apply any recommendations — chad-proposal-apply consumes the structured JSON block.'
 
   if echo "$existing_crons" | grep -q "chad-budget-audit"; then
     warn "chad-budget-audit cron already registered — skipping"
   else
     info "Registering chad-budget-audit cron (weekly Mon 04:00 UTC)"
     register_cron_via_ssh "chad-budget-audit" "0 4 * * 1" "" "$budget_audit_message"
+  fi
+
+  # Daily proposal-applier: closes the autonomy loop on cron telemetry
+  # by applying the safe-list of structured proposals (timeoutSeconds /
+  # maxOutputTokens within ±2× bounds, last-run ok). Anything riskier
+  # stays draft-only. Gated by chad-action-gate. Runs daily 04:30 UTC,
+  # right after the Mon 04:00 budget audit and 90m ahead of the 06:00
+  # email-check window.
+  proposal_apply_message='Run `chad-proposal-apply`. The wrapper reads the latest structured `### Proposals (machine-readable)` block from feedback-proposals.md, validates each entry against the safe-list, applies via `openclaw cron edit`, and appends an `## Applied` block. Confirm it printed `chad-proposal-apply: applied=N skipped=M`, then exit.'
+
+  if echo "$existing_crons" | grep -q "chad-proposal-apply"; then
+    warn "chad-proposal-apply cron already registered — skipping"
+  else
+    info "Registering chad-proposal-apply cron (daily 04:30 UTC)"
+    register_cron_via_ssh "chad-proposal-apply" "30 4 * * *" "" "$proposal_apply_message"
+  fi
+
+  # Daily skill-watch: diffs `openclaw skills list --json` against a
+  # snapshot. New skills are surfaced under "## Skill catalog diff" in
+  # today's memory file so the signal-detector skill picks them up on
+  # the next reasoning cycle. Closes the gap where new gstack skills
+  # land silently and chad keeps using older patterns.
+  skill_watch_message='Run `chad-skill-watch`. The wrapper diffs the registered skill catalog against /sandbox/.openclaw-data/state/skills-snapshot.json and surfaces any added/removed/changed skills into todays memory. Confirm it printed `chad-skill-watch: +N -M ~K (total X skills)`, then exit.'
+
+  if echo "$existing_crons" | grep -q "chad-skill-watch"; then
+    warn "chad-skill-watch cron already registered — skipping"
+  else
+    info "Registering chad-skill-watch cron (daily 09:00 UTC)"
+    register_cron_via_ssh "chad-skill-watch" "0 9 * * *" "" "$skill_watch_message"
   fi
 
   # Idempotent migration: pre-existing crons (registered before --no-deliver
@@ -847,7 +876,7 @@ if [ "$skip_crons" -eq 0 ]; then
     info "Patching existing crons to --no-deliver --best-effort-deliver"
     # shellcheck disable=SC2029
     ssh "$REMOTE_HOST" '
-      for name in email-check workspace-backup gbrain-dream issue-triage self-improve chad-budget-audit; do
+      for name in email-check workspace-backup gbrain-dream issue-triage self-improve chad-budget-audit chad-proposal-apply chad-skill-watch; do
         id="$(openclaw cron list 2>/dev/null | awk -v n="$name" "\$2==n {print \$1}")"
         if [ -n "$id" ]; then
           openclaw cron edit "$id" --no-deliver --best-effort-deliver >/dev/null 2>&1 || true

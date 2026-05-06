@@ -128,7 +128,7 @@ chad-workflow-batch \
 
 **Variants** live at `/usr/local/share/chad/prompt-variants/<name>/chad-drafter` (alternate drafter binaries). The sentinel `current` resolves to the deployed `/usr/local/bin/chad-drafter`. Variants without a binary are recorded as `skipped`, not raised — so adding a candidate is non-disruptive.
 
-**Samples** absorb model nondeterminism (k2.5 with reasoning ON has nontrivial variance). The aggregator averages within `(fixture, variant, model)` cells across samples.
+**Samples** absorb model nondeterminism (Nemotron 3 Super 120B with reasoning ON has nontrivial variance, as did Kimi K2.5 before it was deprecated 2026-04-29). The aggregator averages within `(fixture, variant, model)` cells across samples.
 
 **Output layout** per run:
 ```text

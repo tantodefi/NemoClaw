@@ -347,21 +347,27 @@ sandbox.
 
 **Tier 1 — openclaw reasoning skills (sandbox-safe, synced by chad-setup.sh)**
 
-Four pure-text SKILL.md files from `garrytan/gstack`'s `openclaw/skills/`
-directory. No browser daemon, no Bun binary, no Chromium. Just structured
-reasoning frameworks the agent can invoke in-session:
+The full canonical 40-skill OpenClaw-adapter bundle from
+`garrytan/gstack`'s `.openclaw/skills/` directory — no browser daemon, no
+Bun binary, no Chromium. Structured reasoning frameworks the agent can
+invoke in-session. Names dropped the `gstack-openclaw-` prefix and use
+the canonical `gstack-<verb>` shape (e.g. `gstack-investigate`,
+`gstack-ceo-review`, `gstack-qa`, `gstack-ship`, `gstack-review`,
+`gstack-retro`, `gstack-canary`, `gstack-cso`, `gstack-design-review`,
+`gstack-plan-eng-review`, `gstack-land-and-deploy`, `gstack-health`,
+`gstack-context-save`/`-restore`, `gstack-freeze`/`-unfreeze`,
+`gstack-document-release`, `gstack-make-pdf`, `gstack-codex`, …). The
+full list is enumerated in
+[docs/operations/chad-skills.md](docs/operations/chad-skills.md).
 
-| Skill | When to use |
-|---|---|
-| `gstack-openclaw-ceo-review` | Challenge a plan, expand or reduce scope, find landmines |
-| `gstack-openclaw-investigate` | Root-cause debugging — no fix before diagnosis |
-| `gstack-openclaw-office-hours` | Evaluate an idea before writing any code |
-| `gstack-openclaw-retro` | Weekly engineering retrospective from commit history |
-
-`chad-setup.sh` syncs these from `~/.claude/skills/gstack/openclaw/skills/`
-on the host into `/sandbox/.openclaw-data/skills/` in the sandbox. If
-gstack is not installed on the host the step warns and skips — it is not
-a hard dependency.
+`chad-setup.sh` syncs these from `~/.claude/skills/gstack/.openclaw/skills/`
+(note the dot-prefix — that's the canonical host-adapter dir, alongside
+`.cursor`, `.opencode`, `.agents`, etc., kept current by
+`gstack-upgrade`) into `/sandbox/.openclaw-data/skills/` in the sandbox.
+The setup script also prunes any legacy `gstack-openclaw-*` dirs from a
+previous 4-skill sync so they don't ship as duplicates of the canonical
+names. If gstack is not installed on the host the step warns and skips —
+it is not a hard dependency.
 
 Install gstack on the host once:
 ```bash
@@ -515,21 +521,32 @@ a reply as "needs-research + draft-reply" and spawn both a `researcher`
 and a `writer` in one shot. `issue-triage` is how a human-curated GitHub
 issue turns into a triage plan without Chad having to poll all day.
 
-### 7.1 Wrapper-only invariant (K2.5 caveat) and the hybrid Phase-2 inference path
+### 7.1 Wrapper-only invariant (legacy K2.5 caveat) and the hybrid Phase-2 inference path
 
 `openclaw cron` runs in **isolated sessions** that re-tokenize the full
 prompt every fire and don't inherit the interactive shell's env. Two
 consequences:
 
-1. **Cron prompts must be one-line wrapper invocations.** Multi-step
-   prompts trigger K2.5's multi-turn tool-call regression, which has
-   produced runs of 550k input tokens / 691s. Every cron message looks
-   like: *"Run `<wrapper>`. Confirm it printed `<sentinel line>`, then
-   exit. Do not …"*
+1. **Cron prompts must be one-line wrapper invocations.** Originally this
+   was forced by Kimi K2.5's multi-turn tool-call regression (550k input
+   tokens / 691s on a single fire). Kimi K2.5 was deprecated 2026-04-29;
+   the default now is `nvidia/nemotron-3-super-120b-a12b`, which is
+   `reasoningSafe=true`. The wrapper-only invariant still stands because
+   nemotron-3-super on the embedded path is slow, and re-tokenizing a
+   long instruction every cron tick is expensive regardless of model.
+   Every cron message looks like: *"Run `<wrapper>`. Confirm it printed
+   `<sentinel line>`, then exit. Do not …"*
 2. **Slow work goes via `nohup … & disown` inside the wrapper.** The
    wrapper returns within 1–60s; the actual work writes its result into
    `memory/<today>.md` for the next cron tick to read. `chad-workspace-backup`
    is the canonical example.
+3. **Cron jobs are registered with `--no-deliver --best-effort-deliver`.**
+   The chad sandbox's `messagingChannels` list is empty (no Telegram /
+   Discord bound), so the gateway's default delivery path returns an
+   error per fire and gates the run as `failed`. Disable delivery globally
+   — the wrapper's stdout sentinel is the cron's ack, not a deliverable.
+   `chad-setup.sh` registers every chad-owned cron with these flags and
+   patches pre-existing crons on every run (idempotent).
 
 The wrappers themselves live at `scripts/chad-cron-wrappers/` and are
 deployed to `/usr/local/bin/` by `chad-setup.sh`. Each wrapper is its own
@@ -551,8 +568,10 @@ inbox or the issue queue. Chad recovers it with a two-phase design:
   parked items that warrant thought, it shells out to
   `chad-phase2-draft-replies` for one assistant turn:
   - No MCP servers attached, no tools defined, prompt explicitly
-    forbids tool use → K2.5 multi-turn regression cannot fire because
-    there's nothing to round-trip.
+    forbids tool use → there's nothing to round-trip, so any model's
+    multi-turn tool-call regression (K2.5 was the original hazard;
+    Nemotron 3 Super 120B is `reasoningSafe=true` but the no-tools
+    invariant survives as cheap insurance) cannot fire.
   - Reasoning ON for max intelligence (per profile, currently `high`).
   - Output is a strict JSON object validated by a tolerant
     balanced-brace extractor; failure mode is a no-op.
@@ -569,18 +588,20 @@ min-budget floor, and whether premium routing is allowed.
 
 This is how the system gets the "full inference quality" feel back
 without re-introducing the multi-turn regression: the cron payload stays
-a dumb harness call (thinking off, tools on, K2.5-safe), and the heavy
-thinking happens in the single-turn helper (thinking high, tools off,
-K2.5-safe).
+a dumb harness call (thinking off, tools on, reasoning-safe model), and
+the heavy thinking happens in the single-turn helper (thinking high,
+tools off, no round-trip surface to fail on).
 
 ---
 
 ## 7.2 Premium escalation (Anthropic outsource)
 
-Chad's primary inference is K2.5 via the NVIDIA "nemotron-3-super-120b"
-endpoint. For tasks that K2.5 can't reliably do (multi-turn coding,
-complex reasoning), Chad can escalate to Claude Opus through a tightly
-gated wrapper.
+Chad's primary inference is `nvidia/nemotron-3-super-120b-a12b` via the
+NVIDIA Endpoints free tier (Kimi K2.5 was the previous default; deprecated
+2026-04-29 — see [docs/inference/providers.md](docs/inference/providers.md)
+for the migration note). For tasks where Nemotron's review or reasoning
+depth feels shallow (multi-turn coding, deep architecture sketches), Chad
+can escalate to Claude Sonnet/Opus through a tightly gated wrapper.
 
 | Component | Path | Purpose |
 |---|---|---|

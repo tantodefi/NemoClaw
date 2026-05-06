@@ -412,6 +412,36 @@ by anyone who can chat. **Do not add `proton-tool` or any wrapper from
 `scripts/chad-cron-wrappers/` to this surface** without first auditing the
 input handling. Read-only `gbrain` is the conservative default.
 
+## SQLite journal mode (WAL → DELETE)
+
+`open-webui` stores users, chats, and config in `webui.db` (SQLite). On
+Docker Desktop's macOS bind-mount (the "fakeowner" filesystem), upstream's
+default WAL journal mode produces `SQLITE_IOERR` on both reads and writes.
+The lookup-by-email path (`Users.get_user_by_email`) silently swallowed
+the exception, fell through to a fresh signup, and 401'd every browser
+request — so the front-end loop looked like a Cloudflare Access mismatch
+when the actual cause was disk I/O on the bind-mount.
+
+Fix (commit 553d6ce1): `docker-compose.yml` sets
+`DATABASE_ENABLE_SQLITE_WAL: "False"`, forcing the original SQLite
+DELETE journal mode. DELETE works everywhere, including macOS
+bind-mounts, and the perf delta on `webui.db`'s workload (a handful of
+writes per session) is in the noise.
+
+If you see `SQLITE_IOERR`, repeated 401s after a successful Cloudflare
+Access OTP, or "fresh signup" prompts for an already-provisioned admin,
+verify the env var is still `False` in the running container:
+
+```console
+$ docker exec nemoclaw-openwebui env | grep WAL
+DATABASE_ENABLE_SQLITE_WAL=False
+```
+
+Do not flip this back to `True` on a bind-mounted host. If you move
+`webui.db` onto a real Linux ext4/xfs volume (e.g. inside a VM with no
+bind-mount), WAL becomes safe again — but on Docker Desktop for Mac,
+DELETE is the only sane setting.
+
 ## Failure modes
 
 | Symptom | Likely cause | Fix |

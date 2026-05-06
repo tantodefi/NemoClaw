@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-skill-watch — Daily diff of the registered skill catalog.
+#
+# Without this, when a new skill lands in /sandbox/.openclaw-data/skills/
+# (e.g., from a daily gstack-upgrade pulling the canonical .openclaw/skills
+# bundle), Chad has no in-band signal that he has a new tool. The static
+# routing tables in chad-route.sh and the prompt templates in
+# orchestrator/kinds/*.yaml never reference it, so the new skill sits
+# unused for weeks until a human notices.
+#
+# This wrapper diffs `openclaw skills list --json` against a snapshot at
+# /sandbox/.openclaw-data/state/skills-snapshot.json. New skills get an
+# entry under "## New skills (<ts>)" in today's memory file (with name,
+# description, source). Removed skills get listed too. The snapshot then
+# updates so subsequent runs are no-ops.
+#
+# The signal-detector skill (always-on per CLAUDE.md) sees the today
+# memory entry on Chad's next reasoning cycle and can mention the new
+# tool in any relevant follow-up.
+#
+# Registered as a daily cron by chad-setup.sh (09:00 UTC, between the
+# nightly dream and the morning email-check sweep).
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+SNAPSHOT_FILE="${CHAD_SKILLS_SNAPSHOT:-/sandbox/.openclaw-data/state/skills-snapshot.json}"
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+TS="$(date -u +%FT%TZ)"
+
+mkdir -p "$(dirname "$SNAPSHOT_FILE")"
+
+if ! command -v openclaw >/dev/null 2>&1; then
+  echo "chad-skill-watch: openclaw CLI not on PATH" >&2
+  exit 0
+fi
+
+# `openclaw skills list --json` returns {"skills":[{name,description,source,
+# status,...}]}. We project the four fields we care about.
+LIVE_FILE="$(mktemp)"
+trap 'rm -f "$LIVE_FILE"' EXIT
+
+if ! openclaw skills list --json 2>/dev/null > "$LIVE_FILE"; then
+  echo "chad-skill-watch: 'openclaw skills list --json' failed; nothing to compare"
+  exit 0
+fi
+
+SNAPSHOT_FILE="$SNAPSHOT_FILE" \
+LIVE_FILE="$LIVE_FILE" \
+MEMORY_FILE="$MEMORY_FILE" \
+TS="$TS" \
+python3 <<'PY'
+import json, os, sys
+
+snap_path = os.environ["SNAPSHOT_FILE"]
+live_path = os.environ["LIVE_FILE"]
+mem_path = os.environ["MEMORY_FILE"]
+ts = os.environ["TS"]
+
+def project(raw):
+    skills = raw if isinstance(raw, list) else (raw.get("skills") or raw.get("items") or [])
+    out = {}
+    for s in skills:
+        name = s.get("name")
+        if not name:
+            continue
+        out[name] = {
+            "description": (s.get("description") or "").strip().split("\n", 1)[0][:200],
+            "source": s.get("source") or "?",
+            "status": s.get("status") or "?",
+        }
+    return out
+
+try:
+    live = project(json.load(open(live_path)))
+except Exception as exc:
+    print(f"chad-skill-watch: live skills parse failed: {exc}")
+    sys.exit(0)
+
+prev = {}
+if os.path.exists(snap_path):
+    try:
+        prev = project(json.load(open(snap_path))) if os.path.getsize(snap_path) > 0 else {}
+    except Exception:
+        # Treat malformed snapshot as empty — first run + recovery path.
+        prev = {}
+
+added = sorted(set(live) - set(prev))
+removed = sorted(set(prev) - set(live))
+# Description drift: same name, different desc.
+changed = sorted(
+    n for n in (set(live) & set(prev))
+    if live[n]["description"] != prev[n]["description"]
+)
+
+# Always update the snapshot so this is idempotent across days.
+# Use raw live JSON so we don't lose fields outside our projection.
+with open(snap_path, "w") as f:
+    json.dump(json.load(open(live_path)), f, separators=(",", ":"))
+
+if not added and not removed and not changed:
+    print(f"chad-skill-watch: no changes ({len(live)} skills)")
+    sys.exit(0)
+
+block = [f"\n## Skill catalog diff — {ts}\n"]
+if added:
+    block.append(f"### Added ({len(added)})")
+    block.append("")
+    for n in added:
+        info = live[n]
+        block.append(f"- **{n}** ({info['source']}, {info['status']}) — {info['description']}")
+    block.append("")
+if removed:
+    block.append(f"### Removed ({len(removed)})")
+    block.append("")
+    for n in removed:
+        info = prev[n]
+        block.append(f"- **{n}** (was {info['source']}, {info['status']}) — {info['description']}")
+    block.append("")
+if changed:
+    block.append(f"### Description drift ({len(changed)})")
+    block.append("")
+    for n in changed:
+        block.append(f"- **{n}**")
+        block.append(f"  - was: {prev[n]['description']}")
+        block.append(f"  - now: {live[n]['description']}")
+    block.append("")
+
+with open(mem_path, "a") as f:
+    f.write("\n".join(block) + "\n")
+
+print(f"chad-skill-watch: +{len(added)} -{len(removed)} ~{len(changed)} (total {len(live)} skills)")
+PY

@@ -114,14 +114,26 @@ Source code lives in a separate repo (`tantodefi/NemoClaw`, public). See [Backup
 
 These run unattended via `openclaw cron`. Schedules and budgets live in [`scripts/task-profiles.json`](https://github.com/NVIDIA/NemoClaw/blob/main/scripts/task-profiles.json). Every wrapper appends its result to the day's memory file (`memory/<YYYY-MM-DD>.md`).
 
+> **Cron registration flags.** Every chad-owned cron is registered with
+> `--no-deliver --best-effort-deliver`. The chad sandbox's
+> `messagingChannels` list is empty (no Telegram/Discord/etc bound), so
+> the gateway's default delivery path returns an error per fire and gates
+> the run as `failed`. Disabling delivery globally is load-bearing — the
+> wrapper's stdout sentinel ("X completed") is the cron's ack, not a
+> deliverable. `chad-setup.sh` registers new crons with these flags and
+> patches pre-existing crons via `openclaw cron edit` on every run
+> (idempotent).
+
 | Wrapper | Schedule | What it does |
 |---|---|---|
 | `chad-email-check-cron` | `0 2,6-23 * * *` | Sweeps the inbox via `chad-mail-check`, batch-marks-read low-signal mail, parks remainder under `### Pending replies` for human review. Optionally invokes `chad-drafter` (single-turn LLM, no MCP/tools) and routes drafts through `chad-autosend-replies`. |
 | `chad-issue-triage-cron` | `0 10 * * *` | Reads top-N open issues from `${CHAD_BUG_REPO}`, runs the drafter for triage decisions (skip/comment-draft/close-stale), then detaches researcher/coder sub-agents for the highest-priority items. |
 | `chad-workspace-backup` | `0 */6 * * *` | Wraps `chad-backup-to-github` and detaches the slow git push so the cron payload returns in <1s. |
-| `chad-gbrain-dream` | `30 3 * * *` | Nightly embed-stale + extract-graph + extract-timeline against the gbrain. Detached. |
-| `chad-budget-audit` | `0 4 * * 1` | Weekly Monday: computes p95 telemetry per task vs. `task-profiles.json` and writes recommendations to `memory/feedback-proposals.md`. |
-| `chad-self-improve` | `0 3 * * 0` | Weekly Sunday: runs `chad-self-improve --days 7` and pastes proposals under `## Self-improvement`. |
+| `chad-gbrain-dream` | `30 3 * * *` | Nightly embed-stale + extract-graph + extract-timeline against the gbrain. Detached. Also writes `memory/dream-digest-<date>.md` (24h delta + doctor + stats) and, when doctor reports anomalies, `memory/feedback_brain_health_<date>.md` so the next self-improve sees recurring brain-health issues. |
+| `chad-budget-audit` | `0 4 * * 1` | Weekly Monday: computes p95 telemetry per task vs. `task-profiles.json`, writes prose recommendations and a structured `### Proposals (machine-readable)` JSON block to `memory/feedback-proposals.md`. |
+| `chad-self-improve` | `0 3 * * 0` | Weekly Sunday: reads last 7 days of subagent results, `openclaw cron runs` failures per cron, `auto-action-log.jsonl` errors, outstanding proposals; spawns researcher to draft 1–3 durable improvements under `## Self-improvement` in `feedback-proposals.md`. |
+| `chad-proposal-apply` | `30 4 * * *` | Daily 04:30 UTC: closes the autonomy loop on cron telemetry. Reads the latest structured proposals JSON block from `feedback-proposals.md`, validates each entry against the safe-list (`timeoutSeconds`/`maxOutputTokens` within ±2× bounds, last-run ok, gated by `chad-action-gate chad_self_modify_cron`), applies via `openclaw cron edit`, appends an `## Applied` block. Anything riskier stays draft-only. |
+| `chad-skill-watch` | `0 9 * * *` | Daily 09:00 UTC: diffs `openclaw skills list --json` against `/sandbox/.openclaw-data/state/skills-snapshot.json`, surfaces added/removed/changed skills under `## Skill catalog diff` in today's memory. Closes the gap where new gstack skills land silently and chad keeps using older patterns. |
 
 ### Inference / drafting / sending
 
@@ -143,6 +155,32 @@ These run unattended via `openclaw cron`. Schedules and budgets live in [`script
 | `chad-dump-logs` | Tarball of recent gateway/cron/sub-agent logs. See [Log Locations](log-locations.md). |
 | `_chad-paths.sh` | Sourced by every wrapper. Defines `OPENCLAW_DATA`, `WORKSPACE`, `CRED_FILE`, etc. Single source of truth for filesystem paths. |
 | `auto-actions.template.json` | Template `auto-actions.json` deployed when `chad-setup.sh` finds no existing one. Holds per-channel daily counters and the kill-switch. |
+
+## Skill discovery and MCP wiring
+
+`chad-setup.sh` does two registration steps that aren't obvious from the
+script catalog above:
+
+- **Skills** land in `/sandbox/.openclaw-data/skills/` (sandbox-writable,
+  survives openclaw upgrades) and are registered via
+  `openclaw config set skills.load.extraDirs '["/sandbox/.openclaw-data/skills"]'`.
+  Without that registration, OpenClaw's `loadSkillEntries` only scans the
+  managed dirs (`/sandbox/.openclaw/skills/`, `/sandbox/.agents/skills/`,
+  workspace `.agents/skills/`, workspace `skills/`), skills exist on disk
+  but never appear in `openclaw skills list`, the dashboard, or the
+  agent's `<available_skills>` prompt block. The registration is
+  idempotent — `chad-setup.sh` runs it on every invocation.
+- **Gbrain MCP** is registered persistently via
+  `openclaw mcp set gbrain '{"command":"gbrain","args":["serve"]}'` in
+  `/sandbox/.openclaw/openclaw.json`. Every `openclaw agent` session
+  thereafter has `mcp_gbrain_search` / `mcp_gbrain_put_page` available
+  with no per-spawn flags. The old `--mcp-server gbrain gbrain serve`
+  flag was dropped from `chad-spawn.sh` — it isn't supported in
+  openclaw 2026.4.x.
+
+For the full skill catalog see [chad-skills.md](chad-skills.md). For the
+autonomy loops Chad runs on top of these skills see
+[chad-autonomy.md](chad-autonomy.md).
 
 ## State Locations Cheat-Sheet
 
@@ -186,3 +224,5 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 - [Open WebUI Front-End](openwebui.md) — chat UI exposed via Cloudflare Tunnel + Access
 - [Workflow Scenarios](chad-workflows.md) — named email scenarios + regression spec
 - [Log Locations](log-locations.md) — where each log stream lives
+- [Chad Autonomy Loops](chad-autonomy.md) — the five self-driving loops, two known gaps, and recommended next wrappers
+- [Chad Skills Catalog](chad-skills.md) — all 48 registered skills grouped by source

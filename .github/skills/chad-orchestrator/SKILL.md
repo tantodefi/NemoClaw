@@ -52,19 +52,29 @@ network policy preset under `nemoclaw-blueprint/policies/presets/`.
 
 ## GBrain Integration
 
-All `openclaw-agent` kinds (`researcher`, `writer`, `reviewer`) get the
-gbrain MCP server registered automatically when `gbrain` is on `$PATH`:
+All `openclaw-agent` kinds (`researcher`, `writer`, `reviewer`) inherit
+the gbrain MCP server because it is registered persistently in the
+sandbox's `openclaw.json` by `chad-setup.sh`:
 
 ```bash
-openclaw agent --agent main --local \
-  --session-id "sub-<id>" \
-  --mcp-server gbrain gbrain serve \
-  -m "<prompt>"
+openclaw mcp set gbrain '{"command":"gbrain","args":["serve"]}'
 ```
 
-This means every sub-agent can call `gbrain query` and `gbrain put-page`
-via MCP tools without any extra setup. The `brain` kind uses gbrain CLI
-directly (no inference required for pure recall tasks).
+Every `openclaw agent` invocation thereafter has the gbrain MCP tools
+(`mcp_gbrain_search`, `mcp_gbrain_put_page`, …) available with no
+spawn-time flags required. `chad-spawn` now invokes:
+
+```bash
+env HOME=/sandbox \
+  openclaw agent --agent main --timeout "${timeout_secs}" \
+    --session-id "sub-<id>" \
+    -m "<prompt>"
+```
+
+The `--mcp-server` flag is **not** supported in openclaw 2026.4.x —
+gbrain lives in `openclaw.json` instead, and `--local` was dropped at
+the same time. The `brain` kind uses the gbrain CLI directly (no
+inference required for pure recall tasks).
 
 **Brain-first rule**: `researcher`, `coder`, and `reviewer` prompts all
 instruct the sub-agent to run `gbrain query` *before* any external API
@@ -73,19 +83,32 @@ doesn't pay the same research cost twice.
 
 ## GStack Workflow Skills
 
-GStack skills are available in the sandbox when synced by `chad-setup.sh`
-(to `/sandbox/.openclaw/skills/gstack/`). Sub-agent prompts mention the
-relevant skill but leave the choice to the agent:
+The full canonical 40-skill gstack OpenClaw-adapter bundle is synced by
+`chad-setup.sh` into `/sandbox/.openclaw-data/skills/` (chosen because
+that path is sandbox-writable and survives openclaw upgrades). The same
+script registers that directory as `skills.load.extraDirs` in
+`openclaw.json` so the dashboard, CLI listing, and agent's
+`<available_skills>` prompt block all see them. Skill names use the
+canonical `gstack-<verb>` shape (e.g. `gstack-investigate`,
+`gstack-qa`, `gstack-ship`, `gstack-review`, `gstack-ceo-review`,
+`gstack-retro`, `gstack-cso`, `gstack-canary`, …) — the legacy
+`gstack-openclaw-*` 4-skill subset is pruned on every sync.
+
+Sub-agent prompts mention the most relevant skill but leave the choice
+to the agent:
 
 | Kind | Relevant skills |
 |---|---|
 | `reviewer` | `/gstack-review` — structured role-based review (CEO/QA/security) |
-| `writer` | `/gstack-ceo`, `/gstack-ship` — for long-form docs or release notes |
+| `writer` | `/gstack-ceo-review`, `/gstack-ship` — for long-form docs or release notes |
 | `coder` | `/gstack-qa`, `/gstack-ship` — QA checklist + ship readiness |
 
 **When to skip gstack**: Quick patches, one-line email replies, and PR
 descriptions under 50 lines don't need gstack overhead. The prompt
 templates say "optional" and leave the call to the agent's judgment.
+
+For the full 40-skill catalog see
+[docs/operations/chad-skills.md](../../../docs/operations/chad-skills.md).
 
 ## Fan-Out Pattern (Multiple Similar Items)
 

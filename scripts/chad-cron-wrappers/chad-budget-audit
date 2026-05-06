@@ -86,6 +86,7 @@ def p95(xs):
     return int(s[f] if f == c else s[f] + (s[c] - s[f]) * (k - f))
 
 findings = []
+applies = []  # structured proposals consumed by chad-proposal-apply
 rows = []
 for cron in crons:
     name = cron.get("name") or ""
@@ -129,28 +130,60 @@ for cron in crons:
     if not profile:
         findings.append(f"- **{name}**: no profile in task-profiles.json — add one or rename to match")
         continue
+    # Applier safety gate: never propose changes for a cron that's
+    # currently failing. The error rate signal becomes a separate
+    # finding for the researcher loop, not a knob the applier turns.
+    last_status_ok = bool(statuses) and statuses[0] in ("ok", "completed", "success")
     max_out = int(profile.get("maxOutputTokens") or 0)
     timeout_ms = int(profile.get("timeoutSeconds") or 0) * 1000
     if max_out and pout and pout * 3 < max_out:
+        new_max = max(pout * 2, 256)
         findings.append(
             f"- **{name}**: maxOutputTokens={max_out} but p95 out is {pout} "
-            f"(< 33% used) — consider tightening to ~{max(pout * 2, 256)}"
+            f"(< 33% used) — consider tightening to ~{new_max}"
         )
+        if last_status_ok and new_max < max_out:
+            applies.append({
+                "cron": name, "field": "maxOutputTokens",
+                "old": max_out, "new": new_max,
+                "reason": f"p95 out {pout} < 33% of {max_out}",
+            })
     if max_out and out_toks and max(out_toks) >= int(max_out * 0.9):
+        new_max = int(max(out_toks) * 1.5)
         findings.append(
             f"- **{name}**: maxOutputTokens={max_out} but max observed is {max(out_toks)} "
             f"(≥ 90% used) — risk of truncation, raise"
         )
+        if last_status_ok and new_max > max_out:
+            applies.append({
+                "cron": name, "field": "maxOutputTokens",
+                "old": max_out, "new": new_max,
+                "reason": f"max obs {max(out_toks)} ≥ 90% of {max_out}",
+            })
     if timeout_ms and pdur and pdur * 3 < timeout_ms:
+        new_timeout = max(pdur * 2 // 1000, 30)
         findings.append(
             f"- **{name}**: timeoutSeconds={timeout_ms//1000}s but p95 dur is "
-            f"{pdur//1000}s (< 33% used) — consider tightening"
+            f"{pdur//1000}s (< 33% used) — consider tightening to ~{new_timeout}s"
         )
+        if last_status_ok and new_timeout < timeout_ms // 1000:
+            applies.append({
+                "cron": name, "field": "timeoutSeconds",
+                "old": timeout_ms // 1000, "new": new_timeout,
+                "reason": f"p95 dur {pdur//1000}s < 33% of {timeout_ms//1000}s",
+            })
     if timeout_ms and durs and max(durs) >= int(timeout_ms * 0.9):
+        new_timeout = int(max(durs) * 1.5 // 1000)
         findings.append(
             f"- **{name}**: timeoutSeconds={timeout_ms//1000}s but max dur is "
-            f"{max(durs)//1000}s (≥ 90% used) — risk of timeout"
+            f"{max(durs)//1000}s (≥ 90% used) — risk of timeout, raise to ~{new_timeout}s"
         )
+        if last_status_ok and new_timeout > timeout_ms // 1000:
+            applies.append({
+                "cron": name, "field": "timeoutSeconds",
+                "old": timeout_ms // 1000, "new": new_timeout,
+                "reason": f"max dur {max(durs)//1000}s ≥ 90% of {timeout_ms//1000}s",
+            })
     if n >= 10 and err_pct > 10:
         findings.append(f"- **{name}**: error rate {err_pct}% over last {n} runs — investigate")
 
@@ -206,6 +239,16 @@ lines.append("")
 lines.append("### Recommendations")
 lines.extend(findings if findings else ["- All crons within budget envelope."])
 
+# Structured proposals — consumed by chad-proposal-apply. Only entries
+# in the safe-list (timeoutSeconds | maxOutputTokens, last-run ok,
+# bounded multiplier) appear here. Anything else stays prose-only.
+lines.append("")
+lines.append("### Proposals (machine-readable)")
+lines.append("")
+lines.append("```json")
+lines.append(json.dumps({"applies": applies, "ts": ts}, separators=(",", ":")))
+lines.append("```")
+
 block = "\n".join(lines) + "\n"
 with open(memory_file, "a") as f:
     f.write(block)
@@ -221,6 +264,7 @@ else:
     out = header + new_block + ("\n" + prev if prev else "")
 open(proposals_file, "w").write(out)
 
-print(f"budget-audit: {len(findings)} findings, {len(rows)} crons, "
-      f"{len(premium_rows)} premium model×source rows, appended to {memory_file}")
+print(f"budget-audit: {len(findings)} findings, {len(applies)} applies, "
+      f"{len(rows)} crons, {len(premium_rows)} premium rows, "
+      f"appended to {memory_file}")
 PY

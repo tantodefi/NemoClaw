@@ -99,8 +99,9 @@ CHAD_SI_DAYS="$days" \
   CHAD_SI_SUBAGENTS_DIR="$SUBAGENTS_DIR" \
   CHAD_SI_WORKSPACE="$WORKSPACE" \
   CHAD_SI_TASK_FILE="$task_file" \
+  CHAD_SI_PROPOSALS_FILE="$PROPOSALS_FILE" \
   python3 <<'PY'
-import os, json, datetime, pathlib
+import os, json, subprocess, datetime, pathlib
 
 _UTC = getattr(datetime, "UTC", datetime.timezone.utc)
 days = int(os.environ["CHAD_SI_DAYS"])
@@ -109,6 +110,7 @@ queue_file = pathlib.Path(os.environ["CHAD_SI_QUEUE_FILE"])
 subagents = pathlib.Path(os.environ["CHAD_SI_SUBAGENTS_DIR"])
 workspace = pathlib.Path(os.environ["CHAD_SI_WORKSPACE"])
 task_path = pathlib.Path(os.environ["CHAD_SI_TASK_FILE"])
+proposals_file = pathlib.Path(os.environ["CHAD_SI_PROPOSALS_FILE"])
 
 def parse_ts(s):
     try:
@@ -156,7 +158,74 @@ if subagents.is_dir():
             except Exception:
                 pass
 
-# 3. Recent feedback memories (these are the *existing* rules; the
+# 3. Cron run failures (`openclaw cron runs --limit 50` per cron).
+# Without this signal, a 3-day silent cron outage produces zero
+# proposals — the chad-self-improve loop was deaf to its own
+# infrastructure failing.
+cron_failures = []
+try:
+    raw = subprocess.check_output(
+        ["openclaw", "cron", "list", "--json"],
+        stderr=subprocess.DEVNULL, text=True, timeout=15,
+    )
+    cl = json.loads(raw)
+    items = cl if isinstance(cl, list) else (cl.get("jobs") or cl.get("items") or [])
+    for cron in items:
+        cid, name = cron.get("id"), cron.get("name")
+        if not cid:
+            continue
+        try:
+            out = subprocess.check_output(
+                ["openclaw", "cron", "runs", "--id", cid, "--limit", "50"],
+                stderr=subprocess.DEVNULL, text=True, timeout=20,
+            )
+            runs_raw = json.loads(out)
+        except Exception:
+            continue
+        runs = runs_raw if isinstance(runs_raw, list) else (runs_raw.get("entries") or [])
+        bad = []
+        for r in runs:
+            if r.get("action") != "finished":
+                continue
+            ts = parse_ts(datetime.datetime.fromtimestamp(
+                r.get("ts", 0) / 1000, tz=_UTC).isoformat()) if r.get("ts") else None
+            if ts is None or ts < cutoff:
+                continue
+            status = r.get("status") or ""
+            if status not in ("ok", "completed", "success"):
+                bad.append({
+                    "ts": r.get("ts"),
+                    "status": status,
+                    "duration_ms": r.get("durationMs"),
+                    "error": (r.get("error") or "")[:200],
+                    "summary": (r.get("summary") or "")[:200],
+                })
+        if bad:
+            cron_failures.append({"cron": name, "fail_count": len(bad), "samples": bad[:3]})
+except Exception as exc:
+    cron_failures.append({"_error": f"could not list crons: {exc}"})
+
+# 4. Auto-action log failures (`auto-action-log.jsonl`). Errors
+# logged here (e.g., a github_comment that 4xx'd) won't show up in
+# subagent results — they're emitted directly by the wrappers.
+auto_failures = []
+log_path = pathlib.Path("/sandbox/.openclaw-data/state/auto-action-log.jsonl")
+if log_path.is_file():
+    for raw in log_path.read_text().splitlines()[-500:]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except Exception:
+            continue
+        ts = parse_ts(entry.get("ts", ""))
+        if ts is None or ts < cutoff:
+            continue
+        if entry.get("result") not in ("ok", None):
+            auto_failures.append(entry)
+
+# 5. Recent feedback memories (these are the *existing* rules; the
 #    researcher should propose *new* ones or amendments)
 feedback = []
 mem_dir = workspace / "memory" if (workspace / "memory").is_dir() else None
@@ -167,19 +236,33 @@ if mem_dir:
         except Exception:
             pass
 
+# 6. Outstanding proposals — proposals that have been emitted but
+# never picked up by chad-proposal-apply (or were skipped by it).
+# Helps the researcher notice when a proposal keeps recurring without
+# resolution.
+outstanding = []
+if proposals_file.is_file():
+    text = proposals_file.read_text()
+    # Take the last 4000 chars as a sample (latest blocks first per
+    # chad-budget-audit's prepend pattern).
+    outstanding = [text[:4000]]
+
 # Assemble the task brief
 lines = [
     "# Task: propose durable self-improvements",
     "",
     "You are the researcher sub-agent. Chad has accumulated a week of",
-    "operational signal — failed sub-agent spawns, results with follow-up",
-    "items, and the existing feedback memory corpus. Your job is to",
-    "propose **1-3 durable improvements** Chad can apply to his own",
-    "behavior. Each proposal must be one of these shapes:",
+    "operational signal — failed sub-agent spawns, cron-run failures,",
+    "auto-action errors, and the existing feedback memory corpus.",
+    "Your job is to propose **1-3 durable improvements** Chad can apply",
+    "to his own behavior. Each proposal must be one of these shapes:",
     "",
     "- **New feedback memory entry** (filename, body)",
     "- **Amendment to existing feedback memory** (file, diff)",
-    "- **Cron tweak** (cron name, old schedule, new schedule, reason)",
+    "- **Cron tweak** (cron name, old value, new value, reason) —",
+    "  if it's a `timeoutSeconds` or `maxOutputTokens` change,",
+    "  chad-budget-audit may already emit it; only add a *qualitative*",
+    "  cron tweak here (schedule, message, behavior change).",
     "- **New kind manifest** (name, binary, policy, budget)",
     "",
     "Rules:",
@@ -189,6 +272,8 @@ lines = [
     "  signal below. If the signal is too thin, say so and exit.",
     "- Propose at most 3. Fewer is better. Chad will reject proposals",
     "  that feel speculative.",
+    "- Pay special attention to crons that are erroring repeatedly —",
+    "  silent infrastructure failure is the worst class of bug.",
     "",
     "## Signal",
     "",
@@ -204,6 +289,18 @@ lines = [
     *(json.dumps(r) for r in recent_results),
     "```",
     "",
+    f"### Cron run failures ({sum(c.get('fail_count', 0) for c in cron_failures)} across {len(cron_failures)} crons)",
+    "",
+    "```json",
+    *(json.dumps(c) for c in cron_failures),
+    "```",
+    "",
+    f"### Auto-action errors ({len(auto_failures)} in last {days} days)",
+    "",
+    "```json",
+    *(json.dumps(a) for a in auto_failures[:20]),
+    "```",
+    "",
     f"### Existing feedback memories ({len(feedback)})",
     "",
 ]
@@ -211,6 +308,13 @@ for f in feedback[:6]:
     lines.append(f"**{f['file']}:**")
     lines.append("")
     lines.append(f["head"])
+    lines.append("")
+if outstanding:
+    lines.append("### Outstanding proposals (not yet applied)")
+    lines.append("")
+    lines.append("```")
+    lines.extend(outstanding)
+    lines.append("```")
     lines.append("")
 lines += [
     "## Output format",

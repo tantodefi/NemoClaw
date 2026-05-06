@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-proposal-apply — Close the autonomy loop by applying safe-list
+# proposals from feedback-proposals.md.
+#
+# Reads the LATEST `### Proposals (machine-readable)` JSON block emitted
+# by chad-budget-audit (most recent first). For each entry, applies the
+# change ONLY if all four guards pass:
+#
+#   1. The cron exists in `openclaw cron list`.
+#   2. The field is in the safe-list (timeoutSeconds | maxOutputTokens).
+#   3. The new value is within ±2× the old value (bounded multiplier).
+#   4. chad-action-gate `chad_self_modify_cron <cron-name>` returns auto.
+#
+# Anything else stays draft-only. The applier never edits code, never
+# changes schedules, never registers new crons, never modifies policy.
+# That whole class of change must round-trip through human review per
+# the autonomy roadmap.
+#
+# Output: appends `## Applied — <ts>` block to feedback-proposals.md
+# listing what was applied and what was skipped, plus an entry per apply
+# in the chad-action-gate audit log.
+#
+# Idempotency: every applied entry is matched against the audit log
+# (last 24h) by (cron, field, new) tuple. Duplicate entries from a
+# re-run of the same proposals block are no-ops.
+#
+# Registered as a daily cron by chad-setup.sh (04:30 UTC, after Mon
+# budget audit and ahead of the 06:00 email-check window).
+#
+# Usage:
+#   chad-proposal-apply               # apply latest proposals block
+#   chad-proposal-apply --dry-run     # parse + validate only
+#   chad-proposal-apply --max-apply N # cap applies per run (default 5)
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+PROPOSALS_FILE="${CHAD_PROPOSALS_FILE:-/sandbox/.openclaw-data/memory/feedback-proposals.md}"
+AUDIT_LOG="${CHAD_AUTO_ACTION_LOG:-/sandbox/.openclaw-data/state/auto-action-log.jsonl}"
+PROFILES_FILE="${CHAD_PROFILES_FILE:-/usr/local/share/chad/task-profiles.json}"
+
+dry_run=0
+max_apply=5
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run=1; shift ;;
+    --max-apply) max_apply="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '4,35p' "$0" | sed 's/^# \{0,1\}//' >&2
+      exit 0 ;;
+    *) echo "chad-proposal-apply: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ ! -r "$PROPOSALS_FILE" ]; then
+  echo "chad-proposal-apply: no proposals file at ${PROPOSALS_FILE} — nothing to apply"
+  exit 0
+fi
+
+PROPOSALS_FILE="$PROPOSALS_FILE" \
+AUDIT_LOG="$AUDIT_LOG" \
+DRY_RUN="$dry_run" \
+MAX_APPLY="$max_apply" \
+python3 <<'PY'
+import json, os, re, subprocess, datetime
+
+proposals_file = os.environ["PROPOSALS_FILE"]
+audit_log = os.environ["AUDIT_LOG"]
+dry_run = os.environ["DRY_RUN"] == "1"
+max_apply = int(os.environ["MAX_APPLY"])
+
+# ── Find the latest ```json block under "### Proposals (machine-readable)" ──
+text = open(proposals_file).read()
+# Match the most recent block. The audit prepends new content, so the
+# first match in the file is the freshest.
+m = re.search(r"### Proposals \(machine-readable\)\s*\n+```json\s*\n(.+?)\n```",
+              text, re.DOTALL)
+if not m:
+    print("chad-proposal-apply: no Proposals block found — nothing to apply")
+    raise SystemExit(0)
+
+try:
+    proposals = json.loads(m.group(1))
+except json.JSONDecodeError as exc:
+    print(f"chad-proposal-apply: malformed Proposals JSON: {exc}")
+    raise SystemExit(2)
+
+applies = proposals.get("applies") or []
+proposal_ts = proposals.get("ts", "?")
+if not applies:
+    print(f"chad-proposal-apply: 0 applies in latest block (ts={proposal_ts})")
+    raise SystemExit(0)
+
+# ── Index audit log: skip duplicates within last 24h ──
+seen = set()
+cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
+if os.path.exists(audit_log):
+    for raw in open(audit_log):
+        raw = raw.strip()
+        if not raw: continue
+        try:
+            entry = json.loads(raw)
+        except Exception:
+            continue
+        if entry.get("action") != "chad_self_modify_cron": continue
+        if entry.get("result") != "ok": continue
+        try:
+            ts = datetime.datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ts < cutoff: continue
+        # detail format: "field=<f>,old=<o>,new=<n>"
+        detail = entry.get("detail", "")
+        seen.add((entry.get("target"), detail))
+
+# ── Resolve cron IDs ──
+try:
+    raw = subprocess.check_output(
+        ["openclaw", "cron", "list", "--json"],
+        stderr=subprocess.DEVNULL, text=True, timeout=15,
+    )
+    crons_raw = json.loads(raw)
+    cron_index = {}
+    if isinstance(crons_raw, list):
+        items = crons_raw
+    else:
+        items = crons_raw.get("jobs") or crons_raw.get("items") or []
+    for c in items:
+        if c.get("name") and c.get("id"):
+            cron_index[c["name"]] = c["id"]
+except Exception as exc:
+    print(f"chad-proposal-apply: could not list crons: {exc}")
+    raise SystemExit(3)
+
+SAFE_FIELDS = {"timeoutSeconds", "maxOutputTokens"}
+applied = []
+skipped = []
+applies_left = max_apply
+
+for p in applies:
+    name = p.get("cron")
+    field = p.get("field")
+    old = p.get("old")
+    new = p.get("new")
+    reason = p.get("reason", "")
+    detail = f"field={field},old={old},new={new}"
+
+    if applies_left <= 0:
+        skipped.append((name, field, old, new, "max-apply cap reached"))
+        continue
+    if not name or not field:
+        skipped.append((name or "?", field or "?", old, new, "missing cron/field"))
+        continue
+    if field not in SAFE_FIELDS:
+        skipped.append((name, field, old, new, f"field not in safe-list ({sorted(SAFE_FIELDS)})"))
+        continue
+    if name not in cron_index:
+        skipped.append((name, field, old, new, "cron not found in cron list"))
+        continue
+    if not isinstance(old, int) or not isinstance(new, int) or old <= 0 or new <= 0:
+        skipped.append((name, field, old, new, "non-positive int values"))
+        continue
+    # ±2× bound — protects against runaway proposals.
+    if new > old * 2 or old > new * 2:
+        skipped.append((name, field, old, new, f"out of ±2× bound ({old}↔{new})"))
+        continue
+    # Idempotency: skip if we already applied this exact change today.
+    if (name, detail) in seen:
+        skipped.append((name, field, old, new, "already applied within 24h"))
+        continue
+
+    # Gate via chad-action-gate.
+    try:
+        gate = subprocess.run(
+            ["chad-action-gate", "check", "chad_self_modify_cron", name],
+            capture_output=True, text=True, timeout=10,
+        )
+        decision = gate.stdout.strip()
+    except Exception as exc:
+        skipped.append((name, field, old, new, f"gate check failed: {exc}"))
+        continue
+    if decision != "auto":
+        skipped.append((name, field, old, new, f"gate returned {decision!r}"))
+        continue
+
+    if dry_run:
+        applied.append((name, field, old, new, reason, "[dry-run]"))
+        applies_left -= 1
+        continue
+
+    # Apply via openclaw cron edit. Map field → CLI flag.
+    cid = cron_index[name]
+    flag = {
+        "timeoutSeconds": "--timeout-seconds",
+        "maxOutputTokens": "--max-tokens",
+    }[field]
+    try:
+        edit = subprocess.run(
+            ["openclaw", "cron", "edit", cid, flag, str(new)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if edit.returncode != 0:
+            skipped.append((name, field, old, new,
+                            f"cron edit exit {edit.returncode}: {edit.stderr.strip()[:120]}"))
+            continue
+    except Exception as exc:
+        skipped.append((name, field, old, new, f"cron edit raised: {exc}"))
+        continue
+
+    # Log via chad-action-gate.
+    try:
+        subprocess.run(
+            ["chad-action-gate", "log", "chad_self_modify_cron", name,
+             "--result", "ok", "--detail", detail],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+    applied.append((name, field, old, new, reason, "applied"))
+    applies_left -= 1
+
+# ── Append "## Applied — <ts>" block to proposals file ──
+ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+out = ["", f"## Applied — {ts}", ""]
+out.append(f"_From proposals block ts={proposal_ts}; max_apply={max_apply}; dry_run={dry_run}._")
+out.append("")
+out.append("### Applied")
+if applied:
+    out.append("| cron | field | old | new | reason | status |")
+    out.append("|------|-------|----:|----:|--------|--------|")
+    for n, f, o, w, r, s in applied:
+        out.append(f"| {n} | {f} | {o} | {w} | {r} | {s} |")
+else:
+    out.append("- (nothing applied)")
+out.append("")
+out.append("### Skipped")
+if skipped:
+    out.append("| cron | field | old | new | reason |")
+    out.append("|------|-------|----:|----:|--------|")
+    for n, f, o, w, r in skipped:
+        out.append(f"| {n} | {f} | {o} | {w} | {r} |")
+else:
+    out.append("- (nothing skipped)")
+out.append("")
+
+# Append in-place. Don't prepend — the applier is downstream of the
+# proposals log; ordering within the file is "newest header at top,
+# applied blocks follow each proposal".
+with open(proposals_file, "a") as f:
+    f.write("\n".join(out) + "\n")
+
+print(f"chad-proposal-apply: applied={len(applied)} skipped={len(skipped)} "
+      f"(dry_run={dry_run}, max_apply={max_apply})")
+PY
