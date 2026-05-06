@@ -48,6 +48,8 @@ budget_tokens=""
 dry_run=0
 override_id=""
 substrate_override=""
+async_mode=0
+binary_override=""
 
 usage() {
   cat <<'EOF'
@@ -65,6 +67,13 @@ Options:
   --substrate S          execution substrate: local (in-container) or gha
                          (GitHub Actions runner). Overrides the kind
                          manifest's `substrate` field. Default: local.
+  --async                non-blocking spawn (gha substrate only). Pushes
+                         branch, dispatches workflow, writes a "running"
+                         ledger entry, returns the task id immediately.
+                         chad-spawn-poll cron picks up the result later.
+  --binary-override PATH override the kind manifest's `binary` field for
+                         this spawn only (per-spawn provider swap).
+                         Useful for "use codex on a writer kind once".
   -h, --help             show this help
 EOF
   exit 2
@@ -80,7 +89,9 @@ while [ "$#" -gt 0 ]; do
     --budget-tokens) budget_tokens="$2"; shift 2 ;;
     --dry-run)       dry_run=1; shift ;;
     --id)            override_id="$2"; shift 2 ;;
-    --substrate)     substrate_override="$2"; shift 2 ;;
+    --substrate)        substrate_override="$2"; shift 2 ;;
+    --async)            async_mode=1; shift ;;
+    --binary-override)  binary_override="$2"; shift 2 ;;
     -h|--help)       usage ;;
     *) echo "chad-spawn: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -172,6 +183,28 @@ set -e
 eval "$manifest_eval"
 
 [ -n "$manifest_binary" ] || { echo "chad-spawn: manifest missing 'binary'" >&2; exit 3; }
+
+# --binary-override wins over manifest binary for this spawn only.
+# Use with care: the network policy preset is still the kind's, so the
+# override binary needs to be in that preset's allowlist or the L7 proxy
+# will block it. (Future: add per-spawn policy override for full swap.)
+if [ -n "$binary_override" ]; then
+  manifest_binary="$binary_override"
+fi
+
+# Resolve effective substrate now so every ledger entry carries it
+# (including the queued entry, which chad-spawn-poll uses to filter).
+effective_substrate="${substrate_override:-${manifest_substrate:-local}}"
+case "$effective_substrate" in
+  local|gha) ;;
+  *) echo "chad-spawn: invalid substrate: $effective_substrate (must be local|gha)" >&2; exit 2 ;;
+esac
+
+# --async only meaningful with gha substrate. Refuse silently-wrong combos.
+if [ "$async_mode" -eq 1 ] && [ "$effective_substrate" != "gha" ]; then
+  echo "chad-spawn: --async requires --substrate gha (or a kind with substrate: gha)" >&2
+  exit 2
+fi
 
 # Generate a task id if the caller didn't supply one.
 task_id="${override_id:-$(
@@ -267,6 +300,9 @@ case "$task_file" in
 esac
 
 # ── Ledger: queued ─────────────────────────────────────────────────
+# Substrate field added in Phase C so chad-spawn-poll can find async
+# gha entries to reconcile. Older ledger entries without `substrate`
+# are treated as "local" by readers.
 ledger_append() {
   local status="$1"
   CHAD_LEDGER_ID="$task_id" \
@@ -275,6 +311,8 @@ ledger_append() {
   CHAD_LEDGER_WORKDIR="$workdir" \
   CHAD_LEDGER_BUDGET="$budget_tokens" \
   CHAD_LEDGER_FILE="$QUEUE_FILE" \
+  CHAD_LEDGER_SUBSTRATE="${effective_substrate:-local}" \
+  CHAD_LEDGER_ASYNC="$async_mode" \
   python3 <<'PY'
 import os, json, datetime
 _UTC = getattr(datetime, "UTC", datetime.timezone.utc)
@@ -284,6 +322,8 @@ rec = {
     "status":  os.environ["CHAD_LEDGER_STATUS"],
     "workdir": os.environ["CHAD_LEDGER_WORKDIR"],
     "budget_tokens": int(os.environ["CHAD_LEDGER_BUDGET"]),
+    "substrate": os.environ.get("CHAD_LEDGER_SUBSTRATE", "local"),
+    "async":     os.environ.get("CHAD_LEDGER_ASYNC", "0") == "1",
     "ts_utc": datetime.datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 with open(os.environ["CHAD_LEDGER_FILE"], "a") as f:
@@ -322,15 +362,6 @@ PY
   exit 0
 fi
 
-# ── Resolve effective substrate ────────────────────────────────────
-# CLI --substrate wins, then kind manifest's `substrate` field, then
-# default "local". Validate to avoid passing garbage to the dispatcher.
-effective_substrate="${substrate_override:-${manifest_substrate:-local}}"
-case "$effective_substrate" in
-  local|gha) ;;
-  *) echo "chad-spawn: invalid substrate: $effective_substrate (must be local|gha)" >&2; exit 2 ;;
-esac
-
 # ── Run the sub-agent ──────────────────────────────────────────────
 ledger_append running
 
@@ -339,8 +370,9 @@ stderr_log="${workdir}/stderr.log"
 
 if [ "$effective_substrate" = "gha" ]; then
   # GHA substrate: chad-spawn-gha handles branch push, workflow_dispatch,
-  # poll for result.json, copy back. Sync mode (matches local contract).
-  # See docs/design/spawn-as-github-run.md for the architecture.
+  # and (in sync mode) polling for result.json. CHAD_GHA_NO_POLL=1 makes
+  # the helper return immediately after dispatch (async mode); the
+  # chad-spawn-poll cron picks up the result later.
   set +e
   CHAD_GHA_TASK_ID="$task_id" \
   CHAD_GHA_KIND="$kind" \
@@ -353,9 +385,23 @@ if [ "$effective_substrate" = "gha" ]; then
   CHAD_GHA_INVOCATION="$manifest_invocation" \
   CHAD_GHA_TIMEOUT="$timeout_secs" \
   CHAD_GHA_BUDGET_TOKENS="$budget_tokens" \
+  CHAD_GHA_NO_POLL="$async_mode" \
     "${ORCH_DIR}/scripts/chad-spawn-gha.sh"
   helper_rc=$?
   set -e
+
+  if [ "$async_mode" -eq 1 ]; then
+    # Async: caller gets task_id; chad-spawn-poll cron transitions the
+    # ledger entry from running → done|failed when the runner commits
+    # result.json back to the spawn branch.
+    if [ "$helper_rc" -ne 0 ]; then
+      ledger_append failed
+      echo "chad-spawn: async dispatch failed (exit $helper_rc)" >&2
+      exit "$helper_rc"
+    fi
+    echo "$task_id"
+    exit 0
+  fi
 
   # On helper failure with no result.json, synthesize one so chad-collect
   # has something to merge. On success, the helper has already populated

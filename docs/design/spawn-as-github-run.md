@@ -145,21 +145,48 @@ Keep both substrates. Per-kind default, per-spawn override:
 
 ## Migration path
 
-**Phase A** (current): kinds + presets shipped, all in-container.
-Codex stub kind manifest landed 2026-05-06 (this branch).
+**Phase A** (shipped 2026-05-06): kinds + presets, all in-container.
+Codex stub kind manifest landed.
 
-**Phase B** (next): `--substrate gha` flag added to chad-spawn,
-`agent-job.yml` workflow shipped to `tantodefi/chad-state`,
-`notify-pr-complete.yml` callback handler in Chad's gateway. Codex kind
-flips its default substrate to `gha`.
+**Phase B** (shipped 2026-05-06): `--substrate <local|gha>` flag on
+chad-spawn; `chad-spawn-gha.sh` helper does push + dispatch + sync
+poll; `agent-job.yml` workflow lives in
+`scripts/chad-state-templates/.github/workflows/`; `chad-state-bootstrap`
+installs it into chad-state. Codex kind defaults to `gha`. Provider
+routing in the runner: NVIDIA fallback for codex/opencode when
+`OPENAI_API_KEY` not set; claude requires `ANTHROPIC_API_KEY`
+(no fallback).
 
-**Phase C** (later): opencode kind + preset added. `--binary-override`
-flag for per-spawn provider swap. Auto-merge gate in `agent-job.yml`
-limits writes to `spawns/<id>/` paths only (popebot-style).
+**Phase C** (shipped 2026-05-06):
+
+- `chad-spawn --async` flag: dispatches workflow + writes "running"
+  ledger entry, returns task_id immediately. Ledger now carries
+  `substrate` and `async` fields so reconcilers can find work.
+- `chad-spawn-gha.sh` honors `CHAD_GHA_NO_POLL=1` to skip the
+  polling phase.
+- `chad-spawn-poll` cron (every 5min): scans ledger for running gha
+  entries, fetches result.json from chad-state, copies back to local
+  workdir, transitions ledger to done|failed (or timeout if
+  workflow exceeded budget), runs `chad-collect` on success. Single
+  shared chad-state checkout per run keeps wall time small.
+- `chad-spawn-gc` cron (weekly Mon 02:30 UTC): retention pruning of
+  `chad-spawn/*` branches in chad-state. Default: done=7d, failed=30d,
+  in-flight always kept. Branches with no matching ledger entry are
+  flagged but kept for operator review.
+- `chad-spawn --binary-override <path>`: per-spawn binary swap (use
+  codex on a writer kind once without touching the manifest). The L7
+  policy preset is still the kind's, so the override binary must be in
+  that preset's allowlist.
+- `opencode` kind + `subagent-opencode` preset: parallel to codex,
+  multi-provider (OpenAI/Anthropic/OpenRouter/NVIDIA). Defaults to
+  gha substrate.
 
 **Phase D** (eventual): k3s pod substrate added as third option for
 sub-agents that want both L7 policy enforcement AND isolation. The
-hybrid table above gets a third column.
+hybrid table above gets a third column. Webhook-based completion
+(replacing the polling cron) and an `auto-merge.yml` policy gate so
+spawn results into `spawns/<id>/` paths can land into main, but
+anything outside that path requires human review (popebot pattern).
 
 ## Memory curator alignment
 

@@ -41,6 +41,7 @@ set -uo pipefail
 REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
 POLL_INTERVAL="${CHAD_GHA_POLL_INTERVAL:-10}"
 POLL_EXTRA="${CHAD_GHA_POLL_EXTRA:-180}"
+NO_POLL="${CHAD_GHA_NO_POLL:-0}"
 
 # Required-env check
 for v in CHAD_GHA_TASK_ID CHAD_GHA_KIND CHAD_GHA_WORKDIR CHAD_GHA_RESULT_FILE \
@@ -126,6 +127,14 @@ gh workflow run agent-job.yml \
   -f "task_id=${task_id}" \
   -f "branch=${branch}" \
   >>"${workdir}/gha.log" 2>&1 || fail "workflow_dispatch failed; see ${workdir}/gha.log"
+
+# Async mode: dispatch only, return without polling. chad-spawn-poll
+# cron will reconcile when the runner commits result.json back.
+if [ "$NO_POLL" = "1" ]; then
+  log "async mode: dispatched workflow on branch ${branch}, returning"
+  echo "0"
+  exit 0
+fi
 
 # ── 4. Poll for result.json on the spawn branch ──────────────────────
 poll_timeout=$(( timeout_secs + POLL_EXTRA ))

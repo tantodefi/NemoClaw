@@ -351,7 +351,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve chad-proposal-apply chad-skill-watch chad-memory-snapshot chad-memory-curator; do
+      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve chad-proposal-apply chad-skill-watch chad-memory-snapshot chad-memory-curator chad-spawn-poll chad-spawn-gc; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -942,6 +942,34 @@ if [ "$skip_crons" -eq 0 ]; then
   else
     info "Registering memory-curator cron (weekly Sat 04:00 UTC)"
     register_cron_via_ssh "memory-curator" "0 4 * * 6" "" "$memory_curator_message"
+  fi
+
+  # Async gha sub-agent reconciliation: chad-spawn --async returns
+  # immediately, leaving "running" entries in the ledger. This poller
+  # fetches the spawn branch from chad-state, copies result.json back,
+  # transitions the ledger entry, runs chad-collect. Fast cadence so
+  # async spawns feel responsive. Skips fresh entries (--max-age 1) so
+  # the runner has time to start without the poller racing it.
+  spawn_poll_message='Run `chad-spawn-poll --max-age 1`. The wrapper checks ledger entries with status=running and substrate=gha, fetches results from chad-state, transitions ledger to done|failed, runs chad-collect on success. Append a one-line summary to todays memory only if reconciliations or timeouts happened.'
+
+  if echo "$existing_crons" | grep -q "spawn-poll"; then
+    warn "spawn-poll cron already registered — skipping"
+  else
+    info "Registering spawn-poll cron (every 5min)"
+    register_cron_via_ssh "spawn-poll" "*/5 * * * *" "" "$spawn_poll_message"
+  fi
+
+  # Branch retention for chad-spawn/* in chad-state. With ~24 spawns/day
+  # budget that's ~700 branches/month if nothing prunes them. Default
+  # retention: done branches 7d, failed 30d, in-flight always kept.
+  # Weekly Mon 02:30 UTC, before the busy day.
+  spawn_gc_message='Run `chad-spawn-gc`. The wrapper deletes terminal-ized chad-spawn/* branches in chad-state per retention policy (done=7d, failed=30d). Append a one-line summary to todays memory if any branches were deleted.'
+
+  if echo "$existing_crons" | grep -q "spawn-gc"; then
+    warn "spawn-gc cron already registered — skipping"
+  else
+    info "Registering spawn-gc cron (weekly Mon 02:30 UTC)"
+    register_cron_via_ssh "spawn-gc" "30 2 * * 1" "" "$spawn_gc_message"
   fi
 
   # Weekly budget audit: compares cron telemetry (p95 in/out/dur, error rate)

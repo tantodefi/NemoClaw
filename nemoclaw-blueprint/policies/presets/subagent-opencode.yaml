@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: opencode
+# Egress scope: opencode-supported provider APIs (OpenAI, Anthropic,
+# OpenRouter, NVIDIA), gbrain CLI, GitHub read, openclaw control plane.
+# Mirrors subagent-codex safety contract but adds the additional
+# provider hosts opencode can route to.
+
+preset:
+  name: subagent-opencode
+  description: "opencode CLI sub-agent — OpenAI/Anthropic/OpenRouter/NVIDIA + gbrain + gh read. No writes outside workdir."
+
+network_policies:
+  subagent_opencode_providers:
+    name: subagent_opencode_providers
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: openrouter.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/opencode }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/curl }
+
+  # gbrain query path: opencode sub-agents query gbrain for context
+  # before any external call. Mirrors subagent-codex allowlist; bun +
+  # gbrain-bin must be on the binary list or L7 proxy 403s.
+  subagent_opencode_gbrain:
+    name: subagent_opencode_gbrain
+    endpoints:
+      - host: 127.0.0.1
+        port: 0
+        access: local-only
+    binaries:
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/gbrain-bin }
+      - { path: /usr/local/bin/bun }
+
+  subagent_opencode_github:
+    name: subagent_opencode_github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        access: full
+      - host: github.com
+        port: 443
+        access: full
+      - host: raw.githubusercontent.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/local/bin/gh }
+      - { path: /usr/bin/gh }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }

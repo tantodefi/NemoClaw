@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-spawn-poll — Reconcile async gha sub-agent spawns.
+#
+# chad-spawn --async dispatches a GitHub Actions workflow and returns
+# immediately, leaving a "running" entry in queue/tasks.jsonl. This
+# cron wraps that gap: scans the ledger for running gha entries, fetches
+# the corresponding chad-spawn/<id> branch from chad-state, copies
+# result.json + logs back to the local subagents/<id>/ workdir,
+# transitions the ledger entry to done|failed|timeout, and merges into
+# today's memory via chad-collect.
+#
+# Designed to run on a fast cadence (every 1-5 min) — keep wall time
+# small (< 30s typical). Single shared chad-state checkout per run
+# minimizes git overhead even if many spawns are in flight.
+#
+# Exit codes:
+#   0  ran (zero or more entries reconciled)
+#   2  usage error
+#   3  setup failure (gh missing / auth / ledger unreadable)
+#
+# Usage:
+#   chad-spawn-poll                  # poll all running gha entries
+#   chad-spawn-poll --max-age N      # only poll entries older than N minutes
+#   chad-spawn-poll --timeout N      # mark entries older than N seconds as
+#                                    # timed out (default: kind timeout + 600)
+#   chad-spawn-poll --dry-run        # show what would be reconciled, no writes
+#   chad-spawn-poll --once <task_id> # poll a single entry
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
+QUEUE_FILE="${CHAD_QUEUE_FILE:-${OPENCLAW_DATA}/queue/tasks.jsonl}"
+SUBAGENTS_DIR="${CHAD_SUBAGENTS_DIR:-${OPENCLAW_DATA}/subagents}"
+REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
+
+dry_run=0
+single_id=""
+max_age_min=0
+timeout_extra=600
+
+usage() {
+  cat <<'EOF'
+Usage: chad-spawn-poll [--max-age MIN] [--timeout SECS] [--dry-run] [--once TASK_ID]
+EOF
+  exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --max-age)  max_age_min="$2"; shift 2 ;;
+    --timeout)  timeout_extra="$2"; shift 2 ;;
+    --dry-run)  dry_run=1; shift ;;
+    --once)     single_id="$2"; shift 2 ;;
+    -h|--help)  usage ;;
+    *) echo "chad-spawn-poll: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$QUEUE_FILE" ] || { echo "no ledger at $QUEUE_FILE — nothing to poll"; exit 0; }
+command -v gh >/dev/null 2>&1 || { echo "gh CLI required" >&2; exit 3; }
+gh auth status --hostname github.com >/dev/null 2>&1 || { echo "gh not authenticated" >&2; exit 3; }
+
+# Find unique task_ids whose LATEST ledger entry has status=running and
+# substrate=gha. We treat older entries as superseded — running may
+# actually be stale (already terminal-ized in a later append).
+running_ids="$(QUEUE_FILE="$QUEUE_FILE" SINGLE="$single_id" python3 <<'PY'
+import json, os, sys
+single = os.environ.get("SINGLE", "")
+latest = {}  # task_id -> last record
+with open(os.environ["QUEUE_FILE"]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if "id" in r:
+            latest[r["id"]] = r
+out = []
+for tid, r in latest.items():
+    if single and tid != single:
+        continue
+    if r.get("status") != "running":
+        continue
+    if r.get("substrate") != "gha":
+        continue
+    print(tid + "\t" + r.get("kind", "?") + "\t" + r.get("workdir", "") + "\t" + r.get("ts_utc", ""))
+PY
+)"
+
+if [ -z "$running_ids" ]; then
+  echo "no async gha spawns running"
+  exit 0
+fi
+
+# Single shared chad-state checkout for all reconciliations
+state_dir="$(mktemp -d -t "chad-spawn-poll-XXXXXX")"
+trap 'rm -rf "$state_dir"' EXIT
+gh repo clone "$REPO" "$state_dir" -- --depth 1 --quiet >/dev/null 2>&1 || {
+  echo "chad-spawn-poll: clone failed" >&2
+  exit 3
+}
+
+cd "$state_dir"
+
+reconciled=0
+timed_out=0
+still_running=0
+
+while IFS=$'\t' read -r task_id kind workdir ts_utc; do
+  [ -n "$task_id" ] || continue
+  branch="chad-spawn/${task_id}"
+  spawn_path="spawns/${task_id}"
+  result_remote="${spawn_path}/result.json"
+
+  # max-age filter (skip very fresh entries — give the runner time to start)
+  if [ "$max_age_min" -gt 0 ]; then
+    age_sec="$(python3 -c "
+import datetime, os
+ts = '$ts_utc'
+if not ts:
+    print(0); exit()
+dt = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()))
+")"
+    [ "$age_sec" -lt "$((max_age_min * 60))" ] && continue
+  fi
+
+  # Fetch the spawn branch
+  if ! git fetch origin "$branch" --quiet 2>/dev/null; then
+    echo "  $task_id: branch $branch not on remote (run lost?); skipping"
+    continue
+  fi
+  git checkout -B "$branch" "origin/$branch" --quiet 2>/dev/null
+
+  if [ -f "$result_remote" ]; then
+    # Result is in! Copy back to local workdir.
+    [ -n "$workdir" ] || workdir="${SUBAGENTS_DIR}/${task_id}"
+    mkdir -p "$workdir"
+
+    if [ "$dry_run" -eq 1 ]; then
+      echo "  $task_id: WOULD reconcile from $branch"
+      continue
+    fi
+
+    cp "$result_remote" "$workdir/result.json"
+    [ -f "${spawn_path}/stdout.log" ] && cp "${spawn_path}/stdout.log" "$workdir/stdout.log"
+    [ -f "${spawn_path}/stderr.log" ] && cp "${spawn_path}/stderr.log" "$workdir/stderr.log"
+
+    # Determine final status from result.json
+    exit_code="$(python3 -c "
+import json
+try:
+    print(json.load(open('${workdir}/result.json')).get('exit_code', 0))
+except Exception:
+    print(1)
+")"
+    final_status="done"
+    [ "$exit_code" -eq 0 ] || final_status="failed"
+
+    # Append terminal ledger entry. Use the same substrate/async fields
+    # so the entry is parseable by chad-spawn-status.
+    CHAD_LEDGER_ID="$task_id" \
+    CHAD_LEDGER_KIND="$kind" \
+    CHAD_LEDGER_STATUS="$final_status" \
+    CHAD_LEDGER_WORKDIR="$workdir" \
+    CHAD_LEDGER_FILE="$QUEUE_FILE" \
+    python3 <<'PY'
+import os, json, datetime
+_UTC = getattr(datetime, "UTC", datetime.timezone.utc)
+rec = {
+    "id":      os.environ["CHAD_LEDGER_ID"],
+    "kind":    os.environ["CHAD_LEDGER_KIND"],
+    "status":  os.environ["CHAD_LEDGER_STATUS"],
+    "workdir": os.environ["CHAD_LEDGER_WORKDIR"],
+    "substrate": "gha",
+    "async":     True,
+    "reconciled_by": "chad-spawn-poll",
+    "ts_utc": datetime.datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+with open(os.environ["CHAD_LEDGER_FILE"], "a") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+
+    echo "  $task_id: reconciled (${final_status}, exit $exit_code)"
+    reconciled=$((reconciled + 1))
+    continue
+  fi
+
+  # No result yet — check timeout
+  age_sec="$(python3 -c "
+import datetime
+ts = '$ts_utc'
+if not ts:
+    print(0); exit()
+dt = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()))
+")"
+
+  if [ "$age_sec" -gt "$timeout_extra" ]; then
+    if [ "$dry_run" -eq 1 ]; then
+      echo "  $task_id: WOULD mark timeout (age ${age_sec}s)"
+      continue
+    fi
+
+    [ -n "$workdir" ] || workdir="${SUBAGENTS_DIR}/${task_id}"
+    mkdir -p "$workdir"
+    # Synthesize a timeout result
+    CHAD_TID="$task_id" CHAD_KIND="$kind" CHAD_AGE="$age_sec" CHAD_OUT="$workdir/result.json" \
+    python3 <<'PY'
+import os, json
+json.dump({
+    "status": "failed",
+    "task_id": os.environ["CHAD_TID"],
+    "kind": os.environ["CHAD_KIND"],
+    "exit_code": 124,
+    "substrate": "gha",
+    "summary": f"chad-spawn-poll: workflow did not commit result.json within {os.environ['CHAD_AGE']}s",
+}, open(os.environ["CHAD_OUT"], "w"), indent=2)
+PY
+
+    CHAD_LEDGER_ID="$task_id" CHAD_LEDGER_KIND="$kind" CHAD_LEDGER_FILE="$QUEUE_FILE" \
+    CHAD_LEDGER_WORKDIR="$workdir" \
+    python3 <<'PY'
+import os, json, datetime
+_UTC = getattr(datetime, "UTC", datetime.timezone.utc)
+rec = {
+    "id":      os.environ["CHAD_LEDGER_ID"],
+    "kind":    os.environ["CHAD_LEDGER_KIND"],
+    "status":  "failed",
+    "workdir": os.environ["CHAD_LEDGER_WORKDIR"],
+    "substrate": "gha",
+    "async":     True,
+    "reconciled_by": "chad-spawn-poll",
+    "reason":    "timeout",
+    "ts_utc": datetime.datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+with open(os.environ["CHAD_LEDGER_FILE"], "a") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+
+    echo "  $task_id: TIMEOUT (age ${age_sec}s)"
+    timed_out=$((timed_out + 1))
+    continue
+  fi
+
+  echo "  $task_id: still running (age ${age_sec}s)"
+  still_running=$((still_running + 1))
+done <<<"$running_ids"
+
+echo "chad-spawn-poll: ${reconciled} reconciled, ${timed_out} timed out, ${still_running} still running"
+
+# Trigger chad-collect to merge fresh result.json files into today's memory
+if [ "$reconciled" -gt 0 ] && [ "$dry_run" -eq 0 ] && command -v chad-collect >/dev/null 2>&1; then
+  chad-collect --today >/dev/null 2>&1 || true
+fi

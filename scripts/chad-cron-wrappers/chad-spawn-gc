@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-spawn-gc — Branch retention for the gha spawn substrate.
+#
+# Each chad-spawn --substrate gha call leaves a chad-spawn/<task_id>
+# branch on tantodefi/chad-state. With ~24 spawns/day budget that's
+# ~700 branches/month if nothing prunes them. This cron deletes
+# branches whose corresponding ledger entry has been terminal-ized
+# AND the spawn is older than the retention window.
+#
+# Default retention:
+#   - done    branches: 7 days (audit trail for recent successes)
+#   - failed  branches: 30 days (longer for postmortem)
+#   - "running" branches with no matching ledger entry are left alone
+#     (might be a state-of-the-world drift — operator investigates)
+#
+# Designed to run weekly. Idempotent — re-running doesn't double-delete.
+#
+# Usage:
+#   chad-spawn-gc                          # default retention
+#   chad-spawn-gc --done-days N            # override done retention
+#   chad-spawn-gc --failed-days N          # override failed retention
+#   chad-spawn-gc --dry-run                # show what would be deleted
+#
+# Exit codes:
+#   0  ran (zero or more branches deleted)
+#   2  usage error
+#   3  setup failure
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
+QUEUE_FILE="${CHAD_QUEUE_FILE:-${OPENCLAW_DATA}/queue/tasks.jsonl}"
+REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
+
+done_days=7
+failed_days=30
+dry_run=0
+
+usage() {
+  cat <<'EOF'
+Usage: chad-spawn-gc [--done-days N] [--failed-days N] [--dry-run]
+EOF
+  exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --done-days)   done_days="$2"; shift 2 ;;
+    --failed-days) failed_days="$2"; shift 2 ;;
+    --dry-run)     dry_run=1; shift ;;
+    -h|--help)     usage ;;
+    *) echo "chad-spawn-gc: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+command -v gh >/dev/null 2>&1 || { echo "gh CLI required" >&2; exit 3; }
+gh auth status --hostname github.com >/dev/null 2>&1 || { echo "gh not authenticated" >&2; exit 3; }
+[ -f "$QUEUE_FILE" ] || { echo "no ledger; nothing to gc"; exit 0; }
+
+# Build a map of task_id -> latest_status from the ledger
+declare -A id_status
+declare -A id_age_days
+while IFS=$'\t' read -r task_id status age; do
+  id_status["$task_id"]="$status"
+  id_age_days["$task_id"]="$age"
+done < <(QUEUE_FILE="$QUEUE_FILE" python3 <<'PY'
+import json, os, datetime
+_UTC = datetime.timezone.utc
+now = datetime.datetime.now(_UTC)
+latest = {}
+with open(os.environ["QUEUE_FILE"]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if "id" in r:
+            latest[r["id"]] = r
+for tid, r in latest.items():
+    ts = r.get("ts_utc", "")
+    if not ts:
+        continue
+    try:
+        dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_UTC)
+        age_days = int((now - dt).total_seconds() // 86400)
+    except Exception:
+        continue
+    print(f"{tid}\t{r.get('status', '?')}\t{age_days}")
+PY
+)
+
+# List remote chad-spawn/* branches
+remote_branches="$(gh api "repos/${REPO}/branches?per_page=100" --paginate \
+  --jq '.[].name | select(startswith("chad-spawn/"))' 2>/dev/null || echo "")"
+
+if [ -z "$remote_branches" ]; then
+  echo "no chad-spawn/* branches on $REPO"
+  exit 0
+fi
+
+deleted=0
+kept=0
+unknown=0
+
+while IFS= read -r branch; do
+  [ -n "$branch" ] || continue
+  task_id="${branch#chad-spawn/}"
+  status="${id_status[$task_id]:-}"
+  age="${id_age_days[$task_id]:-0}"
+
+  if [ -z "$status" ]; then
+    # Branch exists but no matching ledger entry — leave alone, alert
+    echo "  $branch: unknown (no ledger entry); KEEP"
+    unknown=$((unknown + 1))
+    continue
+  fi
+
+  threshold=0
+  case "$status" in
+    done)   threshold="$done_days" ;;
+    failed) threshold="$failed_days" ;;
+    queued|running)
+      echo "  $branch: status=$status; KEEP (in flight)"
+      kept=$((kept + 1))
+      continue
+      ;;
+    *)
+      echo "  $branch: unknown status '$status'; KEEP (safety)"
+      kept=$((kept + 1))
+      continue
+      ;;
+  esac
+
+  if [ "$age" -lt "$threshold" ]; then
+    kept=$((kept + 1))
+    continue
+  fi
+
+  if [ "$dry_run" -eq 1 ]; then
+    echo "  $branch: WOULD DELETE (status=$status age=${age}d threshold=${threshold}d)"
+    deleted=$((deleted + 1))
+    continue
+  fi
+
+  # Delete via gh API. Tolerate 404 (already deleted by another runner).
+  if gh api -X DELETE "repos/${REPO}/git/refs/heads/${branch}" >/dev/null 2>&1; then
+    echo "  $branch: deleted (status=$status age=${age}d)"
+    deleted=$((deleted + 1))
+  else
+    echo "  $branch: delete failed (already gone?)" >&2
+  fi
+done <<<"$remote_branches"
+
+echo "chad-spawn-gc: ${deleted} deleted, ${kept} kept, ${unknown} unknown"
