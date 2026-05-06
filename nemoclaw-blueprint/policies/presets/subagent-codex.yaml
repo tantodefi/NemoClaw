@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: codex
+# Egress scope: OpenAI API (Codex backend), gbrain CLI, GitHub read,
+# openclaw control plane. No git push, no registry, no messaging.
+# Mirrors subagent-researcher's safety contract — additive: add OpenAI.
+
+preset:
+  name: subagent-codex
+  description: "Codex CLI sub-agent — OpenAI API + gbrain + gh read. No writes outside workdir."
+
+network_policies:
+  subagent_codex_openai:
+    name: subagent_codex_openai
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET,  path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/codex }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/curl }
+
+  # gbrain query path: codex sub-agents query gbrain for context before
+  # any external call. Mirrors subagent-researcher allowlist; without
+  # bun + gbrain-bin on the binary list the L7 proxy 403s with
+  # `CONNECT tunnel failed`. See feedback_openshell_l7_binary_identity.
+  subagent_codex_gbrain:
+    name: subagent_codex_gbrain
+    endpoints:
+      # gbrain CLI is local subprocess; no external endpoints needed for
+      # the query path. The embedder backend (NVIDIA or LM Studio) goes
+      # through the gbrain process, not codex. Listed for L7 binary
+      # identity only.
+      - host: 127.0.0.1
+        port: 0
+        access: local-only
+    binaries:
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/gbrain-bin }
+      - { path: /usr/local/bin/bun }
+
+  subagent_codex_github:
+    name: subagent_codex_github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        access: full
+      - host: github.com
+        port: 443
+        access: full
+      - host: raw.githubusercontent.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/local/bin/gh }
+      - { path: /usr/bin/gh }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }

@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: codex
+# OpenAI Codex CLI as an alternate coder/researcher backend. Behaves like
+# the existing `coder` kind but uses /usr/local/bin/codex instead of
+# /usr/local/bin/pi. Useful for tasks where:
+#   - The pi binary's policies are too narrow for the work at hand
+#   - You want a second opinion via a different provider on the same task
+#   - The user explicitly requests `--kind codex`
+#
+# **Stub status (2026-05).** Codex CLI is not yet baked into the Chad
+# image. To enable: install `codex` in /usr/local/bin (image rebuild,
+# or runtime via chad-skill-watch), confirm
+# `subagent-codex` policy preset is applied (see Step 8 in
+# chad-setup.sh), and `chad-spawn --kind codex` will route here. Until
+# the binary exists, chad-spawn will fail-fast with a useful message.
+
+kind: codex
+description: "OpenAI Codex CLI as alternate code/research backend. Brain-first like other kinds. Stub: requires codex binary at /usr/local/bin/codex."
+
+binary: /usr/local/bin/codex
+invocation: prompt-stdin
+
+network_policy_preset: subagent-codex
+
+default_timeout: 600
+default_budget_tokens: 50000
+
+prompt_template: |
+  You are a sub-agent spawned by Chad, running Codex CLI.
+
+  ## Step 0 — Brain first (mandatory)
+  Run: gbrain query "<keywords from the task>"
+  If gbrain returns relevant pages, factor them in. Treat results
+  older than 30 days as potentially stale.
+
+  ## Step 1 — Do the work
+  Read /sandbox/source if you need code context. Produce either:
+    1) a unified diff in ```diff fenced blocks, OR
+    2) a concrete answer / report
+
+  Never push to git, never edit files outside your workdir, never
+  spawn further sub-agents, never call non-allowlisted hosts.
+
+  ## Step 2 — Store non-obvious findings (optional)
+  If you discovered something the next sub-agent shouldn't have to
+  re-discover, store it: `gbrain put-page --title "..." --content "..."
+  --tags codex,<topic>`.
+
+  ## Output (last non-empty stdout line MUST be JSON)
+  {"status": "done"|"failed", "summary": "...", "files_changed": []}
+
+  Task id: {{task_id}}
+  Task:
+  {{task}}
