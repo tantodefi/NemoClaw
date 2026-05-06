@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-memory-snapshot — Pre-mutation safety net for the memory stack.
+#
+# Tar-gzips the three durable memory surfaces (lancedb, wiki vault,
+# workspace identity files) into /sandbox/.openclaw-data/memory-snapshots/<utc>/
+# and prunes to the last N snapshots. Mirrors the Hermes curator-backups
+# pattern: every mutation pass calls `create` first; rollback restores
+# from a snapshot and snapshots current state first (so rollback is itself
+# reversible).
+#
+# Snapshot contents:
+#   - /sandbox/.openclaw-data/memory/lancedb       (semantic LTM)
+#   - /sandbox/.openclaw-data/wiki/main            (memory-wiki vault)
+#   - /sandbox/.openclaw-data/workspace            (always-injected files)
+#   - /sandbox/.openclaw-data/curator-runs/latest  (most recent curator output)
+#
+# NOT included (live state, separate backup paths):
+#   - /sandbox/.gbrain                             (covered by chad-gbrain-dream)
+#   - /sandbox/.openclaw-data/queue                (covered by chad-workspace-backup)
+#
+# Usage:
+#   chad-memory-snapshot create [--label <label>]
+#   chad-memory-snapshot list
+#   chad-memory-snapshot rollback <snapshot-id>
+#   chad-memory-snapshot prune [--keep N]
+#
+# Exit codes: 0 ok, 2 usage, 3 snapshot failed, 4 rollback failed.
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
+SNAPSHOT_ROOT="${CHAD_MEMORY_SNAPSHOTS:-${OPENCLAW_DATA}/memory-snapshots}"
+KEEP_DEFAULT=5
+
+# Snapshot scope. Each entry is "label:path"; missing paths are skipped.
+SOURCES=(
+  "lancedb:${OPENCLAW_DATA}/memory/lancedb"
+  "wiki:${OPENCLAW_DATA}/wiki/main"
+  "workspace:${OPENCLAW_DATA}/workspace"
+  "curator-latest:${OPENCLAW_DATA}/curator-runs/latest"
+)
+
+usage() {
+  cat <<'EOF'
+Usage:
+  chad-memory-snapshot create [--label <label>]
+  chad-memory-snapshot list
+  chad-memory-snapshot rollback <snapshot-id>
+  chad-memory-snapshot prune [--keep N]
+
+Default keep: 5 most recent.
+EOF
+  exit 2
+}
+
+require_dir() {
+  mkdir -p "$1" || { echo "chad-memory-snapshot: cannot mkdir $1" >&2; exit 3; }
+}
+
+new_id() {
+  date -u +%Y%m%dT%H%M%SZ
+}
+
+cmd_create() {
+  local label="auto"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --label) label="$2"; shift 2 ;;
+      *) echo "create: unknown arg $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local id; id="$(new_id)"
+  local dest="${SNAPSHOT_ROOT}/${id}"
+  require_dir "$dest"
+
+  printf '{"id":"%s","label":"%s","created_utc":"%s","sources":[' \
+    "$id" "$label" "$(date -u +%FT%TZ)" > "${dest}/manifest.json"
+  local first=1
+  local entry sublabel src
+  for entry in "${SOURCES[@]}"; do
+    sublabel="${entry%%:*}"
+    src="${entry#*:}"
+    if [ ! -e "$src" ]; then
+      continue
+    fi
+    [ "$first" -eq 1 ] || printf ',' >> "${dest}/manifest.json"
+    first=0
+    local archive="${dest}/${sublabel}.tar.gz"
+    # tar -C parent + relative path so extraction restores to original location
+    if tar -C "$(dirname "$src")" -czf "$archive" "$(basename "$src")" 2>/dev/null; then
+      local sz; sz="$(stat -c %s "$archive" 2>/dev/null || stat -f %z "$archive" 2>/dev/null || echo 0)"
+      printf '{"label":"%s","src":"%s","archive":"%s","bytes":%s}' \
+        "$sublabel" "$src" "${sublabel}.tar.gz" "$sz" >> "${dest}/manifest.json"
+    else
+      printf '{"label":"%s","src":"%s","archive":null,"error":"tar failed"}' \
+        "$sublabel" "$src" >> "${dest}/manifest.json"
+    fi
+  done
+  printf ']}\n' >> "${dest}/manifest.json"
+
+  echo "snapshot: ${id} (${label})"
+  cmd_prune --keep "$KEEP_DEFAULT" >/dev/null 2>&1 || true
+}
+
+cmd_list() {
+  if [ ! -d "$SNAPSHOT_ROOT" ]; then
+    echo "(no snapshots)"
+    return 0
+  fi
+  local d
+  # shellcheck disable=SC2012
+  for d in $(ls -1 "$SNAPSHOT_ROOT" 2>/dev/null | sort -r); do
+    local m="${SNAPSHOT_ROOT}/${d}/manifest.json"
+    if [ -f "$m" ]; then
+      local label
+      label="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("label","?"))' "$m" 2>/dev/null || echo "?")"
+      local sz; sz="$(du -sh "${SNAPSHOT_ROOT}/${d}" 2>/dev/null | awk '{print $1}')"
+      printf '%s  %-20s  %s\n' "$d" "$label" "$sz"
+    fi
+  done
+}
+
+cmd_rollback() {
+  local id="${1:-}"
+  [ -n "$id" ] || { echo "rollback: snapshot id required" >&2; exit 2; }
+  local dir="${SNAPSHOT_ROOT}/${id}"
+  [ -d "$dir" ] || { echo "rollback: snapshot ${id} not found" >&2; exit 4; }
+
+  # Snapshot current state first (rollback is itself reversible)
+  echo "rollback: snapshotting current state first..."
+  cmd_create --label "pre-rollback-to-${id}"
+
+  # Extract each archive back to its original location
+  local archive sublabel src
+  for entry in "${SOURCES[@]}"; do
+    sublabel="${entry%%:*}"
+    src="${entry#*:}"
+    archive="${dir}/${sublabel}.tar.gz"
+    [ -f "$archive" ] || continue
+    echo "  restoring ${sublabel} <- ${archive}"
+    # Remove existing then extract — atomic-ish
+    rm -rf "$src" 2>/dev/null || true
+    if ! tar -C "$(dirname "$src")" -xzf "$archive" 2>/dev/null; then
+      echo "rollback: extract failed for ${sublabel}" >&2
+      exit 4
+    fi
+  done
+  echo "rollback complete: restored from ${id}"
+}
+
+cmd_prune() {
+  local keep="$KEEP_DEFAULT"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --keep) keep="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -d "$SNAPSHOT_ROOT" ] || return 0
+  # shellcheck disable=SC2012
+  local snaps; snaps="$(ls -1 "$SNAPSHOT_ROOT" 2>/dev/null | sort -r)"
+  local i=0
+  echo "$snaps" | while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    i=$((i + 1))
+    if [ "$i" -gt "$keep" ]; then
+      rm -rf "${SNAPSHOT_ROOT}/${s}"
+      echo "pruned: $s"
+    fi
+  done
+}
+
+[ "$#" -gt 0 ] || usage
+
+cmd="$1"; shift
+case "$cmd" in
+  create)   cmd_create "$@" ;;
+  list)     cmd_list "$@" ;;
+  rollback) cmd_rollback "$@" ;;
+  prune)    cmd_prune "$@" ;;
+  -h|--help) usage ;;
+  *) echo "chad-memory-snapshot: unknown command: $cmd" >&2; usage ;;
+esac

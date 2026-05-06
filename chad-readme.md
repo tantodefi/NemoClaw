@@ -317,12 +317,19 @@ Hybrid vector + graph knowledge brain running as a local PGLite store at
 1. **Image build** — installed from the `tantodefi/gbrain` fork into
    `/usr/local/lib/gbrain/` with a shim at `/usr/local/bin/gbrain`. The
    bun-based install path is pinned so the binary resolves on Linux arm64.
-2. **Per-sandbox init** — `chad-setup.sh` runs `gbrain init` and registers
-   it as a persistent MCP server in `/sandbox/.openclaw/openclaw.json` via
-   `openclaw mcp set gbrain '{"command":"/usr/local/bin/gbrain","args":["serve"]}'`.
-   Every `openclaw agent` session thereafter has the brain MCP tools
-   (`mcp_gbrain_search`, `mcp_gbrain_put_page`, …) available with no
-   spawn-time flags required.
+2. **Per-sandbox init** — `chad-setup.sh` Step 3a runs `gbrain init` only.
+   gbrain is **intentionally NOT registered as an MCP server**. PGLite is
+   single-process; an always-on `gbrain serve` would hold the file lock
+   continuously and block every cron wrapper that uses gbrain CLI
+   (`chad-gbrain-dream`, `chad-issue-triage-cron`, …). chad-setup.sh
+   Step 3f actively removes `mcp.servers.gbrain` from the config on every
+   run as defense-in-depth against wave-N plugin enables that may
+   re-introduce it. Agents access gbrain via subprocess CLI
+   (`gbrain query`, `gbrain put`, `gbrain doctor`, …); each call
+   acquires + releases the lock atomically. See the
+   `[[pglite-single-process]]` page in the memory-wiki vault for
+   symptoms + the toggle-back-on procedure if you ever need MCP for an
+   interactive session.
 3. **Kind prompts** — `researcher`, `coder`, `reviewer`, and `fitness`
    sub-agents are instructed to `mcp_gbrain_search` before any external
    API call, and to write findings back with `mcp_gbrain_put_page` so the

@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-memory-curator — Hermes-style memory consolidation pass.
+#
+# Distinct from chad-self-improve (which proposes BEHAVIORAL improvements
+# from feedback signal). This wrapper proposes MEMORY improvements:
+# consolidate near-duplicates in lancedb, lift important atoms into
+# workspace MEMORY.md, archive stale entries.
+#
+# DRAFT-ONLY in v1. Output is a proposals JSON the operator (or a future
+# chad-memory-apply) reviews. Never mutates lancedb, wiki, or workspace
+# files directly.
+#
+# Pre-mutation snapshot: even though v1 doesn't mutate, we snapshot
+# before each run anyway so the operator can roll back to a known state
+# if a future apply step misbehaves.
+#
+# Inactivity gate (Hermes pattern): skip if there was an autonomous
+# action within the last 1h, or if the previous curator pass was less
+# than CURATOR_MIN_INTERVAL_HOURS ago. Defaults: 1h activity, 168h (7d)
+# interval — match Hermes defaults but tuned for Chad's daily rhythm
+# via env.
+#
+# Usage:
+#   chad-memory-curator                # default 7-day window
+#   chad-memory-curator --days N       # window override
+#   chad-memory-curator --dry-run      # collect signal but don't spawn
+#   chad-memory-curator --force        # skip inactivity gate
+#
+# Exit codes: 0 ran or skipped, 2 usage, 3 signal collection failed.
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/share/chad/_chad-paths.sh 2>/dev/null || true
+
+OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
+WORKSPACE="${CHAD_WORKSPACE:-/sandbox/.openclaw/workspace}"
+CURATOR_RUNS="${OPENCLAW_DATA}/curator-runs"
+AUDIT_LOG="${CHAD_AUTO_ACTION_LOG:-${OPENCLAW_DATA}/state/auto-action-log.jsonl}"
+SNAPSHOT_BIN="${CHAD_MEMORY_SNAPSHOT:-/usr/local/bin/chad-memory-snapshot}"
+
+days=7
+dry_run=0
+force=0
+budget_tokens=20000
+min_interval_hours="${CURATOR_MIN_INTERVAL_HOURS:-168}"
+min_idle_hours="${CURATOR_MIN_IDLE_HOURS:-1}"
+
+usage() {
+  cat <<'EOF'
+Usage: chad-memory-curator [--days N] [--dry-run] [--force] [--budget-tokens N]
+EOF
+  exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --days) days="$2"; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    --force) force=1; shift ;;
+    --budget-tokens) budget_tokens="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "chad-memory-curator: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$CURATOR_RUNS"
+
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+ts_iso="$(date -u +%FT%TZ)"
+run_dir="${CURATOR_RUNS}/${ts}"
+mkdir -p "$run_dir"
+
+# ── Inactivity gate (Hermes pattern) ──────────────────────────────
+if [ "$force" -eq 0 ]; then
+  # 1) Skip if previous curator run too recent
+  last_run="$(ls -1 "$CURATOR_RUNS" 2>/dev/null | grep -v '^latest$' | sort -r | head -1)"
+  if [ -n "$last_run" ] && [ "$last_run" != "$ts" ]; then
+    last_epoch="$(python3 -c '
+import sys, datetime
+s = sys.argv[1]
+try:
+    dt = datetime.datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+    print(int(dt.timestamp()))
+except Exception:
+    print(0)
+' "$last_run" 2>/dev/null || echo 0)"
+    now_epoch="$(date -u +%s)"
+    elapsed_hours=$(( (now_epoch - last_epoch) / 3600 ))
+    if [ "$elapsed_hours" -lt "$min_interval_hours" ]; then
+      echo "curator skipped: previous run ${elapsed_hours}h ago < min ${min_interval_hours}h"
+      rmdir "$run_dir" 2>/dev/null || true
+      exit 0
+    fi
+  fi
+
+  # 2) Skip if recent autonomous activity (anything in last min_idle_hours)
+  if [ -f "$AUDIT_LOG" ]; then
+    cutoff_iso="$(date -u -d "-${min_idle_hours} hour" +%FT%TZ 2>/dev/null \
+                  || date -u -v-"${min_idle_hours}"H +%FT%TZ 2>/dev/null || echo "")"
+    if [ -n "$cutoff_iso" ]; then
+      recent="$(awk -v c="$cutoff_iso" 'BEGIN{n=0} { if (index($0, "\"ts\":") > 0 && $0 ~ c) n++ } END{print n}' "$AUDIT_LOG" 2>/dev/null || echo 0)"
+      if [ "${recent:-0}" -gt 0 ]; then
+        echo "curator skipped: ${recent} autonomous actions in last ${min_idle_hours}h"
+        rmdir "$run_dir" 2>/dev/null || true
+        exit 0
+      fi
+    fi
+  fi
+fi
+
+# ── Budget guard ──────────────────────────────────────────────────
+# Refuse to spawn if there isn't a comfortable reserve.
+if command -v chad-action-gate >/dev/null 2>&1; then
+  reserve_needed=$(( budget_tokens * 2 ))
+  budget_status="$(chad-action-gate budget spawn_subagent 2>/dev/null || echo "unknown/unknown")"
+  remaining="$(echo "$budget_status" | awk -F/ '{print $1}')"
+  if [ -n "${remaining:-}" ] && [ "$remaining" -lt "$reserve_needed" ] 2>/dev/null; then
+    echo "curator skipped: budget reserve insufficient (have ${remaining}, need 2x ${budget_tokens})"
+    rmdir "$run_dir" 2>/dev/null || true
+    exit 0
+  fi
+fi
+
+# ── Snapshot before any work (no mutation in v1, but future-proof) ─
+if [ -x "$SNAPSHOT_BIN" ]; then
+  "$SNAPSHOT_BIN" create --label "pre-curator-${ts}" >>"${run_dir}/snapshot.log" 2>&1 || \
+    echo "WARN: snapshot failed; continuing (proposals are draft-only anyway)" >&2
+fi
+
+# ── Signal collection ─────────────────────────────────────────────
+signal_md="${run_dir}/signal.md"
+{
+  echo "# Curator signal — ${ts_iso}"
+  echo
+  echo "## LTM stats"
+  if command -v openclaw >/dev/null 2>&1; then
+    openclaw ltm stats 2>&1 | head -30
+  else
+    echo "(openclaw CLI not found)"
+  fi
+  echo
+  echo "## Recent LTM entries (last ${days}d via list)"
+  if command -v openclaw >/dev/null 2>&1; then
+    openclaw ltm list --since "$(date -u -d "-${days} day" +%FT%TZ 2>/dev/null || date -u -v-"${days}"d +%FT%TZ 2>/dev/null)" 2>&1 | head -200
+  fi
+  echo
+  echo "## Workspace MEMORY.md (current head)"
+  if [ -f "${WORKSPACE}/MEMORY.md" ]; then
+    head -100 "${WORKSPACE}/MEMORY.md"
+  fi
+  echo
+  echo "## Recent daily memory files (last ${days}d)"
+  for d in $(seq 0 "$days"); do
+    iso="$(date -u -d "-${d} day" +%F 2>/dev/null || date -u -v-"${d}"d +%F 2>/dev/null)"
+    f="${WORKSPACE}/memory/${iso}.md"
+    if [ -f "$f" ]; then
+      echo
+      echo "### ${iso}"
+      tail -80 "$f"
+    fi
+  done
+} > "$signal_md" 2>/dev/null || { echo "signal collection failed" >&2; exit 3; }
+
+signal_size=$(wc -c < "$signal_md" 2>/dev/null || echo 0)
+echo "signal collected: ${signal_size} bytes -> ${signal_md}"
+
+if [ "$dry_run" -eq 1 ]; then
+  echo "dry-run: stopping before spawn"
+  exit 0
+fi
+
+# ── Spawn researcher with curator prompt ──────────────────────────
+prompt="${run_dir}/prompt.md"
+cat > "$prompt" <<PROMPT_EOF
+You are Chad's memory curator. Read the SIGNAL below and propose a SHORT
+list of consolidation actions. DRAFT-ONLY: do not invoke any mutation
+tool. Just produce the JSON proposal.
+
+# Goals (in priority order)
+1. **Lift important atoms** — facts in recent daily memory or LTM
+   captures that should live in workspace MEMORY.md (curated long-term
+   memory). Examples: durable preferences, recurring decisions,
+   contact/identity facts, gotchas Chad keeps re-discovering.
+2. **Consolidate near-duplicates** — multiple LTM entries that say the
+   same thing, or daily-memory sections that have aged into the
+   permanent record.
+3. **Archive stale** — LTM entries that are time-bounded ("this week
+   we're shipping X") and no longer relevant.
+
+# Output format (last non-empty line of stdout MUST be this JSON)
+{
+  "status": "done",
+  "lift_to_memory_md": [
+    {"text": "...", "reason": "...", "source_ref": "ltm:<id> | daily:<date>"}
+  ],
+  "consolidate": [
+    {"keep_id": "ltm:<id>", "merge_ids": ["ltm:<id>", "ltm:<id>"], "reason": "..."}
+  ],
+  "archive": [
+    {"id": "ltm:<id>", "reason": "..."}
+  ],
+  "summary": "<one-sentence overview>"
+}
+
+# Constraints
+- Be conservative. Empty arrays are valid. Quality over quantity.
+- Never propose deleting or modifying anything in IDENTITY.md, SOUL.md,
+  USER.md, AGENTS.md, TOOLS.md — those are operator-owned, not Chad's
+  curation surface.
+- Respect existing MEMORY.md security rule: do not lift secrets,
+  credential paths, or per-correspondent private content into MEMORY.md
+  (that goes in USER.md sections per their owner).
+
+# SIGNAL
+$(cat "$signal_md")
+PROMPT_EOF
+
+# Spawn via researcher kind (read-only, no external writes by contract)
+if ! command -v chad-spawn >/dev/null 2>&1; then
+  echo "WARN: chad-spawn not found; saving prompt for manual review"
+  echo "prompt: $prompt"
+  exit 0
+fi
+
+task_id="$(chad-spawn --kind researcher --task-file "$prompt" --budget-tokens "$budget_tokens" 2>"${run_dir}/spawn.err" || true)"
+if [ -z "${task_id:-}" ]; then
+  echo "spawn failed; see ${run_dir}/spawn.err"
+  exit 3
+fi
+echo "spawned researcher task: ${task_id}"
+
+# Symlink latest for chad-memory-snapshot to include in next snapshot
+ln -snf "$run_dir" "${CURATOR_RUNS}/latest"
+
+# Wait for result (chad-spawn is sync per chad-readme.md §4.3)
+result_file="${OPENCLAW_DATA}/subagents/${task_id}/result.json"
+if [ -f "$result_file" ]; then
+  cp "$result_file" "${run_dir}/result.json"
+  echo "result: ${run_dir}/result.json"
+  # Extract the JSON proposal from stdout (last non-empty line)
+  stdout_log="${OPENCLAW_DATA}/subagents/${task_id}/stdout.log"
+  if [ -f "$stdout_log" ]; then
+    proposals="$(awk 'NF{line=$0} END{print line}' "$stdout_log")"
+    if echo "$proposals" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' >/dev/null 2>&1; then
+      echo "$proposals" > "${run_dir}/proposals.json"
+      echo "proposals: ${run_dir}/proposals.json"
+    else
+      echo "WARN: last line of stdout was not JSON; raw output saved at ${run_dir}/result.json"
+    fi
+  fi
+fi
+
+# Audit log entry — for chad-action-gate
+if command -v chad-action-gate >/dev/null 2>&1; then
+  chad-action-gate log memory_curator_propose "${ts}" --result ok 2>/dev/null || true
+fi
+
+echo "curator pass complete: ${run_dir}"

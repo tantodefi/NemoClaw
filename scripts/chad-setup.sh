@@ -351,7 +351,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve chad-proposal-apply chad-skill-watch; do
+      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve chad-proposal-apply chad-skill-watch chad-memory-snapshot chad-memory-curator; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -683,6 +683,72 @@ elif [ -n "${SANDBOX_POD:-}" ]; then
   fi
 fi
 
+# ── Step 3e: Enforce memory-lancedb autoCapture: true ─────────────────────
+#
+# Memory-lancedb ships with `autoCapture: false`, which means even though the
+# plugin's MEMORY_TRIGGERS regex array is wired up (English + Czech patterns
+# for "remember/preferences/decisions/contact/possessives"), no captures
+# actually happen. LTM stays empty. Flipping autoCapture: true is the unlock.
+#
+# Self-heal because openclaw plugin enable/disable waves can reset this in
+# the persisted config (observed during 2026-05 memory-plugin deployment).
+
+if [ -n "${SANDBOX_POD:-}" ]; then
+  step "Ensuring memory-lancedb autoCapture is true"
+  if [ "$dry_run" -eq 1 ]; then
+    echo "  [dry-run] python3 jq autoCapture=true on /sandbox/.openclaw/openclaw.json"
+  else
+    docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+      python3 -c '
+import json, sys
+p = "/sandbox/.openclaw/openclaw.json"
+with open(p) as f: cfg = json.load(f)
+ml = cfg.get("plugins", {}).get("entries", {}).get("memory-lancedb")
+if not ml:
+    print("memory-lancedb not enabled — skipping")
+    sys.exit(0)
+cfg_ml = ml.setdefault("config", {})
+if cfg_ml.get("autoCapture") is True:
+    print("autoCapture already true")
+    sys.exit(0)
+cfg_ml["autoCapture"] = True
+with open(p, "w") as f: json.dump(cfg, f, indent=2)
+print("autoCapture set to true")
+' 2>&1 | sed "s/^/  /" || warn "Could not enforce autoCapture (continuing)"
+  fi
+fi
+
+# ── Step 3f: Self-heal — remove gbrain from openclaw.json mcp.servers ────
+#
+# gbrain is intentionally NOT an MCP server (see Step 3a comment). PGLite
+# single-process file lock means a long-lived `gbrain serve` blocks every
+# cron wrapper that uses `gbrain` CLI directly. Wave-N plugin enable flows
+# can re-introduce the MCP entry; this step actively removes it on every
+# setup run so the constraint sticks.
+
+if [ -n "${SANDBOX_POD:-}" ]; then
+  step "Ensuring gbrain is NOT registered as an MCP server"
+  if [ "$dry_run" -eq 1 ]; then
+    echo "  [dry-run] python3 remove mcp.servers.gbrain from /sandbox/.openclaw/openclaw.json"
+  else
+    docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX_POD" -- \
+      python3 -c '
+import json, sys
+p = "/sandbox/.openclaw/openclaw.json"
+with open(p) as f: cfg = json.load(f)
+servers = cfg.get("mcp", {}).get("servers", {})
+removed = servers.pop("gbrain", None)
+if not servers and "mcp" in cfg:
+    cfg.pop("mcp")
+if removed is None:
+    print("gbrain MCP entry already absent")
+else:
+    with open(p, "w") as f: json.dump(cfg, f, indent=2)
+    print("gbrain MCP entry removed (was: " + json.dumps(removed) + ")")
+' 2>&1 | sed "s/^/  /" || warn "Could not enforce gbrain-MCP-absent (continuing)"
+  fi
+fi
+
 # ── Step 4: Authenticate gh ───────────────────────────────────────────────
 
 if [ "$skip_gh_auth" -eq 0 ]; then
@@ -861,6 +927,21 @@ if [ "$skip_crons" -eq 0 ]; then
   else
     info "Registering gbrain-dream cron (nightly 03:30 UTC)"
     register_cron_via_ssh "gbrain-dream" "30 3 * * *" "" "$gbrain_dream_message"
+  fi
+
+  # Weekly memory curator (Hermes pattern): proposes consolidation diffs
+  # for memory-lancedb captures + workspace MEMORY.md. Runs Saturday
+  # 04:00 UTC — separate day from self-improve (Sun) and gbrain-dream
+  # (nightly), so signal collection isn't competing with its own outputs.
+  # DRAFT-ONLY: emits proposals.json the operator (or future
+  # chad-memory-apply) reviews. Never mutates lancedb or workspace files.
+  memory_curator_message='Run `chad-memory-curator --days 7`. The wrapper snapshots memory dirs first, then spawns a researcher that proposes consolidation actions to /sandbox/.openclaw-data/curator-runs/<utc>/proposals.json. Append a one-line summary to todays memory under `## Memory curator`. Never apply proposals.'
+
+  if echo "$existing_crons" | grep -q "memory-curator"; then
+    warn "memory-curator cron already registered — skipping"
+  else
+    info "Registering memory-curator cron (weekly Sat 04:00 UTC)"
+    register_cron_via_ssh "memory-curator" "0 4 * * 6" "" "$memory_curator_message"
   fi
 
   # Weekly budget audit: compares cron telemetry (p95 in/out/dur, error rate)
