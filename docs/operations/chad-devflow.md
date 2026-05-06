@@ -134,6 +134,9 @@ These run unattended via `openclaw cron`. Schedules and budgets live in [`script
 | `chad-self-improve` | `0 3 * * 0` | Weekly Sunday: reads last 7 days of subagent results, `openclaw cron runs` failures per cron, `auto-action-log.jsonl` errors, outstanding proposals; spawns researcher to draft 1–3 durable improvements under `## Self-improvement` in `feedback-proposals.md`. |
 | `chad-proposal-apply` | `30 4 * * *` | Daily 04:30 UTC: closes the autonomy loop on cron telemetry. Reads the latest structured proposals JSON block from `feedback-proposals.md`, validates each entry against the safe-list (`timeoutSeconds`/`maxOutputTokens` within ±2× bounds, last-run ok, gated by `chad-action-gate chad_self_modify_cron`), applies via `openclaw cron edit`, appends an `## Applied` block. Anything riskier stays draft-only. |
 | `chad-skill-watch` | `0 9 * * *` | Daily 09:00 UTC: diffs `openclaw skills list --json` against `/sandbox/.openclaw-data/state/skills-snapshot.json`, surfaces added/removed/changed skills under `## Skill catalog diff` in today's memory. Closes the gap where new gstack skills land silently and chad keeps using older patterns. |
+| `chad-memory-curator` | `0 4 * * 6` | Weekly Sat 04:00 UTC: Hermes-style memory consolidation. Snapshots first via `chad-memory-snapshot`, then spawns a researcher with the curator prompt to propose lift-to-MEMORY.md, consolidate, and archive actions over recent LTM + daily memory. **Draft-only**: writes proposals to `curator-runs/<utc>/proposals.json`. Inactivity-gated (≥7d since last + ≥1h idle) and budget-guarded. |
+| `chad-spawn-poll` | `*/5 * * * *` | Every 5min: reconciles async gha sub-agent spawns. Scans queue ledger for `running`+`gha` entries, fetches result.json from `tantodefi/chad-state`, copies back to local `subagents/<id>/`, transitions ledger to done/failed/timeout, runs `chad-collect`. Skips entries fresher than 1min so the runner has cold-start time. |
+| `chad-spawn-gc` | `30 2 * * 1` | Weekly Mon 02:30 UTC: branch retention for `chad-spawn/*` on chad-state. Default: done=7d, failed=30d, in-flight always kept. Without this, ~700 branches accrue/month at the 24-spawn/day budget. |
 
 ### Inference / drafting / sending
 
@@ -153,8 +156,10 @@ These run unattended via `openclaw cron`. Schedules and budgets live in [`script
 | `chad-ensure-today-memory` | Ensures `workspace/memory/<YYYY-MM-DD>.md` exists, returns its path. Used by every wrapper that appends to today's memory. |
 | `chad-auth-context` | Manages the AuthContext token used to elevate cron-spawned sub-agents to premium / privileged paths. |
 | `chad-dump-logs` | Tarball of recent gateway/cron/sub-agent logs. See [Log Locations](log-locations.md). |
+| `chad-memory-snapshot` | Pre-mutation safety net for the memory stack. Tar-gzips lancedb + wiki vault + workspace + curator-latest into `memory-snapshots/<utc>/`. `create` / `list` / `rollback` / `prune` subcommands; rollback snapshots first so it's reversible; keeps last 5. Called by `chad-memory-curator`. |
 | `_chad-paths.sh` | Sourced by every wrapper. Defines `OPENCLAW_DATA`, `WORKSPACE`, `CRED_FILE`, etc. Single source of truth for filesystem paths. |
 | `auto-actions.template.json` | Template `auto-actions.json` deployed when `chad-setup.sh` finds no existing one. Holds per-channel daily counters and the kill-switch. |
+| `chad-state-bootstrap` | One-shot operator-host installer for the chad-state side of the gha spawn substrate. Clones `tantodefi/chad-state`, syncs `scripts/chad-state-templates/*` (the `agent-job.yml` workflow), opens a PR (or `--no-pr` for direct commit). Required only when first enabling gha-substrate kinds; not deployed into the sandbox. |
 
 ## Skill discovery and MCP wiring
 

@@ -199,15 +199,31 @@ can iterate on them without a rebuild.
 
 A kind is a YAML manifest under
 [`.github/skills/chad-orchestrator/kinds/`](.github/skills/chad-orchestrator/kinds/)
-describing how to invoke a sub-agent. Today we ship five:
+describing how to invoke a sub-agent. Today we ship seven:
 
-| Kind | Binary | Policy preset | Timeout / Budget | Use case |
-|---|---|---|---|---|
-| `coder` | `/usr/local/bin/pi` | `pi-agent` | 600s / 50000 tok | Write/refactor code, run build + tests |
-| `researcher` | `/usr/local/bin/claude` | `subagent-researcher` | 300s / 20000 tok | gh search, web facts, report |
-| `writer` | `/usr/local/bin/claude` | `subagent-writer` | 600s / 25000 tok | Draft mail, docs, articles (never publishes — one spawn per article) |
-| `reviewer` | `/usr/local/bin/claude` | `subagent-reviewer` | 300s / 25000 tok | Audit PR diff, run checklist (read-only gh) |
-| `fitness` | `/usr/local/bin/claude` | `subagent-researcher` | 300s / 15000 tok | Strength + mobility answers from gbrain-ingested books (Rippetoe, Starrett) — brain-first, falls back to archive.org |
+| Kind | Binary | Policy preset | Substrate | Timeout / Budget | Use case |
+|---|---|---|---|---|---|
+| `coder` | `/usr/local/bin/pi` | `pi-agent` | local | 600s / 50000 tok | Write/refactor code, run build + tests |
+| `researcher` | `/usr/local/bin/claude` | `subagent-researcher` | local | 300s / 20000 tok | gh search, web facts, report |
+| `writer` | `/usr/local/bin/claude` | `subagent-writer` | local | 600s / 25000 tok | Draft mail, docs, articles (never publishes — one spawn per article) |
+| `reviewer` | `/usr/local/bin/claude` | `subagent-reviewer` | local | 300s / 25000 tok | Audit PR diff, run checklist (read-only gh) |
+| `fitness` | `/usr/local/bin/claude` | `subagent-researcher` | local | 300s / 15000 tok | Strength + mobility answers from gbrain-ingested books (Rippetoe, Starrett) — brain-first, falls back to archive.org |
+| `codex` | `/usr/local/bin/codex` | `subagent-codex` | **gha** | 600s / 50000 tok | OpenAI Codex CLI as alternate code/research backend. NVIDIA fallback when `OPENAI_API_KEY` absent. |
+| `opencode` | `/usr/local/bin/opencode` | `subagent-opencode` | **gha** | 600s / 50000 tok | Multi-provider coding CLI (OpenAI/Anthropic/OpenRouter/NVIDIA). Honors `OPENAI_BASE_URL` for fallback routing. |
+
+**Substrates.** Each kind picks where it executes:
+
+- `local` — sub-agent runs in-container under the kind's L7 policy
+  preset. Existing default. Synchronous spawn.
+- `gha` — sub-agent runs on a GitHub Actions runner via
+  `tantodefi/chad-state` (popebot-style branch-as-job-record). Lets us
+  add new providers (codex, opencode) without baking binaries into the
+  Chad image. Loses L7 policy enforcement; gains real isolation per
+  spawn. See [docs/design/spawn-as-github-run.md](docs/design/spawn-as-github-run.md).
+
+Per-spawn override: `chad-spawn --substrate gha` (or `--substrate local`).
+Per-spawn binary swap: `chad-spawn --binary-override /usr/local/bin/codex --kind writer ...` (the kind's L7 policy still applies, so the override binary must be in its allowlist).
+Async (gha-only): `chad-spawn --async --substrate gha ...` returns task_id immediately; `chad-spawn-poll` cron reconciles when the runner commits result.json back.
 
 The manifest shape:
 
@@ -216,6 +232,7 @@ kind: coder
 binary: /usr/local/bin/pi
 invocation: prompt-stdin            # prompt-stdin | prompt-arg | openclaw-agent
 network_policy_preset: pi-agent
+substrate: local                    # local | gha (default: local)
 default_timeout: 600
 default_budget_tokens: 50000
 prompt_template: |
@@ -229,8 +246,9 @@ Adding a new kind is:
 
 1. Drop a `kinds/<name>.yaml` file.
 2. Drop a matching preset under `nemoclaw-blueprint/policies/presets/subagent-<name>.yaml` if the existing presets don't cover it.
-3. Sync skills + apply policy.
-4. Run `chad-spawn --kind <name> --task-file /tmp/t.md --dry-run` to validate.
+3. For gha-substrate kinds: ensure `agent-job.yml` in chad-state knows how to install the binary (edit the workflow's "Install <name>" step), and any new provider keys are set as chad-state secrets.
+4. Sync skills + apply policy.
+5. Run `chad-spawn --kind <name> --task-file /tmp/t.md --dry-run` to validate.
 
 No recompile, no image rebuild.
 
@@ -493,7 +511,7 @@ catch honest bugs, not attackers.
 
 ## 7. Cron integration (token-optimized)
 
-Chad runs **six** standing cron jobs, all registered by `chad-setup.sh`.
+Chad runs **nine** standing cron jobs, all registered by `chad-setup.sh`.
 The schedules are **deliberately conservative** — every cron fire
 tokenizes instructions and spawns a model call, so the rule is:
 fewer, cheaper runs + a budget guard at the top of each one.
@@ -503,9 +521,12 @@ fewer, cheaper runs + a budget guard at the top of each one.
 | `email-check` | `0 2,6-23 * * *` (19×/day) | skip if `remaining_tokens < 30000` | Reads mail via `proton-tool`, follows `EMAIL-POLICY.md` rules in the workspace, logs to `memory/<today>.md` |
 | `workspace-backup` | every 6h | n/a (no model call) | `chad-backup-to-github` with the §12 diff-check |
 | `issue-triage` | daily 10:00 UTC | skip if `remaining_tokens < 3×N×70k` | `chad-issue-triage` — scores open issues, routes top 2 through a researcher (see §12) |
-| `gbrain-dream` | nightly 03:00 UTC | skip if `remaining_tokens < 50k` | `chad-gbrain-dream` — runs `gbrain dream` to consolidate links and surface orphans |
+| `gbrain-dream` | nightly 03:30 UTC | skip if `remaining_tokens < 50k` | `chad-gbrain-dream` — runs `gbrain dream` to consolidate links and surface orphans |
 | `self-improve` | weekly Sun 03:00 UTC | skip if `remaining_tokens < 2×budget` | `chad-self-improve` — proposes 1–3 durable improvements based on last week's signal (see §13) |
 | `chad-budget-audit` | weekly Mon 04:00 UTC | n/a (audits, no model call) | Compares last-50-runs telemetry against `task-profiles.json`, rolls up premium spend from `/tmp/chad-premium.jsonl`, appends recommendations to `memory/feedback-proposals.md` |
+| `memory-curator` | weekly Sat 04:00 UTC | inactivity-gated (≥7d since last + ≥1h idle) + budget guard | `chad-memory-curator` — Hermes-style consolidation pass over memory-lancedb captures + workspace MEMORY.md. Snapshots first via `chad-memory-snapshot`, then spawns a researcher with the curator prompt. **Draft-only**: writes proposals to `curator-runs/<utc>/proposals.json` for human review. |
+| `spawn-poll` | every 5min | n/a (lightweight ledger scan) | `chad-spawn-poll` — reconciles async gha sub-agent spawns. Scans queue ledger for `running`+`gha` entries, fetches result.json from chad-state, transitions ledger to `done\|failed`, runs `chad-collect`. Skips entries fresher than `--max-age 1` so the runner has cold-start time. |
+| `spawn-gc` | weekly Mon 02:30 UTC | n/a (gh API only) | `chad-spawn-gc` — branch retention for `chad-spawn/*` on chad-state. Default: done=7d, failed=30d, in-flight always kept. Without this, ~700 branches accrue per month. |
 
 **What changed from the prior schedule:**
 
@@ -744,19 +765,23 @@ The backup set also grew on this branch:
 
 ---
 
-## 10. Phase-2 (not in this branch)
+## 10. Phase-2 (status of follow-up work)
 
-The orchestrator landed on this branch is intentionally the **minimum
-viable contract**. A lot of obvious improvements were deliberately held
-for a follow-up so this PR stays reviewable.
+The orchestrator landed on this branch was intentionally a **minimum
+viable contract**. Several improvements were deliberately held for
+follow-up; some have since shipped. Status as of 2026-05-06:
 
-1. **Nested sandbox spawn.** Today all sub-agents share Chad's container
-   (different L7 policies, same filesystem). Phase-2 spawns each
-   sub-agent into its own k3s pod in the same cluster, so a compromised
-   sub-agent can't read another sub-agent's `stdout.log`.
-2. **Async queue with a worker.** `chad-spawn` is synchronous. A proper
-   worker drains `queue/tasks.jsonl` in a background process and
-   `chad-spawn-status` becomes the only way to poll.
+1. ✅ **Nested-spawn isolation — shipped (gha substrate).** Sub-agents
+   can now spawn onto a per-job GitHub Actions runner instead of
+   sharing Chad's container. See [docs/design/spawn-as-github-run.md](docs/design/spawn-as-github-run.md)
+   for the design (Phases A–C all shipped 2026-05-06). The k3s-pod
+   substrate is still future work for kinds that need both L7 policy
+   enforcement *and* per-spawn isolation.
+2. ✅ **Async spawn — shipped.** `chad-spawn --async --substrate gha`
+   returns immediately; the ledger gets `substrate` + `async` fields;
+   `chad-spawn-poll` cron (every 5min) reconciles result.json back
+   into `subagents/<id>/` and transitions the ledger entry. Branch
+   retention via `chad-spawn-gc` weekly cron.
 3. **Cron DSL.** `chad-intake --from cron` takes a task file today. A
    YAML DSL would let Chad register new crons at runtime — "every
    Tuesday 9am, spawn a reviewer against my open PRs".
@@ -772,6 +797,11 @@ for a follow-up so this PR stays reviewable.
 7. **Diff-checked, compressed backups.** The §9 diff-check is
    per-file. Phase-2 consolidates into a single commit with a tree
    sha diff — one API call per backup run instead of one per file.
+8. **Webhook-based completion.** Today `chad-spawn-poll` polls every
+   5min. A real callback receiver in Chad's gateway would replace
+   that with push semantics, freeing both the runner-to-Chad
+   reconciliation latency and the unnecessary work when no spawns
+   are in flight.
 
 ---
 

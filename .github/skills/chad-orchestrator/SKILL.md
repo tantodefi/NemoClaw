@@ -180,7 +180,7 @@ sandbox resets alongside memory.
 
 ```bash
 # 1. Classify a task (optional — Chad can pick the kind directly).
-kind="$(chad-route --task-file /tmp/task.json)"     # echoes one of: coder|researcher|writer|reviewer
+kind="$(chad-route --task-file /tmp/task.json)"     # echoes: coder|researcher|writer|reviewer|fitness|codex|opencode
 
 # 2. Spawn.
 task_id="$(chad-spawn --kind "$kind" --task-file /tmp/task.json)"
@@ -199,6 +199,42 @@ chad-intake --from chat --task-file /tmp/task.json
 # or:
 chad-intake --from proton --message-id MSGID
 ```
+
+### Substrate selection (where the sub-agent runs)
+
+Each kind has a default substrate set in its manifest. Override per
+spawn when you need to:
+
+```bash
+# Force in-container execution (default for coder/researcher/writer/reviewer/fitness):
+chad-spawn --kind coder --substrate local --task-file /tmp/task.json
+
+# Force GHA runner (default for codex/opencode):
+chad-spawn --kind writer --substrate gha --task-file /tmp/task.json
+
+# Async dispatch (gha-only) — returns task_id immediately. The
+# chad-spawn-poll cron (every 5min) transitions the ledger entry
+# from running → done|failed when the runner commits result.json back.
+chad-spawn --kind codex --async --task-file /tmp/task.json
+
+# Per-spawn binary swap — use codex for one writer spawn. The kind's
+# L7 policy preset still applies; the override binary must be on its
+# allowlist or the proxy 403s.
+chad-spawn --kind writer --binary-override /usr/local/bin/codex --task-file /tmp/task.json
+```
+
+Substrates:
+
+- **`local`** — runs in Chad's container under the kind's L7 policy
+  preset. Synchronous. Default for kinds whose work needs gbrain,
+  embedded Nemotron, or `/sandbox/source` access.
+- **`gha`** — runs on a GitHub Actions runner via `tantodefi/chad-state`
+  (popebot-style branch-as-job-record). Runner installs the binary on
+  demand, picks provider by available secret (NVIDIA fallback when
+  `OPENAI_API_KEY` absent), commits result back. Loses L7 enforcement;
+  gains real per-spawn isolation. Default for codex / opencode.
+
+See `docs/design/spawn-as-github-run.md` for the full architecture.
 
 ## Dry-Run Mode
 
