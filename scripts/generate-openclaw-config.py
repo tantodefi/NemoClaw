@@ -263,11 +263,19 @@ def build_config(env: dict | None = None) -> dict:
             ],
         }
 
+    # idleTimeoutSeconds gates how long the agent can pause between LLM
+    # tokens before erroring. Embedded Nemotron's thinking phase regularly
+    # exceeds 60s on cron prompts, so 180s is the floor for reliability.
+    # Raised from 60s after 2026-05-11 incident where self-improve and
+    # issue-triage crons idle-timed-out despite clean wrapper exits.
+    llm_idle_timeout = int(env.get("NEMOCLAW_LLM_IDLE_TIMEOUT", "180"))
+
     config = {
         "agents": {
             "defaults": {
                 "model": {"primary": primary_model_ref},
                 "timeoutSeconds": agent_timeout,
+                "llm": {"idleTimeoutSeconds": llm_idle_timeout},
             }
         },
         "models": {"mode": "merge", "providers": providers},
@@ -283,6 +291,14 @@ def build_config(env: dict | None = None) -> dict:
             "trustedProxies": ["127.0.0.1", "::1"],
             "auth": {"token": ""},
         },
+        # bonjour plugin advertises the gateway over mDNS. Useless inside
+        # a loopback-only Docker container — nobody can see the broadcasts.
+        # Worse, its announce watchdog races against ciao's Promise cleanup
+        # and throws `CIAO ANNOUNCEMENT CANCELLED` unhandled rejections
+        # every ~25s. Pre-safety-net builds exited on each rejection;
+        # current builds swallow them but the noise is constant. Disable
+        # at config-time so the plugin never starts.
+        "plugins": {"entries": {"bonjour": {"enabled": False}}},
     }
 
     if env.get("NEMOCLAW_WEB_SEARCH_ENABLED", "") == "1":
