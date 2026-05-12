@@ -35,7 +35,12 @@ set -euo pipefail
 
 OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
 WORKSPACE="${CHAD_WORKSPACE:-/sandbox/.openclaw/workspace}"
-PROPOSALS_FILE="${WORKSPACE}/memory/feedback-proposals.md"
+# Canonical proposals path: chad-budget-audit and chad-proposal-apply both
+# use ${OPENCLAW_DATA}/memory/feedback-proposals.md. Previously this script
+# wrote to ${WORKSPACE}/memory/feedback-proposals.md, which created a
+# split-brain where self-improve drafts went to a file nobody read.
+# Override with CHAD_PROPOSALS_FILE if you need to point elsewhere (tests).
+PROPOSALS_FILE="${CHAD_PROPOSALS_FILE:-${OPENCLAW_DATA}/memory/feedback-proposals.md}"
 QUEUE_FILE="${OPENCLAW_DATA}/queue/tasks.jsonl"
 SUBAGENTS_DIR="${OPENCLAW_DATA}/subagents"
 

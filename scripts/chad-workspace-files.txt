@@ -52,6 +52,14 @@ exec-approvals.json
 # the runtime section is the single source of truth.
 queue/tasks.jsonl
 queue/budget.json
+# Canonical proposals file: chad-self-improve writes durable-improvement drafts here,
+# chad-budget-audit writes p95-driven timeout/budget recommendations here, and
+# chad-proposal-apply reads from here. Was previously only the workspace-side copy
+# (workspace/memory/feedback-proposals.md), which led to a split-brain where
+# self-improve output went to a file no other wrapper read. Adding both paths keeps
+# the data side as the source of truth while preserving the workspace copy that
+# survives via the workspace-memory recursive backup.
+memory/feedback-proposals.md
 
 [runtime-dirs]
 # Custom agent registrations created via `openclaw agents add`. Lost twice across resets.
