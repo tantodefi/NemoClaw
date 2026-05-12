@@ -74,9 +74,13 @@ Open-webui binds to `127.0.0.1` only — the cloudflared sidecar is the sole
 inbound path. Cloudflare Access sits in front of that and verifies the user
 against `ADMIN_EMAILS` before any traffic reaches the tunnel.
 
-**Provider 1 (raw NVIDIA Build)** is the default — chat goes straight to
-`integrate.api.nvidia.com` from the host with the `NVIDIA_API_KEY`. Same model
-Chad uses (`nvidia/nemotron-3-super-120b-a12b`), but no agent stack between you and the LLM.
+**Provider 1 (NVIDIA Build via `nvidia-proxy`)** is the default — chat goes to
+the host-local `nvidia-proxy` on `127.0.0.1:3002`, which transparently forwards
+to `integrate.api.nvidia.com` for every request *except* `GET /v1/models`. That
+one endpoint is filtered against a `featured` set produced by the daily
+`nvidia-liveness` sweep, so the model dropdown only ever shows live,
+auto-curated flagships (one per provider by default). No agent stack between
+you and the LLM — same models Chad uses, just probed and pruned for you.
 
 **Provider 2 (`chad` model)** routes each turn through `chad-shim` running
 **inside** the sandbox, which translates `POST /v1/chat/completions` into
@@ -246,46 +250,106 @@ delete the user from `Settings → Users`. Removing only the email from
 Access leaves the open-webui account dormant but intact (no harm — the
 trusted header is the only way in, and they can't pass Access anymore).
 
-## Curated model picker (`seed-models.sql` + `loader.js`)
+## Model picker (auto-curated via `nvidia-proxy` + liveness sweep)
 
-The dropdown shows a curated 14-model list (Chad agent + Nemotron 3
-Super 120B + Llama 3.1/3.3 + Mixtral + Gemma 3 27B + GPT-OSS 20B/120B
-+ Phi-4 Multimodal + Qwen3 Coder + GLM-5.1 + MiniMax M2.5) plus
-hover-tooltip use-case descriptions. Two pieces drive that:
+The dropdown is **auto-curated** — no hand-maintained model list. A daily
+sweep probes every model NVIDIA exposes, marks the dead ones (EOL'd /
+non-serving / vanished from the catalog), and writes a `featured` list of
+per-provider top picks. The proxy filters `GET /v1/models` against that
+list so open-webui's dropdown only shows live, current flagships.
 
-- `scripts/openwebui/seed-models.sql` — INSERT-OR-REPLACE statements
-  that populate the `model` table in `webui.db`. Re-applied
-  automatically by `openwebui-setup.sh` after every container start;
-  idempotent, never duplicates rows, COALESCEs `user_id` to preserve
-  ownership on existing entries.
-- `scripts/openwebui/static/loader.js` — browser-side script that
-  patches each tippy.js tooltip in the model-picker dropdown to show
-  `meta.description` instead of the default `label (id)`. Setup
-  `docker cp`s it into the container at `/app/backend/open_webui/static/loader.js` on every run.
+### Components
 
-If you edit the curated set or descriptions via the admin UI and want
-the changes to survive a container wipe, dump the live state back into
-the source tree:
+| Piece | Where | Role |
+|---|---|---|
+| `nvidia-proxy.js` | host, port `3002`, run via launchd `dev.nemoclaw.nvidia-proxy` | Bun service. Filters `/v1/models` against `featured`; passes through everything else to `integrate.api.nvidia.com`. |
+| `nvidia-liveness.py` | host, daily 04:00 via launchd `dev.nemoclaw.nvidia-liveness` | Probes every model with a 1-token chat completion. Writes `liveness.json`. Flips `is_active=0` on `webui.db.model` rows whose `base_model_id` is dead. |
+| `nvidia-curation.toml` | `scripts/openwebui/nvidia-curation.toml` | Per-provider limit, exclude list, ranking heuristics. Edit + rerun liveness to apply. |
+| `liveness.json` | `~/.nemoclaw/openwebui/liveness.json` | Status per model (`live`/`dead`/`unknown`), probe latency, and the curated `featured` array the proxy reads. |
+| `seed-models.sql` | `scripts/openwebui/` | Custom display names + use-case descriptions for picker entries. Liveness auto-disables rows whose base is dead; the rest stay seeded for pretty labels. |
+
+### Dead-model classification
+
+A model is marked dead on the **first** sweep that gets HTTP 410 Gone
+(NVIDIA's explicit EOL signal). Other failures (404s, 5xx) take three
+consecutive strikes — protects against transient outages. Network timeouts
+don't strike at all; the previous status is preserved. Cold-start large
+models that take >60 s to respond stay "unknown" and don't appear in the
+dropdown until they confirm live on a future sweep.
+
+### Manual sweep + tuning
+
+```console
+# Run the sweep on demand instead of waiting for 04:00:
+$ /opt/homebrew/bin/python3 ~/.nemoclaw/source/scripts/openwebui/nvidia-liveness.py
+# Inspect last sweep:
+$ curl -s http://127.0.0.1:3002/_health | jq .
+$ jq '.featured, .last_sweep' ~/.nemoclaw/openwebui/liveness.json
+# Tail the proxy:
+$ tail -f ~/.nemoclaw/openwebui/nvidia-proxy.err.log
+```
+
+Open-webui caches `/v1/models` per connection. To pick up a fresh sweep
+without waiting for a container restart: **Admin → Settings → Connections
+→ refresh icon** on the OpenAI provider.
+
+### Tuning the dropdown width
+
+Edit `scripts/openwebui/nvidia-curation.toml`:
+
+```toml
+per_provider_limit = 1   # 1 = flagship-only (default, ~14 models)
+                         # 2 = + runner-up per provider (~25 models)
+                         # 0 = show every live model
+exclude = []             # block specific picks (glob OK)
+```
+
+Bump `per_provider_limit` if you want the runner-up per provider; add IDs
+to `exclude` if the heuristic picks a model you don't want (typically a
+vision-only or guardrail variant that landed as flagship).
+
+### Capability guidance — which family for what
+
+The auto-picker rotates specific model IDs over time, but the **provider
+families** stay stable. Rough buckets:
+
+| Best for | Look for |
+|---|---|
+| General reasoning / agentic flows | `nvidia/*nemotron*`, `meta/llama-3.x-*-instruct`, `openai/gpt-oss-120b` |
+| Code & tool-heavy turns | `qwen/*coder*`, `abacusai/*dracarys*`, `openai/gpt-oss-*` |
+| Multimodal (image-in) | `microsoft/phi-*multimodal*` |
+| Fast / cheap | `google/gemma-*`, `microsoft/phi-4*`, `openai/gpt-oss-20b` |
+| Non-English specialists | `sarvamai/*` (Indic), `stockmark/*` (Japanese), `upstage/solar-*` (Korean), `z-ai/glm*` and `qwen/*` (Chinese) |
+
+Edit a row's `meta.description` in **Admin → Settings → Models** to set
+hover-tooltip use-case text. To persist it across container wipes, dump
+the live `model` table back to source:
 
 ```console
 $ bash scripts/openwebui/regen-seed-models.sh
 $ git add scripts/openwebui/seed-models.sql && git commit -m "..."
 ```
 
+The `loader.js` browser shim still applies — it patches each model row's
+tippy.js tooltip to show `meta.description` instead of the default
+`label (id)`.
+
 ## Inference endpoints
 
-### Provider 1 — raw NVIDIA Build
+### Provider 1 — NVIDIA Build (via `nvidia-proxy`)
 
 Set in `scripts/openwebui/.env`:
 
 ```bash
-OPENAI_API_BASE_URL=https://integrate.api.nvidia.com/v1
-OPENAI_API_KEY=<NVIDIA_API_KEY from /sandbox/.openclaw-data/credentials/credentials.json>
+OPENAI_API_BASE_URL=http://host.docker.internal:3002/v1
+OPENAI_API_KEY=<NVIDIA_API_KEY from ~/.nemoclaw/credentials.json>
 ```
 
-The model picker shows every model in your NVIDIA Build catalog
-(`nvidia/nemotron-3-super-120b-a12b`, the various NIMs, etc.). No sandbox dependency —
-chat works even if the OpenShell sandbox is down.
+The base URL points at `nvidia-proxy` (host-local, see
+[Model picker](#model-picker-auto-curated-via-nvidia-proxy--liveness-sweep)
+above), not directly at NVIDIA. The proxy passes the same `OPENAI_API_KEY`
+straight through; auth still happens against `integrate.api.nvidia.com`.
+No sandbox dependency — chat works even if the OpenShell sandbox is down.
 
 > Note: Cloudflare passes the user's email through to open-webui in tunnel
 > mode, but **NVIDIA Build sees no per-user identity** beyond your shared
@@ -449,6 +513,9 @@ DELETE is the only sane setting.
 | 530 / "Argo tunnel error" | cloudflared can't reach the tunnel ingress target | `npm run webui:logs`; check open-webui is healthy |
 | Browser loops on Access login | Email not in `ADMIN_EMAILS`, or policy didn't apply | Re-run setup; verify policy in CF Zero Trust dashboard |
 | 502 from open-webui | `OPENAI_API_BASE_URL` is wrong or upstream is down | `curl $OPENAI_API_BASE_URL/models` from host to test |
+| Dropdown is empty / very short | `nvidia-proxy` down OR `liveness.json` lists everything dead | `curl http://127.0.0.1:3002/_health` — if not responding, `launchctl kickstart -k gui/$UID/dev.nemoclaw.nvidia-proxy`. Then refresh the connection in *Admin → Settings → Connections*. |
+| Dropdown shows wrong picks per provider | Heuristic chose poorly (vision/guardrail variant won) | Add the offender to `exclude` in `scripts/openwebui/nvidia-curation.toml`, rerun `nvidia-liveness.py` |
+| Newly added NVIDIA model not appearing | Daily sweep hasn't run yet OR model not in live set | `python3 ~/.nemoclaw/source/scripts/openwebui/nvidia-liveness.py` then refresh the connection. Check `jq '.models["provider/name"]' ~/.nemoclaw/openwebui/liveness.json` for its status. |
 | `chad` model picker shows but chat 502s | SSH tunnel down OR shim crashed | `npm run webui:chad:status` first; restart tunnel and/or `ssh openshell-chad 'pgrep -af chad-shim.py'` |
 | `chad` model not in picker | Connection 2 not added in admin UI, or `/v1/models` 404 | Re-add provider in *Admin → Connections*; verify `curl http://127.0.0.1:8901/v1/models` returns the `chad` entry |
 | `chad` reply is `[chad-shim] empty reply (stopReason=…)` | openclaw produced no text payloads (tool-only turn, or model declined) | Look at `/tmp/chad-shim.log` and the openclaw session log; some turns Chad delegates to a sub-agent and the immediate reply is empty |

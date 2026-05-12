@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# nvidia-curation.toml — controls which models nvidia-proxy exposes to open-webui.
+#
+# The daily liveness sweep applies this file to the NVIDIA catalog and writes a
+# `featured` array into liveness.json. The proxy returns only featured + live
+# models from GET /v1/models, so open-webui's dropdown stays curated.
+#
+# Strategy: per-provider top-N picks, ranked by newest version then largest
+# params parsed from the model id. No hand-pinning — purely automatic so new
+# models from any provider get picked up the day they're released.
+#
+# Edit, then either wait for the 04:00 daily sweep or rerun manually:
+#   /opt/homebrew/bin/python3 ~/.nemoclaw/source/scripts/openwebui/nvidia-liveness.py
+
+# Top-N picks per provider. 1 = strict flagship-only (~28 models total today),
+# 2 = flagship + runner-up (~50). Single-model providers get their one model
+# regardless.
+per_provider_limit = 1
+
+# Never include — applied after auto-selection. Glob `*` supported.
+# Used to override the heuristic when it picks a model you don't want
+# (e.g. a vision-only or guardrail variant that landed as provider top-pick).
+exclude = []
+
+[ranking]
+prefer_newer_major = true   # llama-3.3 beats llama-3.1
+prefer_larger_params = true # tiebreak within same major: 70b beats 8b
