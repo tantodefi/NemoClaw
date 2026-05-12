@@ -1,13 +1,34 @@
 ---
 name: proton-calendar
 description: >
-  Interact with Proton Mail and Calendar using the go-proton-api Go library.
-  Use when the user asks to read emails, list calendar events, or manage
-  their Proton account. Requires Go 1.26+ and network access to Proton API
-  endpoints and Go module proxies.
+  Interact with Proton Mail and Calendar via the `proton-tool` CLI for
+  user-initiated email and calendar requests. The hourly email-check cron
+  already handles routine inbox sweeps deterministically — see
+  EMAIL-POLICY.md for the cron's behavior (admin senders, anti-spam,
+  auto-reply budget, kill switch). Use this skill when the user asks to
+  read mail, send a new message, draft a reply, list/create/update
+  calendar events, mark messages read, trash messages, or manage their
+  Proton account interactively.
+  Trigger keywords - read email, check inbox, list mail, send mail,
+  send email, reply, draft email, reply-all, mark read, trash mail,
+  list calendar, show events, schedule event, calendar event, proton,
+  mailbox, my emails, my calendar.
 ---
 
 # Proton Calendar & Mail Skill
+
+## When to use this skill
+
+| Situation | Use this skill? |
+|---|---|
+| User asks to read/send/reply/draft email, or list/create calendar events | **Yes** — invoke `proton-tool` commands per the reference below |
+| User asks "did anyone email me?", "what's on my calendar?" | **Yes** — use the listing commands |
+| Hourly email-check cron is processing the inbox | **No** — the cron's wrapper (`chad-email-check-cron`) handles classification, mark-read, and auto-reply policy in bash without LLM involvement. Don't duplicate its work or override its decisions |
+| User wants to change which senders auto-reply, or pause auto-send | **No** — edit `/sandbox/.openclaw-data/auto-actions.json` per EMAIL-POLICY.md; do not invoke `proton-tool` to "fix" the policy |
+
+Routine inbox automation lives in `chad-email-check-cron` and
+[EMAIL-POLICY.md](../../../workspace/EMAIL-POLICY.md). This skill is the
+on-demand surface for user-initiated requests.
 
 ## Overview
 
