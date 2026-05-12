@@ -26,12 +26,22 @@ services:
       - ${WEBUI_DATA_DIR:-${HOME}/.nemoclaw/openwebui/data}:/app/backend/data
     environment:
       WEBUI_AUTH: "True"
+      # Pin the JWT signing key from .env. Without this, OpenWebUI generates a
+      # fresh /app/backend/.webui_secret_key on every container recreate (the
+      # file lives in the image layer, not the data volume), which invalidates
+      # every existing browser JWT — historical chats then 401 and the SPA
+      # bounces to home. Set once in .env, never rotate without warning users.
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY is required — generate with: openssl rand -hex 32}"
       ENABLE_SIGNUP: "${ENABLE_SIGNUP:-False}"
       # In tunnel mode this is set to Cf-Access-Authenticated-User-Email.
       # In quick mode it's empty, so open-webui falls back to its own login form.
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${WEBUI_AUTH_TRUSTED_EMAIL_HEADER:-}"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "${WEBUI_AUTH_TRUSTED_EMAIL_HEADER:-}"
       DEFAULT_USER_ROLE: "user"
+      # Show every base/custom model to every signed-in user. Without this,
+      # OpenWebUI's per-model access_grant filter hides models owned by the
+      # admin from regular users — the dropdown ends up empty for non-admins.
+      BYPASS_MODEL_ACCESS_CONTROL: "True"
       # Duration string (open-webui parses with python parse_duration; bare int
       # like "86400" raises "Invalid duration string" and breaks /signup).
       JWT_EXPIRES_IN: "24h"
