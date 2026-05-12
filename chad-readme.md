@@ -830,6 +830,47 @@ These are the rules I will reject PRs over:
 
 ---
 
+## 11.5 Known deploy gaps
+
+A running sandbox can lag behind `chad-dev` if the image was built before
+a wrapper was added. `chad-setup.sh` only runs at image build time, so
+wrappers added to source after the most recent build won't appear in
+`/usr/local/bin/` until a rebuild.
+
+Verify what's actually installed in a live sandbox:
+
+```bash
+for w in chad-spawn-poll chad-spawn-gc chad-memory-curator; do
+  ssh openshell-chad "[ -x /usr/local/bin/$w ] && echo PRESENT || echo MISSING"
+done
+```
+
+If anything reports MISSING:
+
+- **Stopgap** — deploy to a sandbox-writable path:
+
+  ```bash
+  ssh openshell-chad 'mkdir -p /sandbox/.openclaw-data/bin'
+  for w in chad-spawn-poll chad-spawn-gc chad-memory-curator; do
+    cat scripts/chad-cron-wrappers/$w | ssh openshell-chad \
+      "cat > /sandbox/.openclaw-data/bin/$w && chmod +x /sandbox/.openclaw-data/bin/$w"
+  done
+  # Point cron prompts at the new path:
+  ssh openshell-chad "openclaw cron edit <id> --message 'Run \`/sandbox/.openclaw-data/bin/<wrapper> ...\`'"
+  ```
+
+- **Permanent fix** — rebuild the image. `chad-setup.sh` line ~354 installs
+  every wrapper under `scripts/chad-cron-wrappers/` via `install_to_usrlocal`.
+
+Symptom of running without these wrappers: matching crons spend 8–22 min
+per tick with the agent grinding through `which`/`find`/`ls`/`npx` looking
+for the missing binary, burning 277k–666k input tokens before idle-timeout.
+The 2026-05-11 incident traced 100% of the spawn-poll / spawn-gc /
+memory-curator errors to this gap. Always check this before chasing
+other cron-error hypotheses.
+
+---
+
 ## 12. Where to look next
 
 - **SKILL.md** — [`/.github/skills/chad-orchestrator/SKILL.md`](.github/skills/chad-orchestrator/SKILL.md) is the operator-facing doc Chad reads at invocation time.
