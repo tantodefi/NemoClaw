@@ -365,6 +365,32 @@ Hybrid vector + graph knowledge brain running as a local PGLite store at
 > step now runs `chown -R sandbox:sandbox` and removes stale
 > `postmaster.pid` / `.gbrain-lock` via `kubectl exec` before `gbrain init`.
 
+##### Memory maintenance pipeline
+
+gbrain has three scheduled jobs that keep it current and bounded. All
+three write summaries to today's workspace memory file and produce
+feedback artifacts the signal-detector and self-improve loops consume.
+
+| Job | Schedule | Where it runs | What it does |
+|---|---|---|---|
+| **chad-gbrain-dream** | Daily 03:30 UTC (sandbox cron) | sandbox | Ingest workspace docs + memory + events → `gbrain put`; extract timeline; doctor; detach `gbrain embed --stale` and `gbrain extract links`. Writes `dream-digest-<date>.md` and (if doctor flags `[WARN/FAIL/ERROR]`) `feedback_brain_health_<date>.md`. Also surfaces `Embedded/Chunks` ratio in the digest; writes `feedback_embed_staleness_<date>.md` if < 95% (catches a silently-stalled embed job). |
+| **chad-webui-ingest** | Daily 04:30 UTC (host launchd) | host | Reads `~/.nemoclaw/openwebui/data/webui.db`, extracts chats updated in the last 25h from the `chat.chat` JSON column, formats as markdown with frontmatter, SSHes content into the sandbox via `gbrain put chat/<chat-id>`. Idempotent. Without this, OpenWebUI conversation history is invisible to long-term memory. |
+| **chad-gbrain-prune** | Weekly Sundays 02:00 UTC (sandbox cron) | sandbox | Retention sweep. Deletes `memory/<date>` and `events/<date>` >365d from gbrain; deletes workspace `dream-digest-*.md`, `feedback_*.md`, `prune-log-*.md` >30d. **Protects** `system/*`, `agent/*`, and the workspace `<date>.md` journal (source-of-truth). Default `DRY_RUN=1` — set `DRY_RUN=0` in the cron env to actually delete. |
+
+The three together implement the convergence loop: openwebui chats →
+gbrain (`webui-ingest`) → dream consolidation (`dream`) → bounded
+storage (`prune`). Both CLI-originated and OpenWebUI-originated turns
+end up in the same brain.
+
+Host-side launchd inventory: `dev.nemoclaw.{nvidia-proxy,
+nvidia-liveness, chad-webui-ingest, chad-tunnel}.plist`. Sandbox-side
+cron inventory: `openclaw cron list`. Memory-plugin inventory: the
+gateway loads 9 plugins (`acpx, active-memory, browser, device-pair,
+memory-lancedb, memory-wiki, phone-control, talk-voice, tokenjuice`)
+— `memory-lancedb` actively injects ~3 contextual memories per agent
+turn alongside gbrain queries; it is **not** orphaned and must not be
+deleted.
+
 #### gstack
 
 gstack ships two distinct tiers; only the first works inside Chad's
@@ -664,12 +690,33 @@ Chad's state lives in three places, in order of criticality:
 | Tier | Location | Contents | Restored by |
 |---|---|---|---|
 | **1. GitHub** | `tantodefi/chad-state` (private) | `workspace/` including MEMORY.md, memory/, subagents/, queue/, budget.json | `chad-restore-from-github` |
-| **2. Host tarball** | `~/.nemoclaw/backups/*.tar.gz` | Full `/sandbox` snapshot | `scripts/backup-host.sh --restore` |
-| **3. Container PVC** | k8s PV or docker volume | Live filesystem | automatic on restart |
+| **2. Host tarball** | `~/.nemoclaw/backups/sandbox-state-*.tar.gz` | Full `/sandbox` snapshot streamed via SSH tar | `tar -xzf` + `kubectl cp` |
+| **3. Pod ephemeral fs** | container writable layer (NOT a PVC) | Live filesystem | **NOTHING — see warning below** |
 
 Tier 1 is the "nuclear survival" path — if every tier below is lost,
 `chad-setup.sh` on a blank sandbox recovers everything but the running
 processes.
+
+> ⚠ **CRITICAL — `/sandbox` is NOT on a PVC.** The chad pod mounts only
+> `openshell-client-tls` (secret), `openshell-supervisor-bin`, and the
+> default `kube-api-access` service-account volume. All of `/sandbox`
+> (~1.2 GB: gbrain pglite, openclaw config, workspace memory, lancedb,
+> credentials) lives in the container's writable layer.
+>
+> Running `kubectl delete pod chad -n openshell` (or anything that
+> recreates the pod) **WIPES THE BRAIN.** Verify the mount situation
+> with `docker exec openshell-cluster-nemoclaw kubectl get pod chad -n openshell -o jsonpath='{.spec.volumes[*].name}'`.
+>
+> Before any pod-recreating operation, take a Tier-2 backup:
+> ```bash
+> TS=$(date -u +%Y%m%dT%H%M%SZ)
+> ssh openshell-chad 'cd / && tar -cf - sandbox' \
+>   | gzip > ~/.nemoclaw/backups/sandbox-state-${TS}.tar.gz
+> ```
+> Restore is `kubectl cp` the un-tarred tree back into the new pod plus
+> `chmod +x` on the wrappers. The proper fix is adding a PVC for
+> `/sandbox` in the nemoclaw-blueprint StatefulSet — until that lands,
+> treat the running pod as a single live copy.
 
 `chad-backup-to-github` was updated in this branch to **diff-check**
 before PUT: it computes the local blob sha (using the same algorithm

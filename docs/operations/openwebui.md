@@ -523,6 +523,47 @@ DELETE is the only sane setting.
 | First login lands as "pending" | `DEFAULT_USER_ROLE` was overridden | Set back to `user`; CF Access is the trust boundary |
 | Tunnel never connects | `CF_TUNNEL_TOKEN` truncated / wrong | `bash scripts/openwebui-down.sh --purge` then re-run setup |
 | LAN-reachable on host IP | Port binding regressed to `0.0.0.0` | Verify `ports:` in `docker-compose.yml` is `127.0.0.1:…` |
+| Webui chat history not in agent memory | `chad-webui-ingest` not loaded or SSH tunnel broken | `launchctl list \| grep chad-webui-ingest`; run manually `/opt/homebrew/bin/python3 ~/.nemoclaw/source/scripts/openwebui/chad-webui-ingest.py` and check `~/.nemoclaw/openwebui/webui-ingest.log` |
+| Chat appears twice in agent context | `gbrain put chat/<id>` ran while user was mid-conversation | Expected — `chad-webui-ingest` upserts by chat id, so older snapshot is overwritten on the next 04:30 UTC sweep |
+
+## Chat history → memory consolidation
+
+OpenWebUI chats persist in two places that need to stay in sync:
+
+- **`~/.nemoclaw/openwebui/data/webui.db`** (host SQLite) — the user-facing
+  chat list, message rendering, archive/share state. OpenWebUI reads this
+  directly. Turns live in the `chat` table's `chat` JSON column
+  (`json_extract(chat, '$.messages[*]')`), not the separate `message`
+  table (which is for channels).
+- **`/sandbox/.gbrain/brain.pglite`** (sandbox gbrain) — the long-term
+  memory consolidated by `chad-gbrain-dream` and queried by every agent
+  turn. Without bridge work, OpenWebUI chats are invisible here —
+  `chad-shim.py` routes each turn through `openclaw agent` which logs
+  to the session ledger, but the *human-facing* conversation
+  (titles, structure, archived state) never reaches gbrain.
+
+The **`chad-webui-ingest`** host launchd job at
+`~/Library/LaunchAgents/dev.nemoclaw.chad-webui-ingest.plist` closes
+that gap: daily at 04:30 UTC it reads chats updated in the last 25h
+from `webui.db`, renders each as markdown, and SSHes into the sandbox
+to run `gbrain put chat/<chat-id>`. After ingest, the next
+`chad-gbrain-dream` pass picks them up alongside the workspace journal.
+
+```console
+# manual sweep:
+$ /opt/homebrew/bin/python3 ~/.nemoclaw/source/scripts/openwebui/chad-webui-ingest.py
+# log:
+$ tail -f ~/.nemoclaw/openwebui/webui-ingest.log
+# verify chats reached the brain:
+$ ssh openshell-chad 'gbrain list --limit 100 | grep "^chat/"'
+```
+
+Retention: weekly `chad-gbrain-prune` (sandbox cron, Sundays 02:00 UTC)
+deletes `chat/<id>` pages older than 180 days, `memory/<date>` and
+`events/<date>` older than 365 days, and workspace `dream-digest-*.md`
+/ `feedback_*.md` older than 30 days. Defaults to `DRY_RUN=1`. See the
+"Memory maintenance pipeline" table in `chad-readme.md` § 4.6 for the
+full unified picture.
 
 ## Tear-down
 
