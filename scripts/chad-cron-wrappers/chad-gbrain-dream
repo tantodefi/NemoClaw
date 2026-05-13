@@ -147,8 +147,18 @@ HEALTH_FILE="${WORKSPACE}/memory/feedback_brain_health_${today}.md"
                || echo '')"
   if [ -n "$yesterday" ]; then
     echo "Pages added/updated since ${yesterday}:"
-    timeout 10 gbrain query --since "${yesterday}T00:00:00Z" --limit 30 2>/dev/null \
-      | head -40 || echo "_(query unavailable)_"
+    # gbrain doesn't expose `--since`; list newest and post-filter for
+    # date-suffixed slugs >= yesterday, plus every chat/<uuid> page
+    # (they were upserted by chad-webui-ingest in the last 25h).
+    timeout 10 gbrain list --limit 500 2>/dev/null \
+      | awk -F'\t' -v y="$yesterday" '
+          $1 ~ "^memory/" || $1 ~ "^events/" {
+            d = $1; sub("^[^/]*/", "", d)
+            if (d >= y) print "  - " $1
+          }
+          $1 ~ "^chat/" { print "  - " $1 }
+        ' | head -30 \
+      || echo "_(gbrain list unavailable)_"
   else
     echo "_(date arithmetic unavailable on this host)_"
   fi
