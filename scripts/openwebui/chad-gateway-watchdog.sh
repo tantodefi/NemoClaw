@@ -51,7 +51,9 @@ fi
 # ~1.7 GB which OOM'd on a 35k-token webui session). The gateway run is
 # detached so it survives the SSH exit.
 ssh -o BatchMode=yes "$SSH_HOST" "
+  PATH='/sandbox/.openclaw-data/bin:/usr/local/bin:/usr/bin:/bin' \
   NODE_OPTIONS='--max-old-space-size=${HEAP_MB}' \
+  CHAD_BUDGET_FILE='/sandbox/.openclaw-data/budget.json' \
   nohup openclaw gateway run --port ${PORT} \
     > /tmp/gateway-watchdog-$(date -u +%Y%m%dT%H%M%SZ).log 2>&1 < /dev/null &
   disown 2>/dev/null || true
