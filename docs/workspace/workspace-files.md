@@ -142,19 +142,37 @@ shared-file tooling (shared mount, `workspaces list` command) in
 
 Understanding when these files persist and when they are lost is critical.
 
-### Survives: Sandbox Restart
+### Survives: In-process Gateway Restart
 
-Sandbox restarts (`openshell sandbox restart`) preserve workspace files.
-The sandbox uses a **Persistent Volume Claim (PVC)** that outlives individual container restarts.
+A graceful `openclaw gateway restart` (where the pod stays up and only
+the gateway process is recycled) preserves workspace files — they live
+on the pod's writable filesystem, not in the gateway's memory.
 
-### Lost: Sandbox Destroy
-
-Running `nemoclaw <name> destroy` **deletes the sandbox and its PVC**.
-All workspace files are permanently lost unless you back them up first.
+### Lost: Pod Recreate or Sandbox Destroy
 
 :::{warning}
-Always back up your workspace files before running `nemoclaw <name> destroy`.
-See [Backup and Restore](backup-restore.md) for instructions.
+**`/sandbox` is on the pod's writable container layer — there is no PVC
+backing it.** Any operation that recreates the pod (`kubectl delete pod
+chad -n openshell`, `nemoclaw <name> destroy`, a node-level reschedule)
+**permanently deletes ~1.2 GB of state**: gbrain pglite, openclaw
+config, workspace memory, lancedb plugin cache, credentials.
+
+Always back up first:
+
+```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+ssh openshell-chad 'cd / && tar -cf - sandbox' \
+  | gzip > ~/.nemoclaw/backups/sandbox-state-${TS}.tar.gz
+```
+
+Verify mount situation: `docker exec openshell-cluster-nemoclaw kubectl
+get pod chad -n openshell -o jsonpath='{.spec.volumes[*].name}'` — if
+the only volumes are `openshell-client-tls`, `openshell-supervisor-bin`,
+and `kube-api-access-*`, /sandbox is ephemeral.
+
+The proper fix is a PVC binding for `/sandbox` in the
+nemoclaw-blueprint StatefulSet. See [Backup and Restore](backup-restore.md)
+and `chad-readme.md` § 8.
 :::
 
 ## Editing Workspace Files
