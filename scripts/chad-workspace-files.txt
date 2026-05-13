@@ -67,6 +67,17 @@ agents/
 # Workflow definitions and hook configs — empty by default but populated as Chad evolves.
 flows/
 hooks/
+# Per-operator persona files prepended by chad-shim to user messages from
+# open-webui. One file per operator slug (local-part of X-OpenWebUI-User-Email),
+# plus default.md for unknown users. See scripts/openwebui/chad-shim.py for
+# the resolution logic.
+identities/
+# Sandbox-writable patched copies of chad CLI tools (chad-issue-triage,
+# chad-issue-triage-cron, etc.). Used so fixes can be deployed without
+# touching the root-owned /usr/local/bin/ in the image. The gateway watchdog
+# prepends this dir to PATH for spawned children; cron wrappers reference
+# absolute paths under it.
+bin/
 
 [exclude]
 # Device keypair + operator bearer tokens. Regenerated on first boot via OpenShell

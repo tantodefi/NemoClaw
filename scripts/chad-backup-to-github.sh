@@ -236,10 +236,16 @@ fi
 # Ensure chad-shim is running (open-webui's `chad` model uses it). The backup
 # script doesn't touch the shim itself, but this is the once-per-day cron pulse
 # that runs reliably even if the sandbox was idle, so it's a convenient place
-# to self-heal a crashed shim.
-if [ -x /usr/local/bin/chad-shim.py ] && ! pgrep -f chad-shim.py >/dev/null 2>&1; then
-  HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &
-  log "chad-shim started"
+# to self-heal a crashed shim. Prefer the sandbox-writable copy so patches
+# applied without a full chad-setup.sh re-deploy still take effect.
+if ! pgrep -f chad-shim.py >/dev/null 2>&1; then
+  if [ -x "${OPENCLAW_DATA}/bin/chad-shim.py" ]; then
+    HOME=/sandbox nohup "${OPENCLAW_DATA}/bin/chad-shim.py" >/tmp/chad-shim.log 2>&1 &
+    log "chad-shim started (sandbox copy)"
+  elif [ -x /usr/local/bin/chad-shim.py ]; then
+    HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &
+    log "chad-shim started (image copy)"
+  fi
 fi
 
 log "Pushed ${count} files, skipped ${skipped} unchanged, ${errors} errors"

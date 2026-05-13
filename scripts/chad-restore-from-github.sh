@@ -177,9 +177,17 @@ fi
 
 # Ensure chad-shim is running. open-webui's `chad` model talks to this OpenAI-
 # compat shim (loopback only, port 8901), which translates each chat turn into
-# `openclaw agent`. Idempotent — only starts if not already running and the
-# binary is installed.
-if [ -x /usr/local/bin/chad-shim.py ] && ! pgrep -f chad-shim.py >/dev/null 2>&1; then
-  HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &
-  log "chad-shim started"
+# `openclaw agent`. Idempotent — only starts if not already running and a
+# binary is available. Prefer the sandbox-writable copy under
+# /sandbox/.openclaw-data/bin/ (covered by [runtime-dirs] bin/, just restored
+# above) so patches survive a pod recreate even when /usr/local/bin/chad-shim.py
+# is still the image-baked older version.
+if ! pgrep -f chad-shim.py >/dev/null 2>&1; then
+  if [ -x "${OPENCLAW_DATA}/bin/chad-shim.py" ]; then
+    HOME=/sandbox nohup "${OPENCLAW_DATA}/bin/chad-shim.py" >/tmp/chad-shim.log 2>&1 &
+    log "chad-shim started (sandbox copy)"
+  elif [ -x /usr/local/bin/chad-shim.py ]; then
+    HOME=/sandbox nohup /usr/local/bin/chad-shim.py >/tmp/chad-shim.log 2>&1 &
+    log "chad-shim started (image copy)"
+  fi
 fi

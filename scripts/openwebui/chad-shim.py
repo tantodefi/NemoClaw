@@ -18,23 +18,74 @@
 # Stdlib-only on purpose. The L7 trust boundary pins outbound HTTP by binary
 # identity (/proc/self/exe), but this server only listens on localhost and
 # spawns `openclaw` as a subprocess — no Python-side network calls.
+#
+# Operator routing:
+#   When open-webui has ENABLE_FORWARD_USER_INFO_HEADERS=True, each request
+#   carries X-OpenWebUI-User-{Email,Name,Id,Role} + X-OpenWebUI-Chat-Id. The
+#   shim:
+#     - uses chat-id as a stable session id (one openclaw session per chat)
+#     - loads /sandbox/.openclaw-data/identities/<email-local-part>.md and
+#       prepends it as a tagged operator-context block to the user message,
+#       so the model sees who it's talking to and adapts.
+#   Unknown operators get default.md. Anonymous (no headers) gets nothing.
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 PORT = int(os.environ.get("CHAD_SHIM_PORT", "8901"))
 MODEL_ID = os.environ.get("CHAD_SHIM_MODEL_ID", "chad")
 AGENT_ID = os.environ.get("CHAD_SHIM_AGENT", "main")
 OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "openclaw")
 TIMEOUT_SEC = int(os.environ.get("CHAD_SHIM_TIMEOUT", "300"))
+DEBUG_HEADERS = os.environ.get("CHAD_SHIM_DEBUG_HEADERS", "0") == "1"
+IDENTITY_DIR = os.environ.get(
+    "CHAD_SHIM_IDENTITY_DIR", "/sandbox/.openclaw-data/identities"
+)
+IDENTITY_MAX_BYTES = int(os.environ.get("CHAD_SHIM_IDENTITY_MAX_BYTES", "8000"))
+
+# Cache identity file contents keyed by (path, mtime) so we don't re-read on
+# every turn but DO pick up edits without restarting the shim.
+_identity_cache: dict[str, tuple[float, str]] = {}
+
+
+def _slug_from_email(email: str) -> str:
+    """tantodefi@proton.me → 'tantodefi'. Restricted to a safe set to keep the
+    path traversal-free even if a malicious header arrives."""
+    local = (email or "").split("@", 1)[0].strip().lower()
+    safe = re.sub(r"[^a-z0-9._-]", "", local)
+    return safe[:64]
+
+
+def _load_identity(slug: str) -> str:
+    """Read identity file with mtime-based caching. Returns empty string if
+    missing or unreadable."""
+    if not slug:
+        return ""
+    path = os.path.join(IDENTITY_DIR, f"{slug}.md")
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return ""
+    cached = _identity_cache.get(path)
+    if cached and cached[0] == st.st_mtime:
+        return cached[1]
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            content = fh.read(IDENTITY_MAX_BYTES)
+    except OSError:
+        return ""
+    _identity_cache[path] = (st.st_mtime, content)
+    return content
 
 
 def _extract_json(text: str) -> str | None:
@@ -79,10 +130,9 @@ def run_openclaw(session_id: str, message: str) -> str:
     return f"[chad-shim] empty reply (stopReason={stop!r}); openclaw returned no text payloads."
 
 
-def session_id_from(body: dict) -> str:
-    """Stable session id keyed on the conversation's first message. open-webui
-    sends a stable system+user[0] across turns of the same chat, so this maps
-    each open-webui chat to a single openclaw session."""
+def fallback_session_id(body: dict) -> str:
+    """Used when no X-OpenWebUI-Chat-Id header is present (e.g. direct API
+    callers). Mirrors the prior behavior: stable hash of the first message."""
     messages = body.get("messages") or []
     if not messages:
         return "webui-empty-" + uuid.uuid4().hex[:8]
@@ -109,7 +159,7 @@ def last_user_text(body: dict) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "chad-shim/0.1"
+    server_version = "chad-shim/0.2"
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write(f"[chad-shim {time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}\n")
@@ -121,6 +171,46 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _operator_context(self) -> dict:
+        """Pull operator identity from forwarded OpenWebUI headers.
+
+        Returns a dict with keys: email, name, user_id, role, chat_id, slug,
+        identity (the loaded md file contents or ''). All values are strings."""
+        email = (self.headers.get("X-OpenWebUI-User-Email") or "").strip().lower()
+        # Open-webui URL-encodes the name header (quote(name, safe=' ')); decode.
+        raw_name = self.headers.get("X-OpenWebUI-User-Name") or ""
+        name = unquote(raw_name).strip()
+        user_id = (self.headers.get("X-OpenWebUI-User-Id") or "").strip()
+        role = (self.headers.get("X-OpenWebUI-User-Role") or "").strip().lower()
+        chat_id = (self.headers.get("X-OpenWebUI-Chat-Id") or "").strip()
+        slug = _slug_from_email(email)
+        identity = _load_identity(slug) if slug else ""
+        if not identity and slug:
+            # Fall through to default persona for known-but-unmapped users.
+            identity = _load_identity("default")
+        elif not slug:
+            identity = ""  # truly anonymous (curl, no headers) — no prefix
+        return {
+            "email": email, "name": name, "user_id": user_id, "role": role,
+            "chat_id": chat_id, "slug": slug, "identity": identity,
+        }
+
+    def _format_operator_prefix(self, op: dict) -> str:
+        if not op["identity"]:
+            return ""
+        header_line = f"[operator: {op['name'] or op['slug']} <{op['email']}> role={op['role'] or 'user'}]"
+        return f"{header_line}\n{op['identity'].rstrip()}\n---\n\n"
+
+    def _log_request(self, op: dict, body: dict) -> None:
+        if not DEBUG_HEADERS:
+            return
+        ts = time.strftime("%H:%M:%S")
+        sys.stderr.write(
+            f"[chad-shim hdr {ts}] op_slug={op['slug']!r} chat_id={op['chat_id']!r} "
+            f"identity_len={len(op['identity'])} body_keys={sorted(body.keys())}\n"
+        )
+        sys.stderr.flush()
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/v1/models", "/models"):
@@ -149,13 +239,29 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._send_json(400, {"error": {"message": "invalid json"}})
             return
+
+        op = self._operator_context()
+        self._log_request(op, body)
+
         message = last_user_text(body)
         if not message:
             self._send_json(400, {"error": {"message": "no user message in body"}})
             return
-        session_id = session_id_from(body)
+
+        prefix = self._format_operator_prefix(op)
+        final_message = prefix + message if prefix else message
+
+        # Session id: prefer the OpenWebUI chat-id (stable per conversation,
+        # forwarded regardless of the FORWARD_USER_INFO_HEADERS flag). Scope
+        # by operator slug so two different operators on the same chat-id
+        # (shouldn't happen, but if it did) would still get separate sessions.
+        if op["chat_id"]:
+            session_id = f"webui-{op['slug'] or 'anon'}-{op['chat_id']}"
+        else:
+            session_id = fallback_session_id(body)
+
         try:
-            reply = run_openclaw(session_id, message)
+            reply = run_openclaw(session_id, final_message)
         except subprocess.TimeoutExpired:
             self._send_json(504, {"error": {"message": "openclaw timed out"}})
             return
@@ -214,7 +320,8 @@ def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     sys.stderr.write(
         f"[chad-shim] listening on 127.0.0.1:{PORT} (agent={AGENT_ID}, "
-        f"openclaw={OPENCLAW_BIN}, timeout={TIMEOUT_SEC}s)\n"
+        f"openclaw={OPENCLAW_BIN}, timeout={TIMEOUT_SEC}s, debug={DEBUG_HEADERS}, "
+        f"identity_dir={IDENTITY_DIR})\n"
     )
     try:
         server.serve_forever()
