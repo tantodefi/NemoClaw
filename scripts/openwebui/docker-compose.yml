@@ -69,7 +69,14 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: nemoclaw-cloudflared
     restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN:-missing}
+    # --protocol http2 forces TCP-based HTTP/2 instead of cloudflared's default
+    # QUIC-over-UDP. QUIC sessions get torn down ("failed to accept QUIC stream:
+    # timeout: no recent network activity") when residential routers / mobile
+    # carriers / NAT firewalls prune idle UDP flows aggressively — surfacing as
+    # transient 530 / "Argo tunnel error" until cloudflared reconnects ~1s
+    # later. HTTP/2 over TCP avoids that whole class of failures at the cost of
+    # ~5-15ms extra per request.
+    command: tunnel --no-autoupdate run --protocol http2 --token ${CF_TUNNEL_TOKEN:-missing}
     depends_on:
       - open-webui
     networks:
