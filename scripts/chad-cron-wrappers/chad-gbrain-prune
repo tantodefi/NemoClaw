@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-gbrain-prune — Weekly retention sweep for gbrain pages + workspace
+# memory files. Runs against age-eligible slugs only — never touches
+# system/* (evergreen docs) or any non-dated content.
+#
+# Retention policy:
+#   - gbrain memory/<date>            >365d  → delete
+#   - gbrain events/<date>            >365d  → delete
+#   - gbrain chat/<id> (webui ingest) >180d  → delete (only date-suffixed ones)
+#   - workspace memory/dream-digest-<date>.md  >30d → delete
+#   - workspace memory/feedback_*_<date>.md    >30d → delete
+#   - workspace memory/prune-log-<date>.md     >30d → delete (own logs)
+#
+# Protects: system/*, agent/*, anything else with non-dated slug. Workspace
+# memory/<date>.md (the human journal) is the source-of-truth — never touched.
+#
+# Defaults to DRY-RUN. Set DRY_RUN=0 (env or first arg) to actually delete.
+# Wrapper writes a summary to today's memory file.
+
+set -uo pipefail
+
+DRY_RUN="${DRY_RUN:-${1:-1}}"
+HORIZON_LONG="${HORIZON_LONG:-365}"     # gbrain memory/events/chat
+HORIZON_SHORT="${HORIZON_SHORT:-30}"    # workspace digest/feedback/prune logs
+HORIZON_CHAT="${HORIZON_CHAT:-180}"     # gbrain chat/<id>
+WORKSPACE="/sandbox/.openclaw/workspace"
+MEMORY_DIR="${WORKSPACE}/memory"
+TS="$(date -u +%FT%TZ)"
+TODAY="$(date -u +%Y-%m-%d)"
+MEMORY_FILE="${MEMORY_DIR}/${TODAY}.md"
+
+date_offset() {
+  local days="$1"
+  date -u -d "${days} days ago" +%Y-%m-%d 2>/dev/null \
+    || date -u -v-"${days}"d +%Y-%m-%d 2>/dev/null
+}
+
+CUT_LONG="$(date_offset "$HORIZON_LONG")"
+CUT_SHORT="$(date_offset "$HORIZON_SHORT")"
+CUT_CHAT="$(date_offset "$HORIZON_CHAT")"
+
+if [ -z "$CUT_LONG" ] || [ -z "$CUT_SHORT" ] || [ -z "$CUT_CHAT" ]; then
+  echo "chad-gbrain-prune: date arithmetic unavailable on this host; aborting" >&2
+  exit 1
+fi
+
+mkdir -p "$MEMORY_DIR"
+[ -f "$MEMORY_FILE" ] || printf '# %s\n\n' "$TODAY" >"$MEMORY_FILE"
+
+deleted_gbrain=0
+considered_gbrain=0
+declare -a deleted_slugs=()
+
+# Pull all pages once; iterate locally so we don't hammer gbrain.
+pages_tmp="$(mktemp)"
+trap 'rm -f "$pages_tmp"' EXIT
+gbrain list --limit 50000 2>/dev/null | awk '{print $1}' >"$pages_tmp"
+
+while IFS= read -r slug; do
+  [ -z "$slug" ] && continue
+  prefix="${slug%%/*}"
+  date_part="${slug##*/}"
+  case "$prefix" in
+    memory|events) cut="$CUT_LONG" ;;
+    chat) cut="$CUT_CHAT" ;;
+    *) continue ;;
+  esac
+  # Only handle slugs whose tail is a YYYY-MM-DD date.
+  [[ "$date_part" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+  considered_gbrain=$((considered_gbrain + 1))
+  # Lexical compare works for ISO dates.
+  if [[ "$date_part" < "$cut" ]]; then
+    if [ "$DRY_RUN" = "0" ]; then
+      if gbrain delete "$slug" >/dev/null 2>&1; then
+        deleted_gbrain=$((deleted_gbrain + 1))
+        deleted_slugs+=("$slug")
+      fi
+    else
+      deleted_slugs+=("$slug")
+    fi
+  fi
+done <"$pages_tmp"
+
+# Workspace files — match dream-digest-<date>.md, feedback_*_<date>.md,
+# prune-log-<date>.md older than CUT_SHORT.
+ws_candidates=()
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  base="$(basename "$f" .md)"
+  date_part="${base##*[_-]}"
+  [[ "$date_part" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+  [[ "$date_part" < "$CUT_SHORT" ]] || continue
+  ws_candidates+=("$f")
+done < <(find "$MEMORY_DIR" -maxdepth 1 -type f \
+  \( -name "dream-digest-*.md" -o -name "feedback_*.md" -o -name "prune-log-*.md" \) 2>/dev/null)
+
+deleted_ws=0
+if [ "$DRY_RUN" = "0" ] && [ "${#ws_candidates[@]}" -gt 0 ]; then
+  for f in "${ws_candidates[@]}"; do
+    rm -f "$f" && deleted_ws=$((deleted_ws + 1))
+  done
+fi
+
+{
+  echo ""
+  echo "## Prune sweep — ${TS}"
+  echo ""
+  echo "- DRY_RUN: \`${DRY_RUN}\` (\`0\`=actually delete)"
+  echo "- Cuts: long=${CUT_LONG} (${HORIZON_LONG}d), short=${CUT_SHORT} (${HORIZON_SHORT}d), chat=${CUT_CHAT} (${HORIZON_CHAT}d)"
+  echo "- gbrain candidates considered: ${considered_gbrain}"
+  if [ "$DRY_RUN" = "0" ]; then
+    echo "- gbrain deleted: ${deleted_gbrain}"
+  else
+    echo "- gbrain would-delete: ${#deleted_slugs[@]}"
+  fi
+  echo "- workspace files >${HORIZON_SHORT}d: ${#ws_candidates[@]}"
+  if [ "$DRY_RUN" = "0" ]; then
+    echo "- workspace deleted: ${deleted_ws}"
+  fi
+  if [ "${#deleted_slugs[@]}" -gt 0 ] && [ "${#deleted_slugs[@]}" -le 20 ]; then
+    echo ""
+    echo "Slugs:"
+    for s in "${deleted_slugs[@]}"; do
+      echo "  - \`${s}\`"
+    done
+  fi
+} >>"$MEMORY_FILE"
+
+echo "chad-gbrain-prune complete (DRY_RUN=${DRY_RUN}, gbrain=${deleted_gbrain}/${#deleted_slugs[@]}, ws=${deleted_ws}/${#ws_candidates[@]})"
