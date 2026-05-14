@@ -22,11 +22,17 @@ status: published
 
 # Chad Skills Catalog
 
-This page enumerates every skill registered into Chad's sandbox. Three
-chad-managed skills (shipped from this repo) plus the canonical 40-skill
-gstack OpenClaw-adapter bundle land in
+This page enumerates every skill registered into Chad's sandbox: three
+chad-managed skills shipped from this repo (`.github/skills/chad-*`),
+two runtime-synced chad-managed skills (`openwebui` and
+`chad-experiment` — added 2026-05-13/14), plus the canonical 40-skill
+gstack OpenClaw-adapter bundle. All land in
 `/sandbox/.openclaw-data/skills/`. Together they're the
 `<available_skills>` block presented to the agent on every spawn.
+
+**Current total: ~45 skills.** Breakdown: 3 repo-shipped chad-managed,
+2 runtime-synced chad-managed (see "Runtime-synced chad-managed skills"
+section below), ~40 gstack.
 
 ## Registration mechanism
 
@@ -49,7 +55,7 @@ workspace `skills/`). Skills exist on disk but never appear in
 The script also prunes legacy `gstack-openclaw-*` directories on every
 sync, so the canonical names below are the only ones present.
 
-## Chad-managed skills (3)
+## Chad-managed skills, repo-shipped (3)
 
 Source: `.github/skills/chad-*/` and `.github/skills/proton-calendar/`.
 Synced by `bash scripts/chad-bug-intake/scripts/sync-skills-to-sandbox.sh`
@@ -60,6 +66,18 @@ Synced by `bash scripts/chad-bug-intake/scripts/sync-skills-to-sandbox.sh`
 | `chad-bug-intake` | Create GitHub issues from trusted bug reports reaching Chad via chat or ProtonMail; duplicate-check, normalize, optionally break into child tasks |
 | `chad-orchestrator` | Spawn typed sub-agents (coder/researcher/writer/reviewer/fitness/brain) with bounded budget, structured `result.json`, and memory merge |
 | `proton-calendar` | List + read mail and calendar events via `proton-tool`; the building block for `chad-mail-check` and the email-check cron |
+
+## Runtime-synced chad-managed skills (2)
+
+Source: `scripts/openwebui/openwebui-skill.md` and
+`scripts/openwebui/chad-experiment-skill.md`. Deployed at runtime to
+`/sandbox/.openclaw-data/skills/<name>/SKILL.md` (and backed up under
+`skills/` via the workspace manifest). Added 2026-05-13/14.
+
+| Skill | One-line description |
+|---|---|
+| `openwebui` | Chad's complete control surface for the OpenWebUI deployment at `chad.supachad.com` — 60 CLI sub-commands across 10 groups (calendar/notes/automations/memories/chats/knowledge/models/functions/tools/folders) with worked examples, recipes, and a failure-mode table. Also indexes the matching `webui__*` MCP tools. See `docs/operations/openwebui.md`. |
+| `chad-experiment` | Autonomous experiment lifecycle methodology: scan memory for objectives, decide what's worthy of automation, design + start + observe + evaluate + promote-or-retire experiments, A/B test paired variants. Documents the 13-verb CLI, success-metric authoring rules, calendar tag conventions (`[chad-block]`, `[chad-experiment]`, `[operator-sync]`, `[experiment-review]`), worthy-of-automation checklist, ground rules. See `docs/operations/chad-experiments.md`. |
 
 ## GStack engineering skills (≈18)
 

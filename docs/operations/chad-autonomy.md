@@ -3,7 +3,7 @@ title:
   page: "Chad Autonomy Loops"
   nav: "Chad Autonomy"
 description:
-  main: "The five self-driving loops Chad runs from cron, the two known gaps in current autonomy, and the recommended next wrappers to close them."
+  main: "The six self-driving loops Chad runs from cron, the two known gaps in current autonomy, and the recommended next wrappers to close them."
   agent: "Reference for the autonomy surface area: which loops exist, where their wrappers live, what they read and write, and where the loop is broken (write-only proposals, blind self-improve)."
 keywords: ["chad autonomy", "self-improve", "feedback proposals", "cron telemetry", "gbrain dream", "skill discovery"]
 topics: ["operations", "autonomy"]
@@ -22,11 +22,11 @@ status: published
 
 # Chad Autonomy Loops
 
-Chad's "always-on" claim cashes out as five distinct cron-driven loops
+Chad's "always-on" claim cashes out as six distinct cron-driven loops
 that read state, propose action, and apply or surface that proposal.
 This page enumerates them and the wrappers that close each one.
 
-## The five loops
+## The six loops
 
 | # | Loop | Wrapper(s) | Schedule | Reads | Writes |
 |---|---|---|---|---|---|
@@ -35,6 +35,7 @@ This page enumerates them and the wrappers that close each one.
 | 3 | **Cron telemetry / budget audit** | `chad-budget-audit` (emits prose + structured JSON) → `chad-proposal-apply` (consumes JSON) | Mon 04:00 UTC + daily 04:30 UTC | last-50 `openclaw cron runs` per task, `/tmp/chad-premium.jsonl`, `task-profiles.json` | recommendation table + `### Proposals (machine-readable)` JSON block to `feedback-proposals.md`; bounded `openclaw cron edit` calls; `## Applied` block |
 | 4 | **Dreaming (gbrain consolidation)** | `chad-gbrain-dream` + dream-digest step | nightly 03:30 UTC | today's `memory/<date>.md`, `events-<date>.jsonl`, workspace doc set, gbrain stale chunks, `gbrain doctor` | gbrain pages upserted; `memory/dream-digest-<date>.md` (24h delta + doctor); `memory/feedback_brain_health_<date>.md` if doctor reports anomalies |
 | 5 | **Skill discovery** | `chad-skill-watch` (daily diff) + `chad-setup.sh` skill-sync (host-driven) | daily 09:00 UTC + on-demand from host | `openclaw skills list --json` vs snapshot at `/sandbox/.openclaw-data/state/skills-snapshot.json`; `~/.claude/skills/gstack/.openclaw/skills/` | snapshot updated; `## Skill catalog diff` block in today's memory; signal-detector skill picks it up next reasoning cycle |
+| 6 | **Autonomous experiment lifecycle** | `chad-experiment-night` cron + `chad-experiment` CLI | nightly 02:00 UTC | recent memory (`chad-experiment recent-memory`), recent ledger (`chad-experiment recent-ledger`), `webui__*` MCP tools, gbrain queries, operator chat history | up to N new designed experiments per operator (`state/experiments/active/<id>.json`); observations + state transitions in `state/experiments/ledger.jsonl`; auto-promote/retire on score vs `regression_threshold`; `[chad-experiment]` / `[operator-sync]` calendar events on operators' calendars; summary block in today's memory. Detailed in [`chad-experiments.md`](chad-experiments.md). |
 
 Every wrapper stays inside the **wrapper-only invariant** documented in
 `chad-readme.md` §7.1: cron messages are one-line invocations, slow work

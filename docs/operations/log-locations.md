@@ -65,6 +65,26 @@ Defaults: tail 200 lines per file, all categories, secrets redacted. Pass `--no-
 | Token budget snapshot | `/sandbox/.openclaw-data/budget.json` | `cron` |
 | `openclaw cron list/runs` snapshots | (captured from CLI) | `cron` |
 | Detached cron output (most recent 10) | `/tmp/chad-*-<TS>.log` | `cron` |
+| **Agent inbox** (host-watchdog events → cron agent turns) | `/sandbox/.openclaw-data/state/agent-inbox.jsonl` | `cron` |
+
+### Experiments (autonomous lifecycle, 2026-05-14+)
+
+| Stream | Path inside pod | Category |
+|---|---|---|
+| Experiment config (budget, regression threshold, allowed types) | `/sandbox/.openclaw-data/state/experiments/config.json` | `experiments` |
+| Append-only event log | `/sandbox/.openclaw-data/state/experiments/ledger.jsonl` | `experiments` |
+| Active experiment records (one per running) | `/sandbox/.openclaw-data/state/experiments/active/<id>.json` | `experiments` |
+| Archived experiment records (promoted/retired) | `/sandbox/.openclaw-data/state/experiments/archive/<id>.json` | `experiments` |
+
+### Host-side watchdogs (logs live on the host, not the pod)
+
+| Stream | Path on host | Category |
+|---|---|---|
+| Gateway watchdog | `~/.nemoclaw/openwebui/chad-gateway-watchdog.log` | `watchdog` |
+| Shim watchdog | `~/.nemoclaw/openwebui/chad-shim-watchdog.log` | `watchdog` |
+| Spawn-poll watchdog | `~/.nemoclaw/openwebui/chad-spawn-poll-watchdog.log` | `watchdog` |
+| Tunnel | `/tmp/chad-tunnel.{out,err}.log` | `watchdog` |
+| Per-launchd stdout/stderr | `~/.nemoclaw/openwebui/chad-*.{out,err}.log` | `watchdog` |
 
 ### Sub-agents
 

@@ -223,7 +223,7 @@ describing how to invoke a sub-agent. Today we ship seven:
 
 Per-spawn override: `chad-spawn --substrate gha` (or `--substrate local`).
 Per-spawn binary swap: `chad-spawn --binary-override /usr/local/bin/codex --kind writer ...` (the kind's L7 policy still applies, so the override binary must be in its allowlist).
-Async (gha-only): `chad-spawn --async --substrate gha ...` returns task_id immediately; `chad-spawn-poll` cron reconciles when the runner commits result.json back.
+Async (gha-only): `chad-spawn --async --substrate gha ...` returns task_id immediately; the `chad-spawn-poll-watchdog` launchd job (host-side, 5 min) reconciles when the runner commits result.json back. (Was an openclaw cron until 2026-05-14 — moved out for cost: ~12.7M tokens/day saved. See `docs/operations/chad-devflow.md` § Host-side watchdogs.)
 
 The manifest shape:
 
@@ -537,10 +537,11 @@ catch honest bugs, not attackers.
 
 ## 7. Cron integration (token-optimized)
 
-Chad runs **nine** standing cron jobs, all registered by `chad-setup.sh`.
-The schedules are **deliberately conservative** — every cron fire
-tokenizes instructions and spawns a model call, so the rule is:
-fewer, cheaper runs + a budget guard at the top of each one.
+Chad runs **eleven** standing openclaw cron jobs plus **three host-side
+launchd watchdogs**, all registered by `chad-setup.sh` (crons) and one-shot
+plist loads (watchdogs). The schedules are **deliberately conservative**
+— every cron fire tokenizes instructions and spawns a model call, so the
+rule is: fewer, cheaper runs + a budget guard at the top of each one.
 
 | Job | Cadence | Budget guard | What it does |
 |---|---|---|---|
@@ -550,9 +551,20 @@ fewer, cheaper runs + a budget guard at the top of each one.
 | `gbrain-dream` | nightly 03:30 UTC | skip if `remaining_tokens < 50k` | `chad-gbrain-dream` — runs `gbrain dream` to consolidate links and surface orphans |
 | `self-improve` | weekly Sun 03:00 UTC | skip if `remaining_tokens < 2×budget` | `chad-self-improve` — proposes 1–3 durable improvements based on last week's signal (see §13) |
 | `chad-budget-audit` | weekly Mon 04:00 UTC | n/a (audits, no model call) | Compares last-50-runs telemetry against `task-profiles.json`, rolls up premium spend from `/tmp/chad-premium.jsonl`, appends recommendations to `memory/feedback-proposals.md` |
-| `memory-curator` | weekly Sat 04:00 UTC | inactivity-gated (≥7d since last + ≥1h idle) + budget guard | `chad-memory-curator` — Hermes-style consolidation pass over memory-lancedb captures + workspace MEMORY.md. Snapshots first via `chad-memory-snapshot`, then spawns a researcher with the curator prompt. **Draft-only**: writes proposals to `curator-runs/<utc>/proposals.json` for human review. |
-| `spawn-poll` | every 5min | n/a (lightweight ledger scan) | `chad-spawn-poll` — reconciles async gha sub-agent spawns. Scans queue ledger for `running`+`gha` entries, fetches result.json from chad-state, transitions ledger to `done\|failed`, runs `chad-collect`. Skips entries fresher than `--max-age 1` so the runner has cold-start time. |
-| `spawn-gc` | weekly Mon 02:30 UTC | n/a (gh API only) | `chad-spawn-gc` — branch retention for `chad-spawn/*` on chad-state. Default: done=7d, failed=30d, in-flight always kept. Without this, ~700 branches accrue per month. |
+| `chad-proposal-apply` | daily 04:30 UTC | n/a (applies safe-list) | Reads structured proposals from `feedback-proposals.md`, applies bounded `timeoutSeconds`/`maxOutputTokens` edits via `openclaw cron edit`, appends `## Applied` block. |
+| `chad-skill-watch` | daily 09:00 UTC | n/a (diff only) | Diffs `openclaw skills list --json` against `state/skills-snapshot.json`, surfaces added/removed/changed skills under `## Skill catalog diff` in today's memory. |
+| `memory-curator` | weekly Sat 04:00 UTC | inactivity-gated (≥7d since last + ≥1h idle) + budget guard | `chad-memory-curator` — Hermes-style consolidation pass over memory-lancedb captures + workspace MEMORY.md. **Draft-only**: writes proposals to `curator-runs/<utc>/proposals.json`. |
+| `spawn-gc` | weekly Mon 02:30 UTC | n/a (gh API only) | `chad-spawn-gc` — branch retention for `chad-spawn/*` on chad-state. Default: done=7d, failed=30d, in-flight always kept. |
+| `experiment-night` | nightly 02:00 UTC | n/a (gated by per-operator concurrent budget) | **(NEW 2026-05-14)** Four-phase autonomous experiment loop: propose from memory, observe running experiments, evaluate at the eval window, schedule calendar coordination. Per-operator concurrent budget + regression auto-retire. See `docs/operations/chad-experiments.md`. |
+| `gbrain-prune` | weekly Sun 02:00 UTC | n/a (DRY_RUN default) | `chad-gbrain-prune` — drops stale gbrain pages older than retention windows. Defaults to dry-run. |
+
+**Plus three host-side launchd watchdogs** (no agent overhead, run every 5 min via SSH):
+
+| Plist | Supervises | Why |
+|---|---|---|
+| `dev.nemoclaw.chad-gateway-watchdog` | `openclaw gateway run` on port 18789 | OOM recovery with 4 GB heap |
+| `dev.nemoclaw.chad-shim-watchdog` | `chad-shim.py` on port 8901 (the `chad` model bridge) | Restart on death (BrokenPipeError etc.) |
+| `dev.nemoclaw.chad-spawn-poll` | Runs `chad-spawn-poll` itself, instead of via an openclaw cron | Reclaimed ~12.7M tokens/day vs. the prior agent-turn cron. See `docs/operations/chad-devflow.md` § Host-side watchdogs. |
 
 **What changed from the prior schedule:**
 

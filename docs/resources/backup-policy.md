@@ -70,6 +70,21 @@ If you ever need a *persona checkpoint* that includes operator-role tokens (e.g.
 | `MEMORY.md` | Curated long-term memory | **CRITICAL** | No — accumulated knowledge |
 | `memory/*.md` | Daily session notes (YYYY-MM-DD.md) | HIGH | No — conversation history |
 
+### 2.2b Sandbox Runtime State (`/sandbox/.openclaw-data/`)
+
+Added 2026-05-13/14 — backed up via the same manifest as workspace files.
+
+| Path | Contents | Priority | Recreatable? |
+|------|----------|----------|--------------|
+| `identities/<slug>.md` | Per-operator persona files (prepended by chad-shim) | HIGH | No — operator-specific tuning |
+| `bin/chad-*` | Sandbox-writable patched copies of chad CLI tools | MEDIUM | Yes — can re-shim from source |
+| `skills/openwebui/SKILL.md`, `skills/chad-experiment/SKILL.md` | Runtime-synced chad-managed skills | HIGH | Yes (from source repo) but loses customizations |
+| `state/experiments/config.json` | Experiment budget + thresholds + tag map | **CRITICAL** | No — autonomy-tuning state |
+| `state/experiments/ledger.jsonl` | Append-only experiment event log | HIGH | No — history of what Chad has tried |
+| `state/experiments/active/<id>.json` | Currently-running experiments | **CRITICAL** | No — losing this strands artifacts in OpenWebUI |
+| `state/experiments/archive/<id>.json` | Promoted/retired experiments | MEDIUM | No — historical knowledge of what worked |
+| `state/agent-inbox.jsonl` | Host-watchdog → cron-agent event stream | LOW | Yes — gets recreated on next watchdog tick |
+
 ### 2.3 Policies & Blueprint (`source/nemoclaw-blueprint/`)
 
 | Path | Contents | Priority |

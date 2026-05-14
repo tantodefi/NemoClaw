@@ -48,6 +48,11 @@ The Chad agent persists additional orchestration state under `/sandbox/.openclaw
 | `queue/tasks.jsonl` | Sub-agent task ledger. |
 | `queue/budget.json` | Token budget across cron tasks. |
 | `agents/`, `flows/`, `hooks/` | Custom agent registrations, workflow definitions, and hook configs added at runtime. |
+| `identities/<slug>.md` | Per-operator persona files prepended by `chad-shim` to user messages from open-webui (since 2026-05-13). One file per operator slug (email local-part), plus `default.md` for unknown senders. See `scripts/openwebui/chad-shim.py`. |
+| `bin/` | Sandbox-writable patched copies of chad CLI tools (`chad-issue-triage`, `chad-issue-triage-cron`, `chad-mail-check`, `chad-email-check-cron`, `chad-webui`, `chad-webui-mcp`, `chad-experiment`). Lets fixes deploy without touching root-RO `/usr/local/bin/` in the image. |
+| `skills/openwebui/SKILL.md`, `skills/chad-experiment/SKILL.md` | Runtime-synced chad-managed skills (added 2026-05-13/14). The `openwebui` skill documents the chad-webui CLI + MCP tools; the `chad-experiment` skill documents the autonomous experiment lifecycle. |
+| `state/experiments/{config.json,ledger.jsonl,active/,archive/}` | Autonomous experiment lifecycle state (since 2026-05-14): config (budget, regression threshold, allowed types), append-only event log, and per-experiment records. |
+| `state/agent-inbox.jsonl` | Append-only structured event stream from host-side watchdogs (chad-gateway-watchdog, chad-shim-watchdog, chad-spawn-poll-watchdog). Cron agent turns tail this on startup to surface state changes between turns. |
 
 These are tracked alongside workspace files in the [sectioned manifest](#sectioned-manifest) below so backup tooling round-trips them automatically.
 
