@@ -415,6 +415,219 @@ def cmd_folders_delete(args):
 
 
 # ─────────────────────────────────────────────────────────────────
+# Functions (admin role required for create/update/delete/toggle)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_functions_list(args):
+    """List installed OpenWebUI Functions (filter, pipe, action)."""
+    _print(_http("GET", "/functions/"))
+
+
+def cmd_functions_get(args):
+    _print(_http("GET", f"/functions/id/{args.function_id}"))
+
+
+def _read_content(arg_content, arg_file):
+    if arg_file:
+        with open(arg_file) as fh:
+            return fh.read()
+    return arg_content
+
+
+def cmd_functions_create(args):
+    body = {
+        "id": args.id,
+        "name": args.name,
+        "type": args.type,
+        "content": _read_content(args.content, args.content_file),
+        "meta": {"description": args.description or "", "manifest": {}},
+    }
+    _print(_http("POST", "/functions/create", body=body))
+
+
+def cmd_functions_update(args):
+    body = {}
+    if args.name is not None:
+        body["name"] = args.name
+    if args.description is not None:
+        body["meta"] = {"description": args.description}
+    content = _read_content(args.content, args.content_file)
+    if content is not None:
+        body["content"] = content
+    _print(_http("POST", f"/functions/id/{args.function_id}/update", body=body))
+
+
+def cmd_functions_delete(args):
+    _print(_http("DELETE", f"/functions/id/{args.function_id}/delete"))
+
+
+def cmd_functions_toggle(args):
+    path = f"/functions/id/{args.function_id}/toggle"
+    if args.scope == "global":
+        path += "/global"
+    _print(_http("POST", path))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tools (admin role required for create/update/delete)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_tools_list(args):
+    """List installed OpenWebUI Tools (OpenAI-style tool specs)."""
+    _print(_http("GET", "/tools/"))
+
+
+def cmd_tools_get(args):
+    _print(_http("GET", f"/tools/id/{args.tool_id}"))
+
+
+def cmd_tools_create(args):
+    body = {
+        "id": args.id,
+        "name": args.name,
+        "content": _read_content(args.content, args.content_file),
+        "meta": {"description": args.description or "", "manifest": {}},
+    }
+    _print(_http("POST", "/tools/create", body=body))
+
+
+def cmd_tools_update(args):
+    body = {}
+    if args.name is not None:
+        body["name"] = args.name
+    if args.description is not None:
+        body["meta"] = {"description": args.description}
+    content = _read_content(args.content, args.content_file)
+    if content is not None:
+        body["content"] = content
+    _print(_http("POST", f"/tools/id/{args.tool_id}/update", body=body))
+
+
+def cmd_tools_delete(args):
+    _print(_http("DELETE", f"/tools/id/{args.tool_id}/delete"))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Knowledge — extended (create / file-add / update / delete)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_knowledge_create(args):
+    body = {
+        "name": args.name,
+        "description": args.description or "",
+        "data": {},
+    }
+    _print(_http("POST", "/knowledge/create", body=body))
+
+
+def cmd_knowledge_update(args):
+    body = {}
+    if args.name is not None:
+        body["name"] = args.name
+    if args.description is not None:
+        body["description"] = args.description
+    _print(_http("POST", f"/knowledge/{args.knowledge_id}/update", body=body))
+
+
+def cmd_knowledge_delete(args):
+    _print(_http("DELETE", f"/knowledge/{args.knowledge_id}/delete"))
+
+
+def cmd_knowledge_file_add(args):
+    """Attach an already-uploaded file (by file id, from /api/v1/files) to
+    a knowledge collection. Use chad-webui knowledge upload-file to upload
+    first and get the file id."""
+    body = {"file_id": args.file_id}
+    _print(_http("POST", f"/knowledge/{args.knowledge_id}/file/add", body=body))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Models — extended (create / update / toggle)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_models_create(args):
+    body = {
+        "id": args.id,
+        "base_model_id": args.base_model_id,
+        "name": args.name,
+        "params": json.loads(args.params) if args.params else {},
+        "meta": json.loads(args.meta) if args.meta else {},
+        "access_control": None,
+    }
+    _print(_http("POST", "/models/create", body=body))
+
+
+def cmd_models_update(args):
+    """Patch params/meta/name on a model row. id is required to identify."""
+    body = {"id": args.id}
+    if args.name is not None:
+        body["name"] = args.name
+    if args.params is not None:
+        body["params"] = json.loads(args.params)
+    if args.meta is not None:
+        body["meta"] = json.loads(args.meta)
+    _print(_http("POST", "/models/model/update", body=body, params={"id": args.id}))
+
+
+def cmd_models_toggle(args):
+    _print(_http("POST", "/models/model/toggle", params={"id": args.id}))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Chats — extended (archive / unarchive / share / pin / delete)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_chats_archive(args):
+    _print(_http("POST", f"/chats/{args.chat_id}/archive"))
+
+
+def cmd_chats_pin(args):
+    _print(_http("POST", f"/chats/{args.chat_id}/pin"))
+
+
+def cmd_chats_share(args):
+    """Toggle-on: POST creates the share. DELETE removes it."""
+    _print(_http("POST", f"/chats/{args.chat_id}/share"))
+
+
+def cmd_chats_unshare(args):
+    _print(_http("DELETE", f"/chats/{args.chat_id}/share"))
+
+
+def cmd_chats_delete(args):
+    _print(_http("DELETE", f"/chats/{args.chat_id}"))
+
+
+def cmd_chats_search(args):
+    _print(_http("GET", "/chats/search", params={"text": args.query}))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Memories — extended (update)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_memories_update(args):
+    body = {"content": args.content}
+    _print(_http("POST", f"/memories/{args.memory_id}/update", body=body))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Folders — extended (rename / parent / expanded)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_folders_rename(args):
+    body = {"name": args.name}
+    _print(_http("POST", f"/folders/{args.folder_id}/update", body=body))
+
+
+# ─────────────────────────────────────────────────────────────────
 # Diagnostics
 # ─────────────────────────────────────────────────────────────────
 
@@ -536,26 +749,58 @@ def build_parser() -> argparse.ArgumentParser:
     mems = sub.add_parser("memories", help="OpenWebUI per-user memories").add_subparsers(dest="cmd", required=True)
     c = mems.add_parser("list"); c.set_defaults(func=cmd_memories_list)
     c = mems.add_parser("create"); c.add_argument("--content", required=True); c.set_defaults(func=cmd_memories_create)
+    c = mems.add_parser("update"); c.add_argument("--memory-id", required=True); c.add_argument("--content", required=True); c.set_defaults(func=cmd_memories_update)
     c = mems.add_parser("delete"); c.add_argument("--memory-id", required=True); c.set_defaults(func=cmd_memories_delete)
 
-    # chats (read-only)
-    chats = sub.add_parser("chats", help="Inspect existing chats").add_subparsers(dest="cmd", required=True)
+    # chats
+    chats = sub.add_parser("chats", help="Inspect and act on chats").add_subparsers(dest="cmd", required=True)
     c = chats.add_parser("list"); c.add_argument("--page", type=int, default=1); c.set_defaults(func=cmd_chats_list)
     c = chats.add_parser("get"); c.add_argument("--chat-id", required=True); c.set_defaults(func=cmd_chats_get)
+    c = chats.add_parser("search"); c.add_argument("--query", required=True); c.set_defaults(func=cmd_chats_search)
+    c = chats.add_parser("archive"); c.add_argument("--chat-id", required=True); c.set_defaults(func=cmd_chats_archive)
+    c = chats.add_parser("pin"); c.add_argument("--chat-id", required=True); c.set_defaults(func=cmd_chats_pin)
+    c = chats.add_parser("share"); c.add_argument("--chat-id", required=True); c.set_defaults(func=cmd_chats_share)
+    c = chats.add_parser("unshare"); c.add_argument("--chat-id", required=True); c.set_defaults(func=cmd_chats_unshare)
+    c = chats.add_parser("delete"); c.add_argument("--chat-id", required=True); c.set_defaults(func=cmd_chats_delete)
 
-    # models (read-only)
-    models = sub.add_parser("models", help="Model registry").add_subparsers(dest="cmd", required=True)
+    # models
+    models = sub.add_parser("models", help="Model registry (admin role for write ops)").add_subparsers(dest="cmd", required=True)
     c = models.add_parser("list"); c.set_defaults(func=cmd_models_list)
+    c = models.add_parser("create"); c.add_argument("--id", required=True); c.add_argument("--base-model-id", required=True); c.add_argument("--name", required=True); c.add_argument("--params", help="JSON object"); c.add_argument("--meta", help="JSON object"); c.set_defaults(func=cmd_models_create)
+    c = models.add_parser("update"); c.add_argument("--id", required=True); c.add_argument("--name"); c.add_argument("--params", help="JSON object"); c.add_argument("--meta", help="JSON object"); c.set_defaults(func=cmd_models_update)
+    c = models.add_parser("toggle"); c.add_argument("--id", required=True, help="Model id to enable/disable"); c.set_defaults(func=cmd_models_toggle)
 
-    # knowledge (read-only)
+    # knowledge
     knl = sub.add_parser("knowledge", help="RAG collections").add_subparsers(dest="cmd", required=True)
     c = knl.add_parser("list"); c.set_defaults(func=cmd_knowledge_list)
     c = knl.add_parser("get"); c.add_argument("--knowledge-id", required=True); c.set_defaults(func=cmd_knowledge_get)
+    c = knl.add_parser("create"); c.add_argument("--name", required=True); c.add_argument("--description"); c.set_defaults(func=cmd_knowledge_create)
+    c = knl.add_parser("update"); c.add_argument("--knowledge-id", required=True); c.add_argument("--name"); c.add_argument("--description"); c.set_defaults(func=cmd_knowledge_update)
+    c = knl.add_parser("delete"); c.add_argument("--knowledge-id", required=True); c.set_defaults(func=cmd_knowledge_delete)
+    c = knl.add_parser("add-file", help="Attach an already-uploaded file (POST /api/v1/files first to get its id) to a knowledge collection"); c.add_argument("--knowledge-id", required=True); c.add_argument("--file-id", required=True); c.set_defaults(func=cmd_knowledge_file_add)
+
+    # functions
+    fns = sub.add_parser("functions", help="OpenWebUI Functions (filter/pipe/action Python, admin only for write)").add_subparsers(dest="cmd", required=True)
+    c = fns.add_parser("list"); c.set_defaults(func=cmd_functions_list)
+    c = fns.add_parser("get"); c.add_argument("--function-id", required=True); c.set_defaults(func=cmd_functions_get)
+    c = fns.add_parser("create"); c.add_argument("--id", required=True); c.add_argument("--name", required=True); c.add_argument("--type", required=True, choices=["filter", "pipe", "action"]); c.add_argument("--content"); c.add_argument("--content-file", help="Read Python source from this path"); c.add_argument("--description"); c.set_defaults(func=cmd_functions_create)
+    c = fns.add_parser("update"); c.add_argument("--function-id", required=True); c.add_argument("--name"); c.add_argument("--content"); c.add_argument("--content-file"); c.add_argument("--description"); c.set_defaults(func=cmd_functions_update)
+    c = fns.add_parser("delete"); c.add_argument("--function-id", required=True); c.set_defaults(func=cmd_functions_delete)
+    c = fns.add_parser("toggle"); c.add_argument("--function-id", required=True); c.add_argument("--scope", choices=["self", "global"], default="self"); c.set_defaults(func=cmd_functions_toggle)
+
+    # tools
+    tls = sub.add_parser("tools", help="OpenWebUI Tools (OpenAI-style tool specs, admin only for write)").add_subparsers(dest="cmd", required=True)
+    c = tls.add_parser("list"); c.set_defaults(func=cmd_tools_list)
+    c = tls.add_parser("get"); c.add_argument("--tool-id", required=True); c.set_defaults(func=cmd_tools_get)
+    c = tls.add_parser("create"); c.add_argument("--id", required=True); c.add_argument("--name", required=True); c.add_argument("--content"); c.add_argument("--content-file"); c.add_argument("--description"); c.set_defaults(func=cmd_tools_create)
+    c = tls.add_parser("update"); c.add_argument("--tool-id", required=True); c.add_argument("--name"); c.add_argument("--content"); c.add_argument("--content-file"); c.add_argument("--description"); c.set_defaults(func=cmd_tools_update)
+    c = tls.add_parser("delete"); c.add_argument("--tool-id", required=True); c.set_defaults(func=cmd_tools_delete)
 
     # folders
     flds = sub.add_parser("folders", help="Chat folders").add_subparsers(dest="cmd", required=True)
     c = flds.add_parser("list"); c.set_defaults(func=cmd_folders_list)
     c = flds.add_parser("create"); c.add_argument("--name", required=True); c.set_defaults(func=cmd_folders_create)
+    c = flds.add_parser("rename"); c.add_argument("--folder-id", required=True); c.add_argument("--name", required=True); c.set_defaults(func=cmd_folders_rename)
     c = flds.add_parser("delete"); c.add_argument("--folder-id", required=True); c.set_defaults(func=cmd_folders_delete)
 
     # diagnostics

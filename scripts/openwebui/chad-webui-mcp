@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-webui-mcp — MCP stdio server that exposes chad-webui sub-commands
+# as native MCP tools.
+#
+# Why this exists: openclaw can register MCP servers via
+# `openclaw mcp set <name> <json>`. Once registered, the gateway loads
+# them on startup and the agent sees each tool with its JSON schema in
+# the system prompt. The model can then call (e.g.) the
+# `calendar_create_event` tool with structured args, and the
+# gateway routes the call here. We translate the call into a
+# `chad-webui calendar create-event --flag …` subprocess invocation and
+# return the JSON stdout.
+#
+# This gives Chad the same fail-closed per-operator scoping as direct
+# CLI use (chad-webui reads CHAD_OPERATOR_SLUG from env) but with
+# structured tool-call audit instead of opaque exec lines.
+#
+# Protocol: MCP version 2024-11-05, JSON-RPC 2.0 over stdio.
+# Stdlib-only; no external deps. The server reads one JSON-RPC message
+# per line on stdin, writes one response per line to stdout.
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import traceback
+
+CHAD_WEBUI = os.environ.get(
+    "CHAD_WEBUI_BIN", "/sandbox/.openclaw-data/bin/chad-webui"
+)
+SERVER_NAME = "chad-webui"
+SERVER_VERSION = "0.1.0"
+PROTOCOL_VERSION = "2024-11-05"
+
+
+# Each tool maps to a chad-webui subcommand pair.
+# Format: tool_name -> (chad-webui group, command, schema_props, required)
+# We translate JSON-RPC args -> CLI flags by:
+#   --kebab-case-flag <value>
+# Each string property in the schema becomes a CLI flag of the same name.
+# Boolean true becomes a bare flag.
+TOOLS = [
+    # ── Diagnostics ────────────────────────────────────────────────
+    ("whoami", "whoami", None, {
+        "type": "object",
+        "properties": {},
+    }, "Show the OpenWebUI user the current API key resolves to."),
+    ("health", "health", None, {
+        "type": "object",
+        "properties": {},
+    }, "Probe reachability + auth, return a diagnostic blob."),
+
+    # ── Calendar ───────────────────────────────────────────────────
+    ("calendar_list_calendars", "calendar", "list-calendars", {
+        "type": "object", "properties": {}
+    }, "List all of the operator's calendars."),
+    ("calendar_list_events", "calendar", "list-events", {
+        "type": "object",
+        "properties": {
+            "start": {"type": "string", "description": "ISO date or datetime; default today"},
+            "end": {"type": "string", "description": "ISO date or datetime; default start + 14 days"},
+            "calendar_ids": {"type": "string", "description": "Comma-separated calendar ids"}
+        }
+    }, "List events in a date range."),
+    ("calendar_search_events", "calendar", "search-events", {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "default": 30}
+        }
+    }, "Full-text search across events."),
+    ("calendar_get_event", "calendar", "get-event", {
+        "type": "object",
+        "properties": {"event_id": {"type": "string"}},
+        "required": ["event_id"]
+    }, "Fetch a single event by id."),
+    ("calendar_create_event", "calendar", "create-event", {
+        "type": "object",
+        "properties": {
+            "calendar_id": {"type": "string"},
+            "title": {"type": "string"},
+            "start": {"type": "string", "description": "ISO date or datetime"},
+            "end": {"type": "string"},
+            "description": {"type": "string"},
+            "location": {"type": "string"},
+            "all_day": {"type": "boolean"},
+            "color": {"type": "string"},
+            "rrule": {"type": "string", "description": "RRULE (RFC 5545)"}
+        },
+        "required": ["calendar_id", "title", "start"]
+    }, "Create a calendar event."),
+    ("calendar_update_event", "calendar", "update-event", {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string"},
+            "title": {"type": "string"},
+            "start": {"type": "string"},
+            "end": {"type": "string"},
+            "description": {"type": "string"},
+            "location": {"type": "string"},
+            "all_day": {"type": "boolean"},
+            "color": {"type": "string"},
+            "rrule": {"type": "string"}
+        },
+        "required": ["event_id"]
+    }, "Update fields on an existing event."),
+    ("calendar_delete_event", "calendar", "delete-event", {
+        "type": "object",
+        "properties": {"event_id": {"type": "string"}},
+        "required": ["event_id"]
+    }, "Delete an event."),
+    ("calendar_rsvp", "calendar", "rsvp", {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string"},
+            "status": {"type": "string", "enum": ["accepted", "declined", "tentative", "pending"]}
+        },
+        "required": ["event_id", "status"]
+    }, "RSVP to a calendar event."),
+
+    # ── Notes ──────────────────────────────────────────────────────
+    ("notes_list", "notes", "list", {"type": "object", "properties": {}},
+     "List notes."),
+    ("notes_get", "notes", "get", {
+        "type": "object",
+        "properties": {"note_id": {"type": "string"}},
+        "required": ["note_id"]
+    }, "Fetch a single note by id."),
+    ("notes_create", "notes", "create", {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "content": {"type": "string"},
+            "tags": {"type": "string", "description": "Comma-separated"}
+        },
+        "required": ["title"]
+    }, "Create a new note."),
+    ("notes_update", "notes", "update", {
+        "type": "object",
+        "properties": {
+            "note_id": {"type": "string"},
+            "title": {"type": "string"},
+            "content": {"type": "string"},
+            "tags": {"type": "string"}
+        },
+        "required": ["note_id"]
+    }, "Update an existing note."),
+    ("notes_delete", "notes", "delete", {
+        "type": "object",
+        "properties": {"note_id": {"type": "string"}},
+        "required": ["note_id"]
+    }, "Delete a note."),
+
+    # ── Automations ────────────────────────────────────────────────
+    ("automations_list", "automations", "list", {"type": "object", "properties": {}},
+     "List the operator's scheduled automations."),
+    ("automations_get", "automations", "get", {
+        "type": "object",
+        "properties": {"automation_id": {"type": "string"}},
+        "required": ["automation_id"]
+    }, "Fetch a single automation."),
+    ("automations_create", "automations", "create", {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "prompt": {"type": "string"},
+            "rrule": {"type": "string", "description": "RRULE for recurrence"},
+            "model": {"type": "string"},
+            "inactive": {"type": "boolean"}
+        },
+        "required": ["name", "prompt", "rrule"]
+    }, "Create a scheduled automation."),
+    ("automations_update", "automations", "update", {
+        "type": "object",
+        "properties": {
+            "automation_id": {"type": "string"},
+            "name": {"type": "string"},
+            "prompt": {"type": "string"},
+            "rrule": {"type": "string"},
+            "model": {"type": "string"},
+            "inactive": {"type": "boolean"}
+        },
+        "required": ["automation_id"]
+    }, "Update an automation."),
+    ("automations_delete", "automations", "delete", {
+        "type": "object",
+        "properties": {"automation_id": {"type": "string"}},
+        "required": ["automation_id"]
+    }, "Delete an automation."),
+
+    # ── Memories ───────────────────────────────────────────────────
+    ("memories_list", "memories", "list", {"type": "object", "properties": {}},
+     "List per-operator long-term memories."),
+    ("memories_create", "memories", "create", {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+        "required": ["content"]
+    }, "Save a new memory."),
+    ("memories_update", "memories", "update", {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string"},
+            "content": {"type": "string"}
+        },
+        "required": ["memory_id", "content"]
+    }, "Update a memory's content."),
+    ("memories_delete", "memories", "delete", {
+        "type": "object",
+        "properties": {"memory_id": {"type": "string"}},
+        "required": ["memory_id"]
+    }, "Delete a memory."),
+
+    # ── Chats ──────────────────────────────────────────────────────
+    ("chats_list", "chats", "list", {
+        "type": "object",
+        "properties": {"page": {"type": "integer", "default": 1}}
+    }, "List the operator's chats."),
+    ("chats_get", "chats", "get", {
+        "type": "object",
+        "properties": {"chat_id": {"type": "string"}},
+        "required": ["chat_id"]
+    }, "Fetch a chat (full conversation)."),
+    ("chats_search", "chats", "search", {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"]
+    }, "Search chats by content."),
+    ("chats_archive", "chats", "archive", {
+        "type": "object",
+        "properties": {"chat_id": {"type": "string"}},
+        "required": ["chat_id"]
+    }, "Toggle archive on a chat."),
+    ("chats_pin", "chats", "pin", {
+        "type": "object",
+        "properties": {"chat_id": {"type": "string"}},
+        "required": ["chat_id"]
+    }, "Toggle pin on a chat."),
+    ("chats_share", "chats", "share", {
+        "type": "object",
+        "properties": {"chat_id": {"type": "string"}},
+        "required": ["chat_id"]
+    }, "Create a share token for a chat."),
+    ("chats_unshare", "chats", "unshare", {
+        "type": "object",
+        "properties": {"chat_id": {"type": "string"}},
+        "required": ["chat_id"]
+    }, "Revoke a chat's share token."),
+    ("chats_delete", "chats", "delete", {
+        "type": "object",
+        "properties": {"chat_id": {"type": "string"}},
+        "required": ["chat_id"]
+    }, "Delete a chat permanently."),
+
+    # ── Knowledge (RAG) ────────────────────────────────────────────
+    ("knowledge_list", "knowledge", "list", {"type": "object", "properties": {}},
+     "List knowledge collections."),
+    ("knowledge_get", "knowledge", "get", {
+        "type": "object",
+        "properties": {"knowledge_id": {"type": "string"}},
+        "required": ["knowledge_id"]
+    }, "Fetch a knowledge collection's metadata + file list."),
+    ("knowledge_create", "knowledge", "create", {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "description": {"type": "string"}
+        },
+        "required": ["name"]
+    }, "Create a new knowledge collection."),
+    ("knowledge_update", "knowledge", "update", {
+        "type": "object",
+        "properties": {
+            "knowledge_id": {"type": "string"},
+            "name": {"type": "string"},
+            "description": {"type": "string"}
+        },
+        "required": ["knowledge_id"]
+    }, "Update a knowledge collection's name or description."),
+    ("knowledge_delete", "knowledge", "delete", {
+        "type": "object",
+        "properties": {"knowledge_id": {"type": "string"}},
+        "required": ["knowledge_id"]
+    }, "Delete a knowledge collection."),
+    ("knowledge_add_file", "knowledge", "add-file", {
+        "type": "object",
+        "properties": {
+            "knowledge_id": {"type": "string"},
+            "file_id": {"type": "string"}
+        },
+        "required": ["knowledge_id", "file_id"]
+    }, "Attach a previously uploaded file (POST /api/v1/files) to a collection."),
+
+    # ── Models (admin) ─────────────────────────────────────────────
+    ("models_list", "models", "list", {"type": "object", "properties": {}},
+     "List all registered models."),
+    ("models_create", "models", "create", {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "base_model_id": {"type": "string"},
+            "name": {"type": "string"},
+            "params": {"type": "string", "description": "JSON object as string"},
+            "meta": {"type": "string", "description": "JSON object as string"}
+        },
+        "required": ["id", "base_model_id", "name"]
+    }, "Create a new model registry row (admin only)."),
+    ("models_update", "models", "update", {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "params": {"type": "string"},
+            "meta": {"type": "string"}
+        },
+        "required": ["id"]
+    }, "Update a model row (admin only)."),
+    ("models_toggle", "models", "toggle", {
+        "type": "object",
+        "properties": {"id": {"type": "string"}},
+        "required": ["id"]
+    }, "Enable/disable a model (admin only)."),
+
+    # ── Functions (admin) ──────────────────────────────────────────
+    ("functions_list", "functions", "list", {"type": "object", "properties": {}},
+     "List installed OpenWebUI Functions."),
+    ("functions_get", "functions", "get", {
+        "type": "object",
+        "properties": {"function_id": {"type": "string"}},
+        "required": ["function_id"]
+    }, "Fetch a function by id."),
+    ("functions_create", "functions", "create", {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "type": {"type": "string", "enum": ["filter", "pipe", "action"]},
+            "content": {"type": "string", "description": "Python source"},
+            "description": {"type": "string"}
+        },
+        "required": ["id", "name", "type"]
+    }, "Install a new function (admin only)."),
+    ("functions_update", "functions", "update", {
+        "type": "object",
+        "properties": {
+            "function_id": {"type": "string"},
+            "name": {"type": "string"},
+            "content": {"type": "string"},
+            "description": {"type": "string"}
+        },
+        "required": ["function_id"]
+    }, "Update a function (admin only)."),
+    ("functions_delete", "functions", "delete", {
+        "type": "object",
+        "properties": {"function_id": {"type": "string"}},
+        "required": ["function_id"]
+    }, "Delete a function (admin only)."),
+    ("functions_toggle", "functions", "toggle", {
+        "type": "object",
+        "properties": {
+            "function_id": {"type": "string"},
+            "scope": {"type": "string", "enum": ["self", "global"], "default": "self"}
+        },
+        "required": ["function_id"]
+    }, "Enable/disable a function."),
+
+    # ── Tools (admin) ──────────────────────────────────────────────
+    ("tools_list", "tools", "list", {"type": "object", "properties": {}},
+     "List installed OpenWebUI Tools."),
+    ("tools_get", "tools", "get", {
+        "type": "object",
+        "properties": {"tool_id": {"type": "string"}},
+        "required": ["tool_id"]
+    }, "Fetch a tool by id."),
+    ("tools_create", "tools", "create", {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "content": {"type": "string"},
+            "description": {"type": "string"}
+        },
+        "required": ["id", "name"]
+    }, "Install a new tool (admin only)."),
+    ("tools_update", "tools", "update", {
+        "type": "object",
+        "properties": {
+            "tool_id": {"type": "string"},
+            "name": {"type": "string"},
+            "content": {"type": "string"},
+            "description": {"type": "string"}
+        },
+        "required": ["tool_id"]
+    }, "Update a tool (admin only)."),
+    ("tools_delete", "tools", "delete", {
+        "type": "object",
+        "properties": {"tool_id": {"type": "string"}},
+        "required": ["tool_id"]
+    }, "Delete a tool (admin only)."),
+
+    # ── Folders ────────────────────────────────────────────────────
+    ("folders_list", "folders", "list", {"type": "object", "properties": {}},
+     "List chat folders."),
+    ("folders_create", "folders", "create", {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"]
+    }, "Create a chat folder."),
+    ("folders_rename", "folders", "rename", {
+        "type": "object",
+        "properties": {
+            "folder_id": {"type": "string"},
+            "name": {"type": "string"}
+        },
+        "required": ["folder_id", "name"]
+    }, "Rename a folder."),
+    ("folders_delete", "folders", "delete", {
+        "type": "object",
+        "properties": {"folder_id": {"type": "string"}},
+        "required": ["folder_id"]
+    }, "Delete a folder."),
+]
+
+
+def _kebab(key: str) -> str:
+    return key.replace("_", "-")
+
+
+def _build_cli_args(group: str, cmd: str | None, args: dict) -> list[str]:
+    """Translate MCP tool args (JSON object with snake_case keys) into
+    chad-webui CLI args (--kebab-case flags)."""
+    out = [group]
+    if cmd:
+        out.append(cmd)
+    for key, value in args.items():
+        if value is None or value is False:
+            continue
+        flag = f"--{_kebab(key)}"
+        if value is True:
+            out.append(flag)
+        else:
+            out.extend([flag, str(value)])
+    return out
+
+
+def _run_tool(group: str, cmd: str | None, args: dict) -> dict:
+    """Invoke chad-webui as a subprocess and return MCP content block."""
+    if not shutil.which(CHAD_WEBUI) and not os.path.isfile(CHAD_WEBUI):
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": f"chad-webui not found at {CHAD_WEBUI}"}],
+        }
+    cmd_argv = [CHAD_WEBUI, *_build_cli_args(group, cmd, args)]
+    # Drop NODE_OPTIONS (it would try to --require .js into python3) and
+    # restore the L7 outbound proxy env. The gateway's launch env (set by
+    # chad-gateway-watchdog) doesn't include HTTPS_PROXY since the SSH
+    # command bypasses /etc/environment, so urllib in chad-webui hits
+    # "Errno 101 Network is unreachable" trying direct egress. The L7
+    # OpenShell proxy at 10.200.0.1:3128 is the only outbound path.
+    child_env = {k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"}
+    proxy = "http://10.200.0.1:3128"
+    child_env.setdefault("HTTPS_PROXY", proxy)
+    child_env.setdefault("HTTP_PROXY", proxy)
+    child_env.setdefault("https_proxy", proxy)
+    child_env.setdefault("http_proxy", proxy)
+    child_env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1,10.200.0.1")
+    child_env.setdefault("no_proxy", "localhost,127.0.0.1,::1,10.200.0.1")
+    # The L7 proxy MITMs TLS for hosts with l7_protocol="rest" (e.g.
+    # chad.supachad.com) so it can inspect request bodies. Python urllib
+    # then sees the proxy's CA-issued cert, not Cloudflare's. NODE_EXTRA_CA_CERTS
+    # handles this for Node; for Python we point ssl/urllib at the same bundle.
+    child_env.setdefault("SSL_CERT_FILE", "/etc/openshell-tls/ca-bundle.pem")
+    child_env.setdefault("REQUESTS_CA_BUNDLE", "/etc/openshell-tls/ca-bundle.pem")
+    try:
+        proc = subprocess.run(
+            cmd_argv, capture_output=True, text=True, timeout=60, env=child_env,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": "chad-webui timed out after 60s"}],
+        }
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        msg = stderr or stdout or f"exit {proc.returncode}"
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": msg}],
+        }
+    return {
+        "isError": False,
+        "content": [{"type": "text", "text": stdout or "(no output)"}],
+    }
+
+
+# ────────────────────────────────────────────────────────────────────
+# JSON-RPC dispatch
+# ────────────────────────────────────────────────────────────────────
+
+
+def _send(msg: dict) -> None:
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def _result(req_id, result) -> None:
+    _send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def _error(req_id, code, message) -> None:
+    _send({
+        "jsonrpc": "2.0", "id": req_id,
+        "error": {"code": code, "message": message},
+    })
+
+
+def handle(msg: dict) -> None:
+    req_id = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {}
+
+    if method == "initialize":
+        _result(req_id, {
+            "protocolVersion": PROTOCOL_VERSION,
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "capabilities": {"tools": {}},
+        })
+    elif method == "tools/list":
+        tools = [
+            {"name": name, "description": desc, "inputSchema": schema}
+            for (name, _group, _cmd, schema, desc) in TOOLS
+        ]
+        _result(req_id, {"tools": tools})
+    elif method == "tools/call":
+        name = params.get("name") or ""
+        args = params.get("arguments") or {}
+        match = next(
+            ((g, c) for (n, g, c, _s, _d) in TOOLS if n == name), None
+        )
+        if match is None:
+            _error(req_id, -32601, f"unknown tool: {name}")
+            return
+        group, cmd = match
+        _result(req_id, _run_tool(group, cmd, args))
+    elif method == "notifications/initialized":
+        # Just acknowledged silently per MCP spec — no response for notifications.
+        return
+    elif method == "shutdown":
+        _result(req_id, None)
+    elif method == "exit":
+        sys.exit(0)
+    else:
+        if req_id is not None:
+            _error(req_id, -32601, f"method not implemented: {method}")
+
+
+def main() -> None:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as e:
+            _error(None, -32700, f"parse error: {e}")
+            continue
+        try:
+            handle(msg)
+        except Exception as e:
+            tb = traceback.format_exc()
+            sys.stderr.write(f"chad-webui-mcp internal error: {e}\n{tb}\n")
+            req_id = msg.get("id")
+            if req_id is not None:
+                _error(req_id, -32603, f"internal error: {e}")
+
+
+if __name__ == "__main__":
+    main()
