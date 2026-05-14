@@ -28,7 +28,7 @@ WORKSPACE="${CHAD_WORKSPACE:-/sandbox/.openclaw/workspace}"
 OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
 CREDS="${CHAD_CREDENTIALS:-/sandbox/.nemoclaw/credentials.json}"
 
-log()  { echo "[backup] $*"; }
+log() { echo "[backup] $*"; }
 warn() { echo "[backup] $*" >&2; }
 
 # Load GITHUB_TOKEN from credentials if not already in the environment.
@@ -67,9 +67,12 @@ ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 local_blob_sha() {
   local src="$1"
   local size
-  size="$(wc -c < "$src" | tr -d ' ')"
-  { printf 'blob %s\0' "$size"; cat "$src"; } | \
-    { sha1sum 2>/dev/null || shasum -a 1; } | awk '{print $1}'
+  size="$(wc -c <"$src" | tr -d ' ')"
+  {
+    printf 'blob %s\0' "$size"
+    cat "$src"
+  } \
+    | { sha1sum 2>/dev/null || shasum -a 1; } | awk '{print $1}'
 }
 
 push_file() {
@@ -95,27 +98,43 @@ push_file() {
     fi
   fi
 
-  local content
-  content="$(base64 -w0 < "$src" 2>/dev/null || base64 < "$src" | tr -d '\n')"
-
-  local args=(
-    "repos/${REPO}/contents/${dst}"
-    --method PUT
-    -f "message=chore(backup): workspace snapshot ${ts}"
-    -f "content=${content}"
-    -f "branch=${BRANCH}"
-  )
-  if [ -n "$sha" ]; then
-    args+=(-f "sha=${sha}")
+  # Build the request body via python3 → tempfile, then `gh api --input`.
+  #
+  # The previous approach (-f "content=$base64") passed the entire base64
+  # payload through execve argv, which hit Linux ARG_MAX (~128KB) for any
+  # source file larger than ~95KB raw (base64 inflates ~33%). Symptom was a
+  # silent `gh: Argument list too long` exit, surfaced as `[backup] fail:`
+  # on the day's longest workspace/memory/*.md and on agents/main/sessions/
+  # *.json. Using --input <tempfile> reads the body off disk and bypasses
+  # argv entirely.
+  local body_file
+  body_file="$(mktemp /tmp/chad-backup-body-XXXXXX)"
+  if ! SRC="$src" MSG="chore(backup): workspace snapshot ${ts}" \
+    BR="$BRANCH" SHA="$sha" \
+    python3 -c '
+import base64, json, os
+with open(os.environ["SRC"], "rb") as fh:
+    content = base64.b64encode(fh.read()).decode("ascii")
+body = {"message": os.environ["MSG"], "content": content, "branch": os.environ["BR"]}
+if os.environ.get("SHA"):
+    body["sha"] = os.environ["SHA"]
+import sys; json.dump(body, sys.stdout)
+' >"$body_file" 2>/dev/null; then
+    rm -f "$body_file"
+    errors=$((errors + 1))
+    warn "  fail: ${dst} (body-build failed)"
+    return 0
   fi
 
-  if gh api "${args[@]}" >/dev/null 2>&1; then
+  if gh api "repos/${REPO}/contents/${dst}" \
+    --method PUT --input "$body_file" >/dev/null 2>&1; then
     count=$((count + 1))
     log "  ok: ${dst}"
   else
     errors=$((errors + 1))
     warn "  fail: ${dst}"
   fi
+  rm -f "$body_file"
 }
 
 # Sectioned manifest at /usr/local/share/chad/chad-workspace-files.txt
@@ -139,20 +158,21 @@ if [ -r "$WORKSPACE_FILES_LIST" ]; then
     # Strip comments and whitespace.
     line="${line%%#*}"
     line="${line//[$'\t\r\n']/}"
-    line="${line## }"; line="${line%% }"
+    line="${line## }"
+    line="${line%% }"
     [ -z "$line" ] && continue
     if [[ "$line" =~ ^\[(.+)\]$ ]]; then
       current_section="${BASH_REMATCH[1]}"
       continue
     fi
     case "$current_section" in
-      workspace)    WORKSPACE_FILES+=("$line") ;;
-      runtime)      RUNTIME_FILES+=("$line") ;;
+      workspace) WORKSPACE_FILES+=("$line") ;;
+      runtime) RUNTIME_FILES+=("$line") ;;
       runtime-dirs) RUNTIME_DIRS+=("${line%/}") ;;
-      exclude|"")   : ;;
-      *)            : ;;  # unknown section — forward-compat skip
+      exclude | "") : ;;
+      *) : ;; # unknown section — forward-compat skip
     esac
-  done < "$WORKSPACE_FILES_LIST"
+  done <"$WORKSPACE_FILES_LIST"
 fi
 # Defaults if manifest is missing or empty (older deployments).
 if [ "${#WORKSPACE_FILES[@]}" -eq 0 ]; then
@@ -172,7 +192,7 @@ done
 # Memory directory (recursive). Always backed up, not listed in manifest.
 if [ -d "${WORKSPACE}/memory" ]; then
   while IFS= read -r -d '' file; do
-    rel="${file#${WORKSPACE}/}"
+    rel="${file#"${WORKSPACE}"/}"
     push_file "$file" "workspace/${rel}"
   done < <(find "${WORKSPACE}/memory" -type f -print0)
 fi
@@ -191,7 +211,7 @@ for d in "${RUNTIME_DIRS[@]}"; do
   src_dir="${OPENCLAW_DATA}/${d}"
   if [ -d "$src_dir" ]; then
     while IFS= read -r -d '' file; do
-      rel="${file#${OPENCLAW_DATA}/}"
+      rel="${file#"${OPENCLAW_DATA}"/}"
       push_file "$file" "${rel}"
     done < <(find "$src_dir" -type f -print0)
   fi
@@ -218,7 +238,7 @@ if command -v gbrain >/dev/null 2>&1 && [ -d "$GBRAIN_DATA" ]; then
     log "Brain export: $page_count pages"
     if [ "$page_count" -gt 0 ]; then
       while IFS= read -r -d '' md_file; do
-        rel="${md_file#${brain_export_dir}/}"
+        rel="${md_file#"${brain_export_dir}"/}"
         push_file "$md_file" "brain/${rel}"
       done < <(find "$brain_export_dir" -name '*.md' -print0)
     fi

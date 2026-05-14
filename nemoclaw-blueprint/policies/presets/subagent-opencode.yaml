@@ -57,10 +57,12 @@ network_policies:
   # gbrain-bin must be on the binary list or L7 proxy 403s.
   subagent_opencode_gbrain:
     name: subagent_opencode_gbrain
-    endpoints:
-      - host: 127.0.0.1
-        port: 0
-        access: local-only
+    # No-network scope: gbrain is a local subprocess, no egress. Empty
+    # endpoints array is the schema-blessed form ($defs.networkPolicyEntry:
+    # "Empty array is an explicit 'no-network' scope (e.g. session-logs)").
+    # The earlier placeholder (host: 127.0.0.1 port: 0 access: local-only)
+    # was rejected on port >= 1 and access enum.
+    endpoints: []
     binaries:
       - { path: /usr/local/bin/gbrain }
       - { path: /usr/local/bin/gbrain-bin }

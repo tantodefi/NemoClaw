@@ -33,14 +33,15 @@ network_policies:
   # `CONNECT tunnel failed`. See feedback_openshell_l7_binary_identity.
   subagent_codex_gbrain:
     name: subagent_codex_gbrain
-    endpoints:
-      # gbrain CLI is local subprocess; no external endpoints needed for
-      # the query path. The embedder backend (NVIDIA or LM Studio) goes
-      # through the gbrain process, not codex. Listed for L7 binary
-      # identity only.
-      - host: 127.0.0.1
-        port: 0
-        access: local-only
+    # gbrain CLI is a local subprocess; no external endpoints needed for the
+    # query path. The embedder backend (NVIDIA or LM Studio) goes through
+    # the gbrain process, not codex. Empty endpoints + binaries is the
+    # idiomatic "no-network scope" form per the policy-preset schema
+    # ($defs.networkPolicyEntry: "Empty array is an explicit 'no-network'
+    # scope (e.g. session-logs)"). The earlier placeholder endpoint
+    # (host: 127.0.0.1 port: 0 access: local-only) was rejected by the
+    # schema validator on port >= 1 and access enum.
+    endpoints: []
     binaries:
       - { path: /usr/local/bin/gbrain }
       - { path: /usr/local/bin/gbrain-bin }
