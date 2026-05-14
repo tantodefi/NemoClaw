@@ -93,6 +93,13 @@ skills/
 # cron writes this nightly. Without backup, every experiment Chad has ever
 # tried is lost on pod rebuild.
 state/experiments/
+# Append-only structured event stream from host-side watchdogs
+# (chad-spawn-poll-watchdog, chad-shim-watchdog, future watchdogs).
+# Cron agent turns can `tail` this at startup to surface non-trivial
+# events that happened between turns. Schema: one JSON line per event
+# with ts/source/kind/severity/data. See docs/operations/chad-devflow.md
+# for the schema.
+state/agent-inbox.jsonl
 
 [exclude]
 # Device keypair + operator bearer tokens. Regenerated on first boot via OpenShell

@@ -235,3 +235,33 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 - [Chad Skills Catalog](chad-skills.md) — all 48 registered skills grouped by source
 - [Wrapper Bugs](wrapper-bugs.md) — five tracked argv-vs-env / path bugs in `/usr/local/bin/chad-*` with shim-and-repoint workarounds in place
 - [Autonomous Experiment Lifecycle](chad-experiments.md) — Chad's nightly propose → design → start → observe → evaluate → promote/retire loop with full autonomy + retire-on-regression. New `chad-experiment` CLI + `experiment-night` cron + sibling skill at `/sandbox/.openclaw-data/skills/chad-experiment/`
+
+## Host-side watchdogs (no agent overhead)
+
+Three launchd jobs supervise pod-side services from the host. Each fires every 5 min, takes SSH-quick action, and writes nothing to OpenWebUI's UI:
+
+| Plist | What it supervises | Recovery action | Event sink |
+|---|---|---|---|
+| `dev.nemoclaw.chad-gateway-watchdog` | `openclaw gateway run` on port 18789 | pkill + relaunch with 4 GB heap, `PATH=/sandbox/.openclaw-data/bin:…`, `CHAD_BUDGET_FILE=…` | `~/.nemoclaw/openwebui/chad-gateway-watchdog.log` |
+| `dev.nemoclaw.chad-shim-watchdog` | `chad-shim.py` on port 8901 (the `chad` model bridge) | pkill stale + relaunch from sandbox-writable copy with `HOME=/sandbox nohup` | `~/.nemoclaw/openwebui/chad-shim-watchdog.log` + agent-inbox |
+| `dev.nemoclaw.chad-spawn-poll` | Runs `chad-spawn-poll` every 5 min instead of via an agent-turn cron | Reconciles GHA-async sub-agents and writes state changes to the inbox | `~/.nemoclaw/openwebui/chad-spawn-poll-watchdog.log` + agent-inbox |
+
+Why launchd and not openclaw cron: the openclaw `spawn-poll` cron was costing ~12.7M tokens/day and 288 UI entries/day to invoke what is structurally a 5-second shell script that needs zero LLM reasoning. Moving it to launchd reclaimed those budgets entirely; the only cost is that polls don't run when the host laptop is off (acceptable for spawn reconciliation, which is dev-session driven).
+
+### The agent-inbox pattern
+
+Host-side watchdogs that detect state changes append a structured event line to `/sandbox/.openclaw-data/state/agent-inbox.jsonl`. Schema:
+
+```jsonc
+{
+  "ts": "2026-05-14T18:21:32Z",
+  "source": "chad-spawn-poll-watchdog",   // watchdog identifier
+  "kind": "spawn-reconciled",              // semantic event type
+  "severity": "info|warning|error",
+  "data": { /* per-source structured payload */ }
+}
+```
+
+Cron agent turns (`mail-check`, `issue-triage`, `experiment-night`, etc.) can read this file at startup with `tail -n N /sandbox/.openclaw-data/state/agent-inbox.jsonl` to surface anything important that happened between turns. The file is backed up under `state/agent-inbox.jsonl` in `chad-workspace-files.txt` so pod rebuilds preserve it.
+
+**Quiet ticks leave no trace** — watchdogs only write to the inbox when there's a real state change (reconciliation, restart, error). The local watchdog log captures every fire for ops visibility.
