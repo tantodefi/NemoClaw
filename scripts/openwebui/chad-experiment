@@ -593,6 +593,54 @@ def cmd_ab_pick(args):
         _do_retire(rec, reason=f"ab-pick: variant {args.winner} won")
 
 
+def cmd_ab_summary(args):
+    """Side-by-side comparison of all variants in an A/B pair. Reads both
+    active and archived records so the comparison works after ab-pick has
+    moved one variant to archive/."""
+    pair_id = args.pair_id
+    members = []
+    for d in [STATE_DIR / "active", STATE_DIR / "archive"]:
+        for path in d.glob("*.json"):
+            with path.open() as fh:
+                r = json.load(fh)
+            if r.get("ab_pair") == pair_id:
+                members.append(r)
+    if not members:
+        sys.stderr.write(f"chad-experiment: no experiments found with ab_pair {pair_id!r}\n")
+        sys.exit(1)
+    members.sort(key=lambda r: r.get("ab_variant", "Z"))
+
+    def _obs_breakdown(rec):
+        kinds = {}
+        for obs in rec.get("observations", []):
+            k = obs.get("kind", "?")
+            kinds[k] = kinds.get(k, 0) + 1
+        return kinds
+
+    summary = {
+        "ab_pair": pair_id,
+        "hypothesis": members[0].get("hypothesis"),
+        "success_metric": members[0].get("success_metric"),
+        "baseline": members[0].get("baseline"),
+        "variants": [],
+    }
+    for m in members:
+        summary["variants"].append({
+            "variant": m.get("ab_variant"),
+            "id": m["id"],
+            "state": m["state"],
+            "surface_id": (m.get("surface") or {}).get("id"),
+            "designed_at": m.get("designed_at"),
+            "started_at": m.get("started_at"),
+            "evaluates_at": m.get("evaluates_at"),
+            "verdict": m.get("verdict"),
+            "evaluation": m.get("evaluation"),
+            "observation_count": len(m.get("observations", [])),
+            "observations_by_kind": _obs_breakdown(m),
+        })
+    _print(summary)
+
+
 # ─────────────────────────────────────────────────────────────────
 # Memory + observation helpers (data for the cron LLM)
 # ─────────────────────────────────────────────────────────────────
@@ -713,6 +761,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--id", required=True, help="Any experiment in the pair (the other is found via ab_pair)")
     c.add_argument("--winner", required=True, choices=["A", "B"])
     c.set_defaults(func=cmd_ab_pick)
+
+    c = sub.add_parser("ab-summary", help="Side-by-side comparison of A/B variants (works across active + archive)")
+    c.add_argument("--pair-id", required=True, help="The ab_pair id (from ab-start output or ab_pair field)")
+    c.set_defaults(func=cmd_ab_summary)
 
     c = sub.add_parser("recent-memory", help="Emit recent memory files for hypothesis discovery")
     c.add_argument("--days", type=int, default=7)

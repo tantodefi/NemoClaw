@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-inbox — first-class CLI for the agent-inbox event stream.
+#
+# The agent-inbox at /sandbox/.openclaw-data/state/agent-inbox.jsonl is
+# how host-side watchdogs (chad-gateway-watchdog, chad-shim-watchdog,
+# chad-spawn-poll-watchdog) and other off-agent processes report state
+# changes that should reach Chad's next cron turn or chat session.
+# Previously each writer hand-rolled the JSON formatting; this CLI gives
+# everyone the same surface so the schema stays consistent and adopters
+# don't have to remember `printf '{"ts":"%s",...}'` boilerplate.
+#
+# Verbs:
+#   append  Write a single event line. Source/kind/severity required.
+#   tail    Read recent events, optionally filtered by since/source/severity.
+#   summarize  Group recent events by source+kind+severity for a digest.
+#   prune   Trim the file to the last N lines (default 10k). Atomic.
+#
+# Schema (one JSON object per line):
+#
+#   {
+#     "ts":       "2026-05-14T18:21:32Z",
+#     "source":   "<watchdog or wrapper identifier>",
+#     "kind":     "<semantic event type>",
+#     "severity": "info|warning|error",
+#     "data":     { ... per-source payload ... }
+#   }
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import sys
+from pathlib import Path
+
+DEFAULT_PATH = "/sandbox/.openclaw-data/state/agent-inbox.jsonl"
+INBOX = Path(os.environ.get("CHAD_AGENT_INBOX", DEFAULT_PATH))
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ensure_parent() -> None:
+    INBOX.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _read_all() -> list[dict]:
+    if not INBOX.exists():
+        return []
+    out = []
+    for line in INBOX.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def cmd_append(args):
+    _ensure_parent()
+    event = {
+        "ts": _utc_now_iso(),
+        "source": args.source,
+        "kind": args.kind,
+        "severity": args.severity,
+    }
+    if args.data:
+        try:
+            event["data"] = json.loads(args.data)
+        except json.JSONDecodeError as e:
+            sys.stderr.write(f"chad-inbox: --data is not valid JSON: {e}\n")
+            sys.exit(2)
+    with INBOX.open("a") as fh:
+        fh.write(json.dumps(event, sort_keys=True) + "\n")
+    if args.echo:
+        json.dump(event, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+
+
+def _parse_since(s: str) -> datetime.datetime:
+    """Accepts ISO 8601 with optional trailing Z, or shortcut tokens like
+    '1h', '24h', '7d'."""
+    txt = s.strip()
+    if txt and txt[-1] in {"h", "d", "m"} and txt[:-1].isdigit():
+        n = int(txt[:-1])
+        unit = txt[-1]
+        delta = {"m": datetime.timedelta(minutes=n),
+                 "h": datetime.timedelta(hours=n),
+                 "d": datetime.timedelta(days=n)}[unit]
+        return datetime.datetime.now(datetime.timezone.utc) - delta
+    try:
+        return datetime.datetime.fromisoformat(txt.replace("Z", "+00:00"))
+    except ValueError as e:
+        sys.stderr.write(f"chad-inbox: --since {s!r} unparseable: {e}\n")
+        sys.exit(2)
+
+
+def _match(event: dict, args) -> bool:
+    if args.source and event.get("source") != args.source:
+        return False
+    if args.kind and event.get("kind") != args.kind:
+        return False
+    if args.severity:
+        sev_order = {"info": 0, "warning": 1, "error": 2}
+        want = sev_order.get(args.severity, -1)
+        have = sev_order.get(event.get("severity", "info"), 0)
+        if args.severity_compare == "min" and have < want:
+            return False
+        if args.severity_compare == "eq" and have != want:
+            return False
+    if args.since:
+        cutoff = _parse_since(args.since)
+        try:
+            ts = datetime.datetime.fromisoformat(event["ts"].replace("Z", "+00:00"))
+        except Exception:
+            return False
+        if ts < cutoff:
+            return False
+    return True
+
+
+def cmd_tail(args):
+    events = _read_all()
+    matched = [e for e in events if _match(e, args)]
+    matched = matched[-args.limit:] if args.limit else matched
+    if args.oneline:
+        for e in matched:
+            data_preview = ""
+            if isinstance(e.get("data"), dict) and e["data"]:
+                data_preview = " " + json.dumps(e["data"])[:120]
+            print(f"{e.get('ts','?')} [{e.get('severity','?')}] {e.get('source','?')}:{e.get('kind','?')}{data_preview}")
+    else:
+        json.dump(matched, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+
+
+def cmd_summarize(args):
+    """Group recent events by (source, kind, severity). Useful for cron
+    agent turns that want a one-shot "what happened overnight" digest."""
+    events = _read_all()
+    matched = [e for e in events if _match(e, args)]
+    buckets: dict[tuple, dict] = {}
+    for e in matched:
+        key = (e.get("source", "?"), e.get("kind", "?"), e.get("severity", "?"))
+        b = buckets.setdefault(key, {
+            "source": key[0], "kind": key[1], "severity": key[2],
+            "count": 0, "first_ts": e.get("ts"), "last_ts": e.get("ts"),
+        })
+        b["count"] += 1
+        ts = e.get("ts") or ""
+        if ts and ts < b["first_ts"]:
+            b["first_ts"] = ts
+        if ts and ts > b["last_ts"]:
+            b["last_ts"] = ts
+    out = sorted(buckets.values(), key=lambda b: (b["severity"] != "error",
+                                                  b["severity"] != "warning",
+                                                  -b["count"]))
+    json.dump({"event_count": len(matched), "buckets": out}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+def cmd_prune(args):
+    """Trim the inbox to the last --keep lines. Atomic via tmp + rename."""
+    events = _read_all()
+    if len(events) <= args.keep:
+        sys.stdout.write(f"chad-inbox: {len(events)} lines, no prune needed\n")
+        return
+    tmp = INBOX.with_suffix(".tmp")
+    with tmp.open("w") as fh:
+        for e in events[-args.keep:]:
+            fh.write(json.dumps(e, sort_keys=True) + "\n")
+    tmp.replace(INBOX)
+    sys.stdout.write(f"chad-inbox: pruned {len(events) - args.keep} of {len(events)} lines\n")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="chad-inbox",
+        description="Append-only structured event stream for off-agent state changes",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("append", help="Write one event line")
+    c.add_argument("--source", required=True, help="Watchdog or wrapper name")
+    c.add_argument("--kind", required=True, help="Semantic event type (e.g. spawn-reconciled, chad-shim-restarted)")
+    c.add_argument("--severity", choices=["info", "warning", "error"], default="info")
+    c.add_argument("--data", help="JSON object payload (optional)")
+    c.add_argument("--echo", action="store_true", help="Also print the written event")
+    c.set_defaults(func=cmd_append)
+
+    def _filters(p):
+        p.add_argument("--source", help="Filter by source")
+        p.add_argument("--kind", help="Filter by kind")
+        p.add_argument("--severity", choices=["info", "warning", "error"], help="Filter by severity")
+        p.add_argument("--severity-compare", choices=["min", "eq"], default="min",
+                       help="With --severity: min = at-or-above (default), eq = exact")
+        p.add_argument("--since", help="Cutoff: ISO 8601 or shortcut (5m, 1h, 24h, 7d)")
+
+    c = sub.add_parser("tail", help="Read recent events (default 50, newest last)")
+    c.add_argument("--limit", type=int, default=50, help="Last N matches (0 = all)")
+    c.add_argument("--oneline", action="store_true", help="Compact one-line-per-event format")
+    _filters(c)
+    c.set_defaults(func=cmd_tail)
+
+    c = sub.add_parser("summarize", help="Group recent events by source+kind+severity")
+    _filters(c)
+    c.set_defaults(func=cmd_summarize)
+
+    c = sub.add_parser("prune", help="Trim file to last --keep lines (atomic)")
+    c.add_argument("--keep", type=int, default=10_000, help="Lines to retain (default 10k)")
+    c.set_defaults(func=cmd_prune)
+
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

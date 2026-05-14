@@ -171,10 +171,29 @@ def last_user_text(body: dict) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "chad-shim/0.2"
+    server_version = "chad-shim/0.3"
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write(f"[chad-shim {time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}\n")
+
+    def handle_one_request(self) -> None:
+        """Wrap the request loop so client-side disconnects don't crash the
+        server. BaseHTTPRequestHandler's default propagates BrokenPipeError /
+        ConnectionResetError out of `wfile.write()` and Python's socketserver
+        doesn't catch it — the whole shim process dies on a single bad client
+        (e.g. OpenWebUI dropping the connection mid-stream). chad-shim/0.2
+        was killed by this at 16:36Z on 2026-05-14, taking the chad model
+        offline until the new chad-shim-watchdog launchd job caught it.
+        Catching here is the durable fix."""
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # Client disconnected mid-response — log and continue, don't die.
+            self.log_message("client dropped: %s", e.__class__.__name__)
+            try:
+                self.close_connection = True
+            except Exception:
+                pass
 
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
