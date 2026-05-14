@@ -39,6 +39,10 @@ MEMORY.md
 HEARTBEAT.md
 TOOLS.md
 EMAIL-POLICY.md
+# Skill doc: how Chad uses the chad-webui CLI to act on operator content
+# (calendar / notes / automations / memories) via the OpenWebUI REST API.
+# Acts as Chad's reference at runtime; deployed once and edited in place.
+OPENWEBUI.md
 
 [runtime]
 # Cron jobs. Restoring this file alone is NOT enough — the gateway holds the in-memory

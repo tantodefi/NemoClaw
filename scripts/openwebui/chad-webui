@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-webui — invoke OpenWebUI REST API from inside the Chad sandbox.
+#
+# Wraps the v0.9+ OpenWebUI endpoints Chad uses to act on operator content:
+# calendar, notes, automations, memories, chats, models, knowledge, folders.
+# Output is JSON on stdout (parseable by the model); errors go to stderr with
+# a non-zero exit code.
+#
+# Auth model
+# ----------
+# Two layers because OpenWebUI sits behind Cloudflare Access:
+#   1. CF Access service token (header pair CF-Access-Client-{Id,Secret}) gets
+#      past the edge. The CF Access policy must explicitly trust the service
+#      token. Service tokens don't set Cf-Access-Authenticated-User-Email, so
+#      OpenWebUI falls through to bearer-auth at layer 2.
+#   2. OpenWebUI personal API key (Authorization: Bearer ...) authenticates
+#      against an `auth.api_key` column row. The owning user's role determines
+#      what the request can do. Use an admin key to give Chad ownership-bypass
+#      on calendar/notes/etc.
+#
+# Credentials live in /sandbox/.nemoclaw/credentials.json:
+#   {
+#     "OPENWEBUI_API_KEY":        "<personal API key from /api/v1/auths/api_key>",
+#     "CF_ACCESS_CLIENT_ID":      "<service token client id>.access",
+#     "CF_ACCESS_CLIENT_SECRET":  "<service token secret>",
+#     "OPENWEBUI_BASE_URL":       "https://chad.supachad.com/api/v1"   # optional
+#   }
+#
+# Operator scoping
+# ----------------
+# Chad uses one admin API key so it can act on any user's resources. The model
+# is expected to self-regulate based on the operator-context prefix the
+# chad-shim injects on every turn (see openwebui-user-forwarding memory). For
+# defense-in-depth, future versions can read CHAD_OPERATOR_EMAIL (set by the
+# shim before launching `openclaw agent`) and constrain writes to that user.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+DEFAULT_CREDS = "/sandbox/.nemoclaw/credentials.json"
+DEFAULT_BASE = "https://chad.supachad.com/api/v1"
+SCHEDULED_TASKS_CALENDAR_ID = "__scheduled_tasks__"
+
+
+# ─────────────────────────────────────────────────────────────────
+# Plumbing
+# ─────────────────────────────────────────────────────────────────
+
+
+def _creds() -> dict:
+    path = os.environ.get("CHAD_CREDENTIALS", DEFAULT_CREDS)
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        sys.stderr.write(f"chad-webui: credentials file not found: {path}\n")
+        sys.exit(2)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"chad-webui: credentials JSON invalid: {e}\n")
+        sys.exit(2)
+
+
+def _http(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict | list:
+    creds = _creds()
+    api_key = creds.get("OPENWEBUI_API_KEY")
+    if not api_key:
+        sys.stderr.write("chad-webui: OPENWEBUI_API_KEY missing from credentials\n")
+        sys.exit(2)
+
+    base = os.environ.get("OPENWEBUI_BASE_URL") or creds.get("OPENWEBUI_BASE_URL", DEFAULT_BASE)
+    url = f"{base.rstrip('/')}{path}"
+    if params:
+        filtered = {k: v for k, v in params.items() if v is not None}
+        if filtered:
+            url = f"{url}?{urllib.parse.urlencode(filtered)}"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "chad-webui/0.1",
+    }
+    cf_id = creds.get("CF_ACCESS_CLIENT_ID")
+    cf_secret = creds.get("CF_ACCESS_CLIENT_SECRET")
+    if cf_id and cf_secret:
+        headers["CF-Access-Client-Id"] = cf_id
+        headers["CF-Access-Client-Secret"] = cf_secret
+
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return {}
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:600]
+        sys.stderr.write(f"chad-webui: HTTP {e.code} {e.reason} on {method} {path}\n{detail}\n")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"chad-webui: network error on {method} {url}: {e.reason}\n")
+        sys.exit(1)
+
+
+def _print(payload) -> None:
+    json.dump(payload, sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+
+
+def _iso_to_ns(s: str | None) -> int | None:
+    """Accepts ISO 8601 (with or without trailing Z) or a bare YYYY-MM-DD.
+    Returns nanoseconds-since-epoch as int, matching OpenWebUI's storage."""
+    if s is None or s == "":
+        return None
+    text = s.strip()
+    if "T" not in text and len(text) == 10:
+        text = f"{text}T00:00:00+00:00"
+    text = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as e:
+        sys.stderr.write(f"chad-webui: cannot parse timestamp {s!r}: {e}\n")
+        sys.exit(2)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1_000_000_000)
+
+
+def _ns_to_iso(ns: int | None) -> str | None:
+    if not ns:
+        return None
+    return datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc).isoformat()
+
+
+def _now_ns() -> int:
+    return int(time.time() * 1_000_000_000)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Calendar
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_calendar_list(args):
+    _print(_http("GET", "/calendars/"))
+
+
+def cmd_calendar_create(args):
+    body = {"name": args.name, "color": args.color, "is_default": args.default}
+    _print(_http("POST", "/calendars/create", body=body))
+
+
+def cmd_calendar_set_default(args):
+    _print(_http("POST", f"/calendars/{args.calendar_id}/default"))
+
+
+def cmd_calendar_delete(args):
+    _print(_http("DELETE", f"/calendars/{args.calendar_id}/delete"))
+
+
+def cmd_events_list(args):
+    # Defaults: today through 14 days out. Helpful for "what's coming up".
+    start = args.start or datetime.now(timezone.utc).date().isoformat()
+    end = args.end or (datetime.now(timezone.utc).date().replace(day=1)).isoformat()
+    if not args.end:
+        # +14 days from start
+        s_dt = datetime.fromisoformat(start if "T" in start else f"{start}T00:00:00+00:00")
+        end = (s_dt + (datetime.fromtimestamp(s_dt.timestamp() + 14 * 86400, tz=timezone.utc) - s_dt)).isoformat()
+    params = {"start": start, "end": end, "calendar_ids": args.calendar_ids}
+    _print(_http("GET", "/calendars/events", params=params))
+
+
+def cmd_events_search(args):
+    _print(_http("GET", "/calendars/events/search", params={"query": args.query, "limit": args.limit}))
+
+
+def cmd_events_get(args):
+    _print(_http("GET", f"/calendars/events/{args.event_id}"))
+
+
+def cmd_events_create(args):
+    body = {
+        "calendar_id": args.calendar_id,
+        "title": args.title,
+        "description": args.description,
+        "location": args.location,
+        "start_at": _iso_to_ns(args.start),
+        "end_at": _iso_to_ns(args.end),
+        "all_day": args.all_day,
+        "color": args.color,
+        "rrule": args.rrule,
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+    _print(_http("POST", "/calendars/events/create", body=body))
+
+
+def cmd_events_update(args):
+    body = {
+        "title": args.title,
+        "description": args.description,
+        "location": args.location,
+        "start_at": _iso_to_ns(args.start),
+        "end_at": _iso_to_ns(args.end),
+        "all_day": args.all_day,
+        "color": args.color,
+        "rrule": args.rrule,
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+    _print(_http("POST", f"/calendars/events/{args.event_id}/update", body=body))
+
+
+def cmd_events_delete(args):
+    _print(_http("DELETE", f"/calendars/events/{args.event_id}/delete"))
+
+
+def cmd_events_rsvp(args):
+    _print(_http("POST", f"/calendars/events/{args.event_id}/rsvp", body={"status": args.status}))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Notes
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_notes_list(args):
+    _print(_http("GET", "/notes/"))
+
+
+def cmd_notes_get(args):
+    _print(_http("GET", f"/notes/{args.note_id}"))
+
+
+def cmd_notes_create(args):
+    content = args.content
+    if args.content_file:
+        with open(args.content_file) as fh:
+            content = fh.read()
+    body = {"title": args.title, "data": {"content": content or ""}, "meta": {}}
+    if args.tags:
+        body["meta"]["tags"] = args.tags.split(",")
+    _print(_http("POST", "/notes/create", body=body))
+
+
+def cmd_notes_update(args):
+    content = args.content
+    if args.content_file:
+        with open(args.content_file) as fh:
+            content = fh.read()
+    body = {}
+    if args.title:
+        body["title"] = args.title
+    if content is not None:
+        body["data"] = {"content": content}
+    if args.tags:
+        body.setdefault("meta", {})["tags"] = args.tags.split(",")
+    _print(_http("POST", f"/notes/{args.note_id}/update", body=body))
+
+
+def cmd_notes_delete(args):
+    _print(_http("DELETE", f"/notes/{args.note_id}/delete"))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Automations
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_automations_list(args):
+    _print(_http("GET", "/automations/"))
+
+
+def cmd_automations_get(args):
+    _print(_http("GET", f"/automations/{args.automation_id}"))
+
+
+def cmd_automations_create(args):
+    body = {
+        "name": args.name,
+        "data": {
+            "prompt": args.prompt,
+            "model": args.model or "chad",
+            "rrule": args.rrule,
+        },
+        "is_active": not args.inactive,
+    }
+    _print(_http("POST", "/automations/create", body=body))
+
+
+def cmd_automations_update(args):
+    body = {}
+    if args.name:
+        body["name"] = args.name
+    data = {}
+    if args.prompt:
+        data["prompt"] = args.prompt
+    if args.model:
+        data["model"] = args.model
+    if args.rrule:
+        data["rrule"] = args.rrule
+    if data:
+        body["data"] = data
+    if args.inactive is not None:
+        body["is_active"] = not args.inactive
+    _print(_http("POST", f"/automations/{args.automation_id}/update", body=body))
+
+
+def cmd_automations_delete(args):
+    _print(_http("DELETE", f"/automations/{args.automation_id}/delete"))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Memories
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_memories_list(args):
+    _print(_http("GET", "/memories/"))
+
+
+def cmd_memories_create(args):
+    _print(_http("POST", "/memories/add", body={"content": args.content}))
+
+
+def cmd_memories_delete(args):
+    _print(_http("DELETE", f"/memories/{args.memory_id}"))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Read-only: chats, models, knowledge, folders
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_chats_list(args):
+    _print(_http("GET", "/chats/", params={"page": args.page}))
+
+
+def cmd_chats_get(args):
+    _print(_http("GET", f"/chats/{args.chat_id}"))
+
+
+def cmd_models_list(args):
+    _print(_http("GET", "/models/"))
+
+
+def cmd_knowledge_list(args):
+    _print(_http("GET", "/knowledge/"))
+
+
+def cmd_knowledge_get(args):
+    _print(_http("GET", f"/knowledge/{args.knowledge_id}"))
+
+
+def cmd_folders_list(args):
+    _print(_http("GET", "/folders/"))
+
+
+def cmd_folders_create(args):
+    _print(_http("POST", "/folders/", body={"name": args.name}))
+
+
+def cmd_folders_delete(args):
+    _print(_http("DELETE", f"/folders/{args.folder_id}"))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Diagnostics
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_whoami(args):
+    """Hit /auths to show who the OpenWebUI API key resolves to. Useful for
+    confirming Chad's identity inside OpenWebUI before doing privileged ops."""
+    _print(_http("GET", "/auths/"))
+
+
+def cmd_health(args):
+    """Pulls /api/version + a no-auth probe; useful when the chad sandbox can
+    reach the box but you're not sure if auth or network is wrong."""
+    creds = _creds()
+    base = os.environ.get("OPENWEBUI_BASE_URL") or creds.get("OPENWEBUI_BASE_URL", DEFAULT_BASE)
+    # /api/version is unauthed (mounted at /api, not /api/v1)
+    version_url = base.rstrip("/").rsplit("/", 1)[0] + "/version"
+    out = {
+        "base": base,
+        "version_url": version_url,
+        "has_api_key": bool(creds.get("OPENWEBUI_API_KEY")),
+        "has_cf_access": bool(creds.get("CF_ACCESS_CLIENT_ID") and creds.get("CF_ACCESS_CLIENT_SECRET")),
+    }
+    headers = {"User-Agent": "chad-webui/0.1"}
+    cf_id = creds.get("CF_ACCESS_CLIENT_ID")
+    cf_secret = creds.get("CF_ACCESS_CLIENT_SECRET")
+    if cf_id and cf_secret:
+        headers["CF-Access-Client-Id"] = cf_id
+        headers["CF-Access-Client-Secret"] = cf_secret
+    try:
+        req = urllib.request.Request(version_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            out["version_status"] = resp.status
+            out["version_body"] = resp.read().decode("utf-8", errors="replace")[:300]
+    except urllib.error.HTTPError as e:
+        out["version_status"] = e.code
+        out["version_body"] = e.read().decode("utf-8", errors="replace")[:300]
+    except urllib.error.URLError as e:
+        out["version_status"] = "network_error"
+        out["version_body"] = str(e.reason)
+    _print(out)
+
+
+# ─────────────────────────────────────────────────────────────────
+# CLI assembly
+# ─────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="chad-webui", description="OpenWebUI REST API wrapper for Chad")
+    sub = p.add_subparsers(dest="group", required=True)
+
+    # calendar
+    cal = sub.add_parser("calendar", help="Calendars and events").add_subparsers(dest="cmd", required=True)
+    c = cal.add_parser("list-calendars"); c.set_defaults(func=cmd_calendar_list)
+    c = cal.add_parser("create-calendar"); c.add_argument("--name", required=True); c.add_argument("--color"); c.add_argument("--default", action="store_true"); c.set_defaults(func=cmd_calendar_create)
+    c = cal.add_parser("set-default-calendar"); c.add_argument("--calendar-id", required=True); c.set_defaults(func=cmd_calendar_set_default)
+    c = cal.add_parser("delete-calendar"); c.add_argument("--calendar-id", required=True); c.set_defaults(func=cmd_calendar_delete)
+
+    c = cal.add_parser("list-events", help="Events in date range (defaults to today + 14 days)")
+    c.add_argument("--start", help="ISO date or datetime; default today")
+    c.add_argument("--end", help="ISO date or datetime; default start + 14 days")
+    c.add_argument("--calendar-ids", help="Comma-separated calendar ids to filter")
+    c.set_defaults(func=cmd_events_list)
+
+    c = cal.add_parser("search-events"); c.add_argument("--query"); c.add_argument("--limit", type=int, default=30); c.set_defaults(func=cmd_events_search)
+    c = cal.add_parser("get-event"); c.add_argument("--event-id", required=True); c.set_defaults(func=cmd_events_get)
+
+    c = cal.add_parser("create-event")
+    c.add_argument("--calendar-id", required=True)
+    c.add_argument("--title", required=True)
+    c.add_argument("--start", required=True, help="ISO date/datetime")
+    c.add_argument("--end", help="ISO date/datetime")
+    c.add_argument("--description")
+    c.add_argument("--location")
+    c.add_argument("--all-day", action="store_true")
+    c.add_argument("--color")
+    c.add_argument("--rrule", help="RRULE string e.g. FREQ=WEEKLY;BYDAY=MO,WE,FR")
+    c.set_defaults(func=cmd_events_create)
+
+    c = cal.add_parser("update-event")
+    c.add_argument("--event-id", required=True)
+    c.add_argument("--title"); c.add_argument("--start"); c.add_argument("--end")
+    c.add_argument("--description"); c.add_argument("--location")
+    c.add_argument("--all-day", action="store_true")
+    c.add_argument("--color"); c.add_argument("--rrule")
+    c.set_defaults(func=cmd_events_update)
+
+    c = cal.add_parser("delete-event"); c.add_argument("--event-id", required=True); c.set_defaults(func=cmd_events_delete)
+    c = cal.add_parser("rsvp"); c.add_argument("--event-id", required=True); c.add_argument("--status", required=True, choices=["accepted", "declined", "tentative", "pending"]); c.set_defaults(func=cmd_events_rsvp)
+
+    # notes
+    notes = sub.add_parser("notes", help="Notes (Chad-authored or operator notes)").add_subparsers(dest="cmd", required=True)
+    c = notes.add_parser("list"); c.set_defaults(func=cmd_notes_list)
+    c = notes.add_parser("get"); c.add_argument("--note-id", required=True); c.set_defaults(func=cmd_notes_get)
+    c = notes.add_parser("create"); c.add_argument("--title", required=True); c.add_argument("--content"); c.add_argument("--content-file", help="Read content from this path"); c.add_argument("--tags", help="Comma-separated"); c.set_defaults(func=cmd_notes_create)
+    c = notes.add_parser("update"); c.add_argument("--note-id", required=True); c.add_argument("--title"); c.add_argument("--content"); c.add_argument("--content-file"); c.add_argument("--tags"); c.set_defaults(func=cmd_notes_update)
+    c = notes.add_parser("delete"); c.add_argument("--note-id", required=True); c.set_defaults(func=cmd_notes_delete)
+
+    # automations
+    autos = sub.add_parser("automations", help="Scheduled automations").add_subparsers(dest="cmd", required=True)
+    c = autos.add_parser("list"); c.set_defaults(func=cmd_automations_list)
+    c = autos.add_parser("get"); c.add_argument("--automation-id", required=True); c.set_defaults(func=cmd_automations_get)
+    c = autos.add_parser("create"); c.add_argument("--name", required=True); c.add_argument("--prompt", required=True); c.add_argument("--rrule", required=True); c.add_argument("--model"); c.add_argument("--inactive", action="store_true"); c.set_defaults(func=cmd_automations_create)
+    c = autos.add_parser("update"); c.add_argument("--automation-id", required=True); c.add_argument("--name"); c.add_argument("--prompt"); c.add_argument("--rrule"); c.add_argument("--model"); c.add_argument("--inactive", action="store_true", default=None); c.set_defaults(func=cmd_automations_update)
+    c = autos.add_parser("delete"); c.add_argument("--automation-id", required=True); c.set_defaults(func=cmd_automations_delete)
+
+    # memories
+    mems = sub.add_parser("memories", help="OpenWebUI per-user memories").add_subparsers(dest="cmd", required=True)
+    c = mems.add_parser("list"); c.set_defaults(func=cmd_memories_list)
+    c = mems.add_parser("create"); c.add_argument("--content", required=True); c.set_defaults(func=cmd_memories_create)
+    c = mems.add_parser("delete"); c.add_argument("--memory-id", required=True); c.set_defaults(func=cmd_memories_delete)
+
+    # chats (read-only)
+    chats = sub.add_parser("chats", help="Inspect existing chats").add_subparsers(dest="cmd", required=True)
+    c = chats.add_parser("list"); c.add_argument("--page", type=int, default=1); c.set_defaults(func=cmd_chats_list)
+    c = chats.add_parser("get"); c.add_argument("--chat-id", required=True); c.set_defaults(func=cmd_chats_get)
+
+    # models (read-only)
+    models = sub.add_parser("models", help="Model registry").add_subparsers(dest="cmd", required=True)
+    c = models.add_parser("list"); c.set_defaults(func=cmd_models_list)
+
+    # knowledge (read-only)
+    knl = sub.add_parser("knowledge", help="RAG collections").add_subparsers(dest="cmd", required=True)
+    c = knl.add_parser("list"); c.set_defaults(func=cmd_knowledge_list)
+    c = knl.add_parser("get"); c.add_argument("--knowledge-id", required=True); c.set_defaults(func=cmd_knowledge_get)
+
+    # folders
+    flds = sub.add_parser("folders", help="Chat folders").add_subparsers(dest="cmd", required=True)
+    c = flds.add_parser("list"); c.set_defaults(func=cmd_folders_list)
+    c = flds.add_parser("create"); c.add_argument("--name", required=True); c.set_defaults(func=cmd_folders_create)
+    c = flds.add_parser("delete"); c.add_argument("--folder-id", required=True); c.set_defaults(func=cmd_folders_delete)
+
+    # diagnostics
+    sub.add_parser("whoami", help="Show OpenWebUI identity the API key resolves to").set_defaults(func=cmd_whoami)
+    sub.add_parser("health", help="Probe reachability + auth, returns diagnostic blob").set_defaults(func=cmd_health)
+
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
