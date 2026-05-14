@@ -517,6 +517,8 @@ DELETE is the only sane setting.
 | Dropdown shows wrong picks per provider | Heuristic chose poorly (vision/guardrail variant won) | Add the offender to `exclude` in `scripts/openwebui/nvidia-curation.toml`, rerun `nvidia-liveness.py` |
 | Newly added NVIDIA model not appearing | Daily sweep hasn't run yet OR model not in live set | `python3 ~/.nemoclaw/source/scripts/openwebui/nvidia-liveness.py` then refresh the connection. Check `jq '.models["provider/name"]' ~/.nemoclaw/openwebui/liveness.json` for its status. |
 | `chad` model picker shows but chat 502s | SSH tunnel down OR shim crashed | `npm run webui:chad:status` first; restart tunnel and/or `ssh openshell-chad 'pgrep -af chad-shim.py'` |
+| `chad` model returns "not found" / TCP connection RST mid-response | `dev.nemoclaw.chad-tunnel` SSH session wedged (process alive but mux dead). Symptom seen after the tunnel has been up for many days. | `launchctl kickstart -k gui/$(id -u)/dev.nemoclaw.chad-tunnel` then retry. SSH `ServerAliveInterval=30 ServerAliveCountMax=3 ExitOnForwardFailure=yes` doesn't catch session-level wedges on long-running tunnels. |
+| `[chad-shim] openclaw produced no JSON (rc=9)` | Gateway is restarting (e.g. just after watchdog respawned it) — agent registration takes longer than the shim's 30s timeout | Wait, retry. Check `tail -10 /Users/r/.nemoclaw/openwebui/chad-gateway-watchdog.log` for a recent relaunch line. |
 | `chad` model not in picker | Connection 2 not added in admin UI, or `/v1/models` 404 | Re-add provider in *Admin → Connections*; verify `curl http://127.0.0.1:8901/v1/models` returns the `chad` entry |
 | `chad` reply is `[chad-shim] empty reply (stopReason=…)` | openclaw produced no text payloads (tool-only turn, or model declined) | Look at `/tmp/chad-shim.log` and the openclaw session log; some turns Chad delegates to a sub-agent and the immediate reply is empty |
 | `chad` reply takes >100 s and times out | cloudflared quick-tunnel HTTP idle timeout | Use streaming (open-webui defaults to `stream:true`) — keeps the SSE connection live; or move to tunnel mode which has no quick-tunnel idle limit |
@@ -564,6 +566,106 @@ deletes `chat/<id>` pages older than 180 days, `memory/<date>` and
 / `feedback_*.md` older than 30 days. Defaults to `DRY_RUN=1`. See the
 "Memory maintenance pipeline" table in `chad-readme.md` § 4.6 for the
 full unified picture.
+
+## Per-operator routing (open-webui → chad-shim)
+
+When `ENABLE_FORWARD_USER_INFO_HEADERS=True` is set on the open-webui
+container (now the default in `docker-compose.yml`), every outbound
+OpenAI-style request carries the authenticated user's identity:
+
+```
+X-OpenWebUI-User-Email:  tantodefi@proton.me
+X-OpenWebUI-User-Name:   tantodefi
+X-OpenWebUI-User-Id:     a8f3…
+X-OpenWebUI-User-Role:   admin
+X-OpenWebUI-Chat-Id:     7f02…
+```
+
+The `chad-shim` (v0.2+) uses these to map each open-webui chat to a
+stable openclaw `--session-id` and to load per-operator context:
+
+- `X-OpenWebUI-Chat-Id` → openclaw session id (one session per chat,
+  preserves multi-turn context across requests).
+- Email local part is sanitized to a slug and used to load
+  `/sandbox/.openclaw-data/identities/<slug>.md`. That file is
+  prepended to the user message as a tagged operator-context block, so
+  the same `chad` model adapts to who's talking (`tantodefi` the
+  developer vs `tjcooke` the personal trainer).
+- Unknown sender falls back to `default.md`. No headers → no prefix.
+
+Identity content is mtime-cached, so edits are picked up without
+restarting the shim:
+
+```console
+$ ssh openshell-chad "vi /sandbox/.openclaw-data/identities/<slug>.md"
+$ # next /v1/chat/completions request loads the new content
+```
+
+The `identities/` directory is in the workspace-backup set
+(`scripts/chad-workspace-files.txt`) so persona files survive sandbox
+rebuilds.
+
+## Upgrade procedure
+
+The compose file pins `image: ghcr.io/open-webui/open-webui:main` —
+a rolling tag. A `docker compose pull` may bring in arbitrary changes
+from any merge into upstream `main`. Data is preserved by the bind
+mount (`~/.nemoclaw/openwebui/data` → `/app/backend/data`), and JWTs
+survive because `WEBUI_SECRET_KEY` is pinned in `.env`. Forward-only
+alembic migrations handle schema changes automatically.
+
+**Standard upgrade flow:**
+
+```console
+$ TS=$(date -u +%Y%m%dT%H%M%SZ)
+$ cp ~/.nemoclaw/openwebui/data/webui.db \
+     ~/.nemoclaw/openwebui/data/webui.db.bak-$TS    # 1. Backup
+$ cd ~/.nemoclaw/source/scripts/openwebui
+$ docker compose pull                                # 2. New image
+$ docker compose up -d                               # 3. Recreate container
+$ docker ps --format '{{.Names}}: {{.Status}}' | grep webui  # 4. Wait healthy
+$ curl -s http://127.0.0.1:3000/api/version          # 5. Sanity check
+$ bash patch-share-admin-bug.sh                      # 6. Reapply local patch
+```
+
+The `patch-share-admin-bug.sh` script is idempotent and prints
+`already patched, nothing to do` once upstream lands the fix
+(verified as of v0.9.5 / image build `3660bc00`). It does an
+in-container edit of `routers/chats.py` to flip the admin share-id
+lookup. Run it after every `compose pull` until you stop seeing
+the patch take effect.
+
+**To pin to a stable tag instead of `:main`:**
+
+```yaml
+# docker-compose.yml
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.9.5    # was :main
+```
+
+Then `docker compose up -d`. Note that `:main` is ahead of any tagged
+release — going to a stable tag is a **downgrade**, not an upgrade,
+and you may lose features that haven't been cut to a tag yet.
+
+**Risk of upgrade:**
+
+1. Schema migrations are forward-only. Stale `webui.db.bak-*` is your
+   only escape hatch; take one fresh.
+2. New env defaults can change behavior. v0.9.5 added
+   `AIOHTTP_CLIENT_ALLOW_REDIRECTS=False` (blocks redirect-based
+   SSRF — set `True` only if a tool you rely on follows redirects)
+   and `IFRAME_CSP` (CSP for sandboxed iframes).
+3. Local patches (like `patch-share-admin-bug.sh`) live *in the
+   container*, not in the data volume — gone on every recreate. The
+   script re-applies them; run it.
+
+For the full env-var reference, schema layout, and REST API quick
+reference for this deployment, see the operator skill at
+`~/.claude/skills/openwebui/SKILL.md`. Known wrapper-class bugs in
+`/usr/local/bin/chad-*` (which don't affect open-webui directly but
+do affect chad's behavior) are tracked in
+[`wrapper-bugs.md`](wrapper-bugs.md).
 
 ## Tear-down
 
