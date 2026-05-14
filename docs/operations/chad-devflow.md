@@ -234,3 +234,4 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 - [Chad Autonomy Loops](chad-autonomy.md) — the five self-driving loops, two known gaps, and recommended next wrappers
 - [Chad Skills Catalog](chad-skills.md) — all 48 registered skills grouped by source
 - [Wrapper Bugs](wrapper-bugs.md) — five tracked argv-vs-env / path bugs in `/usr/local/bin/chad-*` with shim-and-repoint workarounds in place
+- [Autonomous Experiment Lifecycle](chad-experiments.md) — Chad's nightly propose → design → start → observe → evaluate → promote/retire loop with full autonomy + retire-on-regression. New `chad-experiment` CLI + `experiment-night` cron + sibling skill at `/sandbox/.openclaw-data/skills/chad-experiment/`

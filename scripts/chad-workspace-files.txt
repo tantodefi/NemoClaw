@@ -82,6 +82,17 @@ identities/
 # prepends this dir to PATH for spawned children; cron wrappers reference
 # absolute paths under it.
 bin/
+# Sandbox-loaded skill directories. /sandbox/.openclaw/openclaw.json
+# under skills.load.extraDirs points here. Two skills currently live in
+# this tree: openwebui (the chad-webui control surface) and chad-experiment
+# (the autonomous experiment lifecycle). Survives pod rebuilds via this
+# backup; rebuilt sandboxes re-mount from chad-state.
+skills/
+# Autonomous experiment lifecycle state: ledger + active/archive records +
+# config (budget, regression threshold, allowed types). chad-experiment-night
+# cron writes this nightly. Without backup, every experiment Chad has ever
+# tried is lost on pod rebuild.
+state/experiments/
 
 [exclude]
 # Device keypair + operator bearer tokens. Regenerated on first boot via OpenShell

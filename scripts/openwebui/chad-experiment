@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-experiment — Chad's autonomous experiment lifecycle.
+#
+# Goal: let Chad scan memory for objectives/tasks, decide whether
+# they're worthy of automation, build the OpenWebUI artifact (a
+# function, tool, automation, knowledge collection, calendar event,
+# memory, or note), measure success against a baseline, and either
+# promote (keep + activate globally) or retire (delete the artifact)
+# — all without operator approval per turn. Autonomy bounded by:
+#
+#   - Per-operator concurrent active-experiment budget (default 3)
+#   - Regression threshold for auto-retire (default -30% vs baseline)
+#   - Allowed-types config — explicit whitelist of artifact types
+#
+# State layout (under /sandbox/.openclaw-data/state/experiments/):
+#
+#   config.json          authoritative budget + thresholds + tag map
+#   ledger.jsonl         append-only event log; one line per state transition
+#   active/<id>.json     one file per experiment in {proposed,designed,running}
+#   archive/<id>.json    moved here on promote or retire (snapshot at end)
+#
+# Each verb writes both:
+#   - the active/<id>.json (full record, latest state)
+#   - a ledger.jsonl line (event marker for traceability)
+#
+# Surface mutations go through chad-webui (CLI form for scripted use,
+# /sandbox/.openclaw-data/bin/chad-webui). Network egress / TLS env
+# is handled there.
+#
+# Hypothesis sourcing is intentionally NOT done in this CLI — that's
+# the LLM's job in the nightly cron payload. This CLI provides the
+# data layer (memory paths, recent ledger) so the prompt can read,
+# reason, and then call `chad-experiment design --hypothesis ...`.
+#
+# All operations are operator-scoped via CHAD_OPERATOR_SLUG, mirroring
+# chad-webui's fail-closed model. Anonymous callers default to a
+# pseudo-operator "_admin".
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+STATE_DIR = Path(os.environ.get(
+    "CHAD_EXPERIMENT_STATE_DIR", "/sandbox/.openclaw-data/state/experiments"
+))
+CHAD_WEBUI = os.environ.get(
+    "CHAD_WEBUI_BIN", "/sandbox/.openclaw-data/bin/chad-webui"
+)
+MEMORY_DIR = Path("/sandbox/.openclaw/workspace/memory")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Plumbing
+# ─────────────────────────────────────────────────────────────────
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _iso(dt: Optional[datetime.datetime] = None) -> str:
+    return (dt or _utc_now()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _operator() -> str:
+    raw = os.environ.get("CHAD_OPERATOR_SLUG", "").strip().lower()
+    return raw or "_admin"
+
+
+def _config() -> dict:
+    path = STATE_DIR / "config.json"
+    if not path.exists():
+        sys.stderr.write(f"chad-experiment: config missing: {path}\n")
+        sys.exit(2)
+    with path.open() as fh:
+        return json.load(fh)
+
+
+def _next_id(operator: str) -> str:
+    """Stable id: exp-YYYY-MM-DD-OPSLUG-NNN. NNN is local to that day+operator."""
+    today = _utc_now().strftime("%Y-%m-%d")
+    prefix = f"exp-{today}-{operator}-"
+    existing = list((STATE_DIR / "active").glob(f"{prefix}*.json")) + \
+               list((STATE_DIR / "archive").glob(f"{prefix}*.json"))
+    n = len(existing) + 1
+    return f"{prefix}{n:03d}"
+
+
+def _active_path(exp_id: str) -> Path:
+    return STATE_DIR / "active" / f"{exp_id}.json"
+
+
+def _archive_path(exp_id: str) -> Path:
+    return STATE_DIR / "archive" / f"{exp_id}.json"
+
+
+def _load_active(exp_id: str) -> dict:
+    p = _active_path(exp_id)
+    if not p.exists():
+        # Maybe already archived
+        ap = _archive_path(exp_id)
+        if ap.exists():
+            with ap.open() as fh:
+                return json.load(fh)
+        sys.stderr.write(f"chad-experiment: no such experiment: {exp_id}\n")
+        sys.exit(1)
+    with p.open() as fh:
+        return json.load(fh)
+
+
+def _save_active(record: dict) -> None:
+    p = _active_path(record["id"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    with tmp.open("w") as fh:
+        json.dump(record, fh, indent=2, sort_keys=True)
+    tmp.replace(p)
+
+
+def _ledger(event: str, exp_id: str, data: Optional[dict] = None) -> None:
+    """Append a structured event to the ledger."""
+    line = {
+        "ts": _iso(),
+        "event": event,
+        "exp_id": exp_id,
+        "operator": _operator(),
+        "data": data or {},
+    }
+    p = STATE_DIR / "ledger.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a") as fh:
+        fh.write(json.dumps(line, sort_keys=True) + "\n")
+
+
+def _archive(record: dict) -> None:
+    """Move active→archive."""
+    _archive_path(record["id"]).parent.mkdir(parents=True, exist_ok=True)
+    with _archive_path(record["id"]).open("w") as fh:
+        json.dump(record, fh, indent=2, sort_keys=True)
+    ap = _active_path(record["id"])
+    if ap.exists():
+        ap.unlink()
+
+
+def _print(payload: Any) -> None:
+    json.dump(payload, sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+
+
+def _count_active(operator: str) -> int:
+    """Count active experiments (state running or designed) for one operator."""
+    n = 0
+    for p in (STATE_DIR / "active").glob("*.json"):
+        with p.open() as fh:
+            r = json.load(fh)
+        if r.get("operator") == operator and r.get("state") in {"designed", "running"}:
+            n += 1
+    return n
+
+
+def _webui(*args: str, check: bool = True) -> Optional[Any]:
+    """Run chad-webui and return parsed JSON output (or None on failure with
+    check=False)."""
+    proc = subprocess.run(
+        [CHAD_WEBUI, *args], capture_output=True, text=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or proc.stdout.strip()
+        if check:
+            sys.stderr.write(f"chad-experiment: chad-webui {' '.join(args)} failed:\n{msg}\n")
+            sys.exit(1)
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"chad-experiment: chad-webui output not JSON: {e}\nraw: {raw[:500]}\n")
+        if check:
+            sys.exit(1)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────
+# Verbs — lifecycle
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_design(args):
+    """Convert raw hypothesis → designed record. Caller (typically the
+    nightly cron turn) has already decided this is worthy of automation."""
+    op = args.operator or _operator()
+    cfg = _config()
+    if args.type not in cfg["allowed_types"]:
+        sys.stderr.write(
+            f"chad-experiment: type {args.type!r} not in allowed_types {cfg['allowed_types']}\n"
+        )
+        sys.exit(2)
+
+    # Budget gate — design counts toward concurrent active
+    active_now = _count_active(op)
+    if active_now >= cfg["max_active_per_operator"]:
+        sys.stderr.write(
+            f"chad-experiment: operator {op!r} at budget ceiling "
+            f"({active_now} active, max {cfg['max_active_per_operator']}). "
+            f"Retire or promote one before designing new.\n"
+        )
+        sys.exit(3)
+
+    exp_id = _next_id(op)
+    window = args.evaluation_days or cfg["default_evaluation_window_days"]
+    record = {
+        "id": exp_id,
+        "version": 1,
+        "operator": op,
+        "type": args.type,
+        "hypothesis": args.hypothesis,
+        "success_metric": args.success_metric,
+        "baseline": args.baseline or "",
+        "rollback_path": args.rollback_path or "",
+        "state": "designed",
+        "ab_pair": None,
+        "ab_variant": None,
+        "surface": None,
+        "observations": [],
+        "designed_at": _iso(),
+        "started_at": None,
+        "evaluates_at": _iso(_utc_now() + datetime.timedelta(days=window)),
+        "evaluation_window_days": window,
+        "verdict": None,
+    }
+    _save_active(record)
+    _ledger("designed", exp_id, {
+        "type": args.type, "hypothesis": args.hypothesis,
+        "success_metric": args.success_metric,
+    })
+    _print(record)
+
+
+def cmd_start(args):
+    """Materialize the OpenWebUI artifact and transition designed→running.
+
+    The artifact-creation args are forwarded verbatim to chad-webui via
+    --surface-args (a JSON object). E.g. for an automation:
+       --surface-cmd "automations create"
+       --surface-args '{"name":"...","prompt":"...","rrule":"..."}'
+    """
+    rec = _load_active(args.id)
+    if rec["state"] != "designed":
+        sys.stderr.write(
+            f"chad-experiment: cannot start from state {rec['state']!r}; "
+            f"only 'designed' is startable.\n"
+        )
+        sys.exit(1)
+
+    surface_args = json.loads(args.surface_args) if args.surface_args else {}
+    cmd_parts = (args.surface_cmd or "").split()
+    if not cmd_parts:
+        sys.stderr.write("chad-experiment: --surface-cmd required (e.g. 'automations create')\n")
+        sys.exit(2)
+
+    # Translate JSON object to --kebab flags (same convention as chad-webui-mcp)
+    cli_args = list(cmd_parts)
+    for key, value in surface_args.items():
+        if value is None or value is False:
+            continue
+        flag = f"--{key.replace('_','-')}"
+        if value is True:
+            cli_args.append(flag)
+        else:
+            cli_args.extend([flag, str(value)])
+
+    response = _webui(*cli_args)
+    surface_id = None
+    if isinstance(response, dict):
+        surface_id = response.get("id") or response.get("knowledge_id") or response.get("event_id")
+    rec["surface"] = {
+        "cmd": args.surface_cmd,
+        "args": surface_args,
+        "response": response,
+        "id": surface_id,
+    }
+    rec["state"] = "running"
+    rec["started_at"] = _iso()
+    if not rec.get("rollback_path"):
+        # Best-effort auto-rollback: delete by id if we got one
+        group = cmd_parts[0]
+        if surface_id and group in {"automations", "functions", "tools", "knowledge",
+                                     "notes", "memories", "folders"}:
+            id_flag_name = {
+                "automations": "automation-id",
+                "functions": "function-id",
+                "tools": "tool-id",
+                "knowledge": "knowledge-id",
+                "notes": "note-id",
+                "memories": "memory-id",
+                "folders": "folder-id",
+            }[group]
+            rec["rollback_path"] = (
+                f"chad-webui {group} delete --{id_flag_name} {surface_id}"
+            )
+        elif group == "calendar" and surface_id:
+            rec["rollback_path"] = f"chad-webui calendar delete-event --event-id {surface_id}"
+    _save_active(rec)
+    _ledger("started", rec["id"], {"surface_id": surface_id, "surface_cmd": args.surface_cmd})
+    _print(rec)
+
+
+def cmd_observe(args):
+    """Append an observation to a running experiment."""
+    rec = _load_active(args.id)
+    if rec["state"] != "running":
+        sys.stderr.write(
+            f"chad-experiment: cannot observe state {rec['state']!r}; only 'running'.\n"
+        )
+        sys.exit(1)
+    data = json.loads(args.data) if args.data else {}
+    obs = {"ts": _iso(), "kind": args.kind, "data": data}
+    rec["observations"].append(obs)
+    _save_active(rec)
+    _ledger("observed", rec["id"], {"kind": args.kind, "data": data})
+    _print(obs)
+
+
+def cmd_evaluate(args):
+    """Apply the operator-supplied verdict and transition state.
+
+    Verdict comes from the LLM driving the cron (it reasons about
+    observations + success_metric, computes a score 0..1, decides). The
+    regression_threshold from config triggers auto-retire when verdict
+    is 'score' with a value <= threshold.
+    """
+    rec = _load_active(args.id)
+    if rec["state"] != "running":
+        sys.stderr.write(
+            f"chad-experiment: cannot evaluate state {rec['state']!r}; only 'running'.\n"
+        )
+        sys.exit(1)
+    cfg = _config()
+    notes = args.notes or ""
+    verdict = args.verdict
+    score = None
+    if args.score is not None:
+        score = float(args.score)
+        # Convert raw score to verdict using regression threshold
+        if score <= 1 + cfg["regression_threshold"]:   # threshold is negative
+            verdict = verdict or "retire"
+        else:
+            verdict = verdict or "promote"
+    if verdict not in {"promote", "retire", "extend"}:
+        sys.stderr.write(
+            "chad-experiment: --verdict required (promote|retire|extend) or "
+            "pass --score for auto-decide.\n"
+        )
+        sys.exit(2)
+
+    rec["evaluated_at"] = _iso()
+    rec["evaluation"] = {"verdict": verdict, "score": score, "notes": notes}
+    rec["verdict"] = verdict
+    _ledger("evaluated", rec["id"], {"verdict": verdict, "score": score, "notes": notes})
+
+    if verdict == "extend":
+        window = args.extend_days or cfg["default_evaluation_window_days"]
+        rec["evaluates_at"] = _iso(_utc_now() + datetime.timedelta(days=window))
+        _save_active(rec)
+        _print(rec)
+        return
+
+    # promote / retire — fall through to their commands
+    if verdict == "promote":
+        _do_promote(rec)
+    else:
+        _do_retire(rec, reason=f"auto-retire after evaluate score={score} notes={notes!r}")
+
+
+def _do_promote(rec: dict) -> None:
+    """Toggle the artifact into its 'promoted' state (function/tool global,
+    automation activated, model toggled-on, etc.) and archive the record."""
+    surf = rec.get("surface") or {}
+    cmd = (surf.get("cmd") or "").split()
+    sid = surf.get("id")
+    if cmd and sid:
+        group = cmd[0]
+        # Group-specific promotion actions
+        if group == "functions":
+            _webui("functions", "toggle", "--function-id", sid, "--scope", "global", check=False)
+        elif group == "models":
+            _webui("models", "toggle", "--id", sid, check=False)
+        # automations are active by default on create; nothing to do
+        # tools have no separate global toggle yet
+        # notes/memories/calendar/knowledge — promote = "keep" (no toggle)
+    rec["state"] = "promoted"
+    rec["promoted_at"] = _iso()
+    _archive(rec)
+    _ledger("promoted", rec["id"], {"surface_id": sid})
+    _print(rec)
+
+
+def cmd_promote(args):
+    """Manual promote (skip evaluate)."""
+    rec = _load_active(args.id)
+    if rec["state"] != "running":
+        sys.stderr.write(f"chad-experiment: cannot promote state {rec['state']!r}.\n")
+        sys.exit(1)
+    _do_promote(rec)
+
+
+def _do_retire(rec: dict, reason: str = "") -> None:
+    """Roll back the artifact and archive the record."""
+    rollback = rec.get("rollback_path", "").strip()
+    if rollback:
+        # Best-effort: parse "chad-webui <args...>" out of the rollback string
+        parts = rollback.split()
+        if parts and parts[0] == "chad-webui":
+            _webui(*parts[1:], check=False)
+        else:
+            # Custom rollback — emit as a shell command but DO NOT run it.
+            sys.stderr.write(
+                f"chad-experiment: non-chad-webui rollback for {rec['id']}: {rollback!r} "
+                f"— please run manually if needed.\n"
+            )
+    rec["state"] = "retired"
+    rec["retired_at"] = _iso()
+    rec["retire_reason"] = reason
+    _archive(rec)
+    _ledger("retired", rec["id"], {"reason": reason})
+    _print(rec)
+
+
+def cmd_retire(args):
+    rec = _load_active(args.id)
+    if rec["state"] not in {"designed", "running"}:
+        sys.stderr.write(f"chad-experiment: cannot retire state {rec['state']!r}.\n")
+        sys.exit(1)
+    _do_retire(rec, reason=args.reason or "manual retire")
+
+
+def cmd_list(args):
+    rows = []
+    op_filter = args.operator
+    show_all = args.all
+    for path in (STATE_DIR / "active").glob("*.json"):
+        with path.open() as fh:
+            r = json.load(fh)
+        if op_filter and r.get("operator") != op_filter:
+            continue
+        rows.append(r)
+    if show_all:
+        for path in (STATE_DIR / "archive").glob("*.json"):
+            with path.open() as fh:
+                r = json.load(fh)
+            if op_filter and r.get("operator") != op_filter:
+                continue
+            rows.append(r)
+    rows.sort(key=lambda r: r.get("designed_at", ""), reverse=True)
+    summary = [
+        {
+            "id": r["id"],
+            "operator": r["operator"],
+            "type": r["type"],
+            "state": r["state"],
+            "hypothesis": r["hypothesis"][:70],
+            "evaluates_at": r.get("evaluates_at"),
+            "verdict": r.get("verdict"),
+        }
+        for r in rows
+    ]
+    _print(summary)
+
+
+def cmd_show(args):
+    _print(_load_active(args.id))
+
+
+def cmd_budget(args):
+    cfg = _config()
+    by_op = {}
+    for path in (STATE_DIR / "active").glob("*.json"):
+        with path.open() as fh:
+            r = json.load(fh)
+        op = r.get("operator", "_admin")
+        by_op[op] = by_op.get(op, 0) + 1
+    _print({
+        "max_active_per_operator": cfg["max_active_per_operator"],
+        "regression_threshold": cfg["regression_threshold"],
+        "default_evaluation_window_days": cfg["default_evaluation_window_days"],
+        "active_count_by_operator": by_op,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────
+# A/B testing
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_ab_start(args):
+    """Create two paired experiments under a common hypothesis. Each gets
+    the same success metric but different surface configs.
+
+    The two --surface-args-A and --surface-args-B JSON blobs describe
+    the variant-specific artifact configs; everything else is shared.
+    """
+    op = args.operator or _operator()
+    cfg = _config()
+    active_now = _count_active(op)
+    if active_now + 2 > cfg["max_active_per_operator"]:
+        sys.stderr.write(
+            f"chad-experiment: ab-start would exceed budget "
+            f"({active_now} active + 2 new > max {cfg['max_active_per_operator']}).\n"
+        )
+        sys.exit(3)
+
+    pair_id = hashlib.sha1(
+        f"{args.hypothesis}-{_iso()}".encode()
+    ).hexdigest()[:8]
+    ids = []
+    for variant, sa_json in [("A", args.surface_args_a), ("B", args.surface_args_b)]:
+        # design
+        rec_id = _next_id(op)
+        ids.append(rec_id)
+        window = args.evaluation_days or cfg["default_evaluation_window_days"]
+        rec = {
+            "id": rec_id,
+            "version": 1,
+            "operator": op,
+            "type": args.type,
+            "hypothesis": args.hypothesis,
+            "success_metric": args.success_metric,
+            "baseline": args.baseline or "",
+            "rollback_path": "",
+            "state": "designed",
+            "ab_pair": pair_id,
+            "ab_variant": variant,
+            "surface": None,
+            "observations": [],
+            "designed_at": _iso(),
+            "started_at": None,
+            "evaluates_at": _iso(_utc_now() + datetime.timedelta(days=window)),
+            "evaluation_window_days": window,
+            "verdict": None,
+        }
+        _save_active(rec)
+        _ledger("designed", rec_id, {"type": args.type, "ab_pair": pair_id, "ab_variant": variant})
+        # start
+        start_args = argparse.Namespace(
+            id=rec_id,
+            surface_cmd=args.surface_cmd,
+            surface_args=sa_json,
+        )
+        cmd_start(start_args)
+    _print({"ab_pair": pair_id, "ids": ids})
+
+
+def cmd_ab_pick(args):
+    """Mark winner; promote winner; retire loser. Both must share an ab_pair."""
+    rec = _load_active(args.id)
+    pair_id = rec.get("ab_pair")
+    if not pair_id:
+        sys.stderr.write("chad-experiment: ab-pick requires an experiment with ab_pair set.\n")
+        sys.exit(1)
+    siblings = []
+    for path in (STATE_DIR / "active").glob("*.json"):
+        with path.open() as fh:
+            sib = json.load(fh)
+        if sib.get("ab_pair") == pair_id and sib["id"] != rec["id"]:
+            siblings.append(sib)
+    if not siblings:
+        sys.stderr.write(f"chad-experiment: no active sibling found for ab_pair {pair_id}\n")
+        sys.exit(1)
+    if args.winner == rec["ab_variant"]:
+        _do_promote(rec)
+        for sib in siblings:
+            _do_retire(sib, reason=f"ab-pick: variant {rec['ab_variant']} won")
+    else:
+        winner = next((s for s in siblings if s["ab_variant"] == args.winner), None)
+        if winner is None:
+            sys.stderr.write(f"chad-experiment: no sibling with variant {args.winner!r}\n")
+            sys.exit(1)
+        _do_promote(winner)
+        _do_retire(rec, reason=f"ab-pick: variant {args.winner} won")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Memory + observation helpers (data for the cron LLM)
+# ─────────────────────────────────────────────────────────────────
+
+
+def cmd_recent_memory(args):
+    """Emit the last N days of memory file paths + a sample. The cron
+    prompt reads this to look for hypothesis candidates."""
+    days = args.days
+    cutoff = _utc_now().date() - datetime.timedelta(days=days)
+    rows = []
+    for path in sorted(MEMORY_DIR.glob("2026-*.md"), reverse=True):
+        try:
+            d = datetime.date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        if d < cutoff:
+            continue
+        text = path.read_text(errors="replace")[: args.sample_chars]
+        rows.append({"date": path.stem, "path": str(path), "sample": text})
+    _print(rows)
+
+
+def cmd_recent_ledger(args):
+    """Emit the last N ledger events. The cron uses this to see what was
+    designed/started/evaluated recently — context for the next iteration."""
+    path = STATE_DIR / "ledger.jsonl"
+    if not path.exists():
+        _print([])
+        return
+    lines = path.read_text().splitlines()
+    tail = lines[-args.limit :]
+    out = []
+    for line in tail:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    _print(out)
+
+
+# ─────────────────────────────────────────────────────────────────
+# CLI assembly
+# ─────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="chad-experiment",
+        description="Autonomous experiment lifecycle for Chad",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("design", help="Convert proposal → designed record")
+    c.add_argument("--hypothesis", required=True, help="What's the bet?")
+    c.add_argument("--type", required=True, help="automation|function|tool|knowledge|memory|note|calendar|chad-cron")
+    c.add_argument("--success-metric", required=True, help="How will you know it worked?")
+    c.add_argument("--baseline", help="Current state (numbers if measurable)")
+    c.add_argument("--rollback-path", help="Shell line to undo; auto-generated for chad-webui artifacts")
+    c.add_argument("--operator", help="Override CHAD_OPERATOR_SLUG")
+    c.add_argument("--evaluation-days", type=int, help="Override eval window")
+    c.set_defaults(func=cmd_design)
+
+    c = sub.add_parser("start", help="Materialize artifact via chad-webui, transition to running")
+    c.add_argument("--id", required=True)
+    c.add_argument("--surface-cmd", required=True, help="e.g. 'automations create' or 'calendar create-event'")
+    c.add_argument("--surface-args", required=True, help="JSON object of chad-webui --kebab flags (snake_case keys)")
+    c.set_defaults(func=cmd_start)
+
+    c = sub.add_parser("observe", help="Append an observation to a running experiment")
+    c.add_argument("--id", required=True)
+    c.add_argument("--kind", required=True, help="e.g. 'fired', 'operator_used', 'metric_sample'")
+    c.add_argument("--data", help="JSON blob of observation data")
+    c.set_defaults(func=cmd_observe)
+
+    c = sub.add_parser("evaluate", help="Apply verdict; auto promote/retire if --score given")
+    c.add_argument("--id", required=True)
+    c.add_argument("--verdict", choices=["promote", "retire", "extend"], help="Explicit verdict (omit with --score for auto)")
+    c.add_argument("--score", type=float, help="0..1 ratio vs baseline; auto-decide via regression_threshold")
+    c.add_argument("--notes", help="Free-text reasoning")
+    c.add_argument("--extend-days", type=int, help="If verdict=extend, by how long")
+    c.set_defaults(func=cmd_evaluate)
+
+    c = sub.add_parser("promote", help="Manual promote (skip evaluate)")
+    c.add_argument("--id", required=True)
+    c.set_defaults(func=cmd_promote)
+
+    c = sub.add_parser("retire", help="Manual retire (rollback + archive)")
+    c.add_argument("--id", required=True)
+    c.add_argument("--reason")
+    c.set_defaults(func=cmd_retire)
+
+    c = sub.add_parser("list", help="List experiments (active by default)")
+    c.add_argument("--operator", help="Filter by operator")
+    c.add_argument("--all", action="store_true", help="Include archived")
+    c.set_defaults(func=cmd_list)
+
+    c = sub.add_parser("show", help="Show one experiment's full record")
+    c.add_argument("--id", required=True)
+    c.set_defaults(func=cmd_show)
+
+    c = sub.add_parser("budget", help="Show current budget usage")
+    c.set_defaults(func=cmd_budget)
+
+    c = sub.add_parser("ab-start", help="Create paired A/B experiments")
+    c.add_argument("--hypothesis", required=True)
+    c.add_argument("--type", required=True)
+    c.add_argument("--success-metric", required=True)
+    c.add_argument("--baseline")
+    c.add_argument("--surface-cmd", required=True)
+    c.add_argument("--surface-args-a", required=True, help="JSON for variant A")
+    c.add_argument("--surface-args-b", required=True, help="JSON for variant B")
+    c.add_argument("--operator")
+    c.add_argument("--evaluation-days", type=int)
+    c.set_defaults(func=cmd_ab_start)
+
+    c = sub.add_parser("ab-pick", help="Pick the winning A/B variant; promote winner, retire loser")
+    c.add_argument("--id", required=True, help="Any experiment in the pair (the other is found via ab_pair)")
+    c.add_argument("--winner", required=True, choices=["A", "B"])
+    c.set_defaults(func=cmd_ab_pick)
+
+    c = sub.add_parser("recent-memory", help="Emit recent memory files for hypothesis discovery")
+    c.add_argument("--days", type=int, default=7)
+    c.add_argument("--sample-chars", type=int, default=3000)
+    c.set_defaults(func=cmd_recent_memory)
+
+    c = sub.add_parser("recent-ledger", help="Emit recent ledger events")
+    c.add_argument("--limit", type=int, default=40)
+    c.set_defaults(func=cmd_recent_ledger)
+
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
