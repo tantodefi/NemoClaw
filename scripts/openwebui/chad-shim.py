@@ -99,7 +99,18 @@ def _extract_json(text: str) -> str | None:
     return None
 
 
-def run_openclaw(session_id: str, message: str) -> str:
+def run_openclaw(session_id: str, message: str, op: dict | None = None) -> str:
+    # Pass operator identity down to anything `openclaw agent` shells out to
+    # (chad-webui in particular). Defense in depth — the message prefix tells
+    # the model *who* it's talking to; CHAD_OPERATOR_SLUG lets downstream
+    # tooling pick a per-operator API key so OpenWebUI's permission system
+    # enforces scope independent of the LLM's discipline.
+    env = os.environ.copy()
+    if op:
+        env["CHAD_OPERATOR_EMAIL"] = op.get("email", "")
+        env["CHAD_OPERATOR_SLUG"] = op.get("slug", "")
+        env["CHAD_OPERATOR_ROLE"] = op.get("role", "")
+        env["CHAD_OPERATOR_CHAT_ID"] = op.get("chat_id", "")
     proc = subprocess.run(
         [
             OPENCLAW_BIN, "agent", "--json",
@@ -109,6 +120,7 @@ def run_openclaw(session_id: str, message: str) -> str:
             "--timeout", str(TIMEOUT_SEC),
         ],
         capture_output=True, text=True, timeout=TIMEOUT_SEC + 30,
+        env=env,
     )
     # OpenClaw 2026.4.24+ emits --json on stdout (was stderr in 2026.4.9).
     # Try stdout first, fall back to stderr for older runtimes.
@@ -261,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
             session_id = fallback_session_id(body)
 
         try:
-            reply = run_openclaw(session_id, final_message)
+            reply = run_openclaw(session_id, final_message, op=op)
         except subprocess.TimeoutExpired:
             self._send_json(504, {"error": {"message": "openclaw timed out"}})
             return

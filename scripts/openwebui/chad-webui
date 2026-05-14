@@ -31,11 +31,17 @@
 #
 # Operator scoping
 # ----------------
-# Chad uses one admin API key so it can act on any user's resources. The model
-# is expected to self-regulate based on the operator-context prefix the
-# chad-shim injects on every turn (see openwebui-user-forwarding memory). For
-# defense-in-depth, future versions can read CHAD_OPERATOR_EMAIL (set by the
-# shim before launching `openclaw agent`) and constrain writes to that user.
+# When chad-shim launches `openclaw agent`, it exports CHAD_OPERATOR_SLUG (and
+# CHAD_OPERATOR_EMAIL / CHAD_OPERATOR_ROLE / CHAD_OPERATOR_CHAT_ID for context).
+# This wrapper reads CHAD_OPERATOR_SLUG and requires a matching key in
+# credentials: OPENWEBUI_API_KEY_<SLUG.upper()>. If missing, the wrapper
+# refuses to fall back to the default admin key — fail-closed enforcement.
+# The result: OpenWebUI's own permission system contains a jailbroken or
+# confused LLM, because cross-operator writes hit 403 at the API regardless
+# of what the prompt says.
+#
+# Anonymous callers (no CHAD_OPERATOR_SLUG) get OPENWEBUI_API_KEY. Use a
+# low-privilege key there if you want defense-in-depth for direct CLI use.
 
 from __future__ import annotations
 
@@ -72,12 +78,42 @@ def _creds() -> dict:
         sys.exit(2)
 
 
-def _http(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict | list:
-    creds = _creds()
-    api_key = creds.get("OPENWEBUI_API_KEY")
-    if not api_key:
+def _pick_api_key(creds: dict) -> str:
+    """Select the OpenWebUI bearer key for this request.
+
+    If CHAD_OPERATOR_SLUG is set (chad-shim sets it before launching
+    `openclaw agent`), require OPENWEBUI_API_KEY_<SLUG.upper()> — fail
+    closed rather than escalate to the default admin key. This is the
+    enforcement layer that lets OpenWebUI's per-resource permission check
+    contain a jailbroken or confused LLM: tjcooke chats use tjcooke's
+    user-role key, so any cross-operator write returns 403 at the API
+    even if Chad is talked into attempting it.
+
+    Anonymous requests (no slug — direct curl, internal cron, etc.) fall
+    back to OPENWEBUI_API_KEY. Set that to a low-privilege key if you
+    want defense-in-depth for non-operator callers too."""
+    slug = os.environ.get("CHAD_OPERATOR_SLUG", "").strip().lower()
+    if slug:
+        key_name = f"OPENWEBUI_API_KEY_{slug.upper().replace('-', '_').replace('.', '_')}"
+        per_op = creds.get(key_name)
+        if per_op:
+            return per_op
+        sys.stderr.write(
+            f"chad-webui: refusing to use default key for operator {slug!r} — "
+            f"missing {key_name} in credentials. Either add it or run without "
+            f"CHAD_OPERATOR_SLUG to use the default key explicitly.\n"
+        )
+        sys.exit(3)
+    default = creds.get("OPENWEBUI_API_KEY")
+    if not default:
         sys.stderr.write("chad-webui: OPENWEBUI_API_KEY missing from credentials\n")
         sys.exit(2)
+    return default
+
+
+def _http(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict | list:
+    creds = _creds()
+    api_key = _pick_api_key(creds)
 
     base = os.environ.get("OPENWEBUI_BASE_URL") or creds.get("OPENWEBUI_BASE_URL", DEFAULT_BASE)
     url = f"{base.rstrip('/')}{path}"
@@ -396,9 +432,19 @@ def cmd_health(args):
     base = os.environ.get("OPENWEBUI_BASE_URL") or creds.get("OPENWEBUI_BASE_URL", DEFAULT_BASE)
     # /api/version is unauthed (mounted at /api, not /api/v1)
     version_url = base.rstrip("/").rsplit("/", 1)[0] + "/version"
+    slug = os.environ.get("CHAD_OPERATOR_SLUG", "").strip().lower()
+    per_op_key_name = (
+        f"OPENWEBUI_API_KEY_{slug.upper().replace('-', '_').replace('.', '_')}" if slug else None
+    )
     out = {
         "base": base,
         "version_url": version_url,
+        "operator_slug": slug or None,
+        "operator_email": os.environ.get("CHAD_OPERATOR_EMAIL") or None,
+        "operator_role": os.environ.get("CHAD_OPERATOR_ROLE") or None,
+        "selected_key": per_op_key_name if (per_op_key_name and creds.get(per_op_key_name)) else (
+            "OPENWEBUI_API_KEY" if not slug else f"{per_op_key_name} (MISSING — would fail closed)"
+        ),
         "has_api_key": bool(creds.get("OPENWEBUI_API_KEY")),
         "has_cf_access": bool(creds.get("CF_ACCESS_CLIENT_ID") and creds.get("CF_ACCESS_CLIENT_SECRET")),
     }
