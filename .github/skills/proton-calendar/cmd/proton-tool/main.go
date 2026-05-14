@@ -84,33 +84,25 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  proton-tool events           List events from default calendar\n")
 	fmt.Fprintf(os.Stderr, "    --calendar-id=ID           Calendar ID (uses first if omitted)\n")
 	fmt.Fprintf(os.Stderr, "    --days=N                   Look-ahead days (default: 7)\n")
-	fmt.Fprintf(os.Stderr, "    --past=N                   Also show N past days (default: 0)\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool mail             List inbox messages\n")
 	fmt.Fprintf(os.Stderr, "    --limit=N                  Number of messages (default: 10)\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool sent             List sent messages\n")
 	fmt.Fprintf(os.Stderr, "    --limit=N                  Number of messages (default: 10)\n")
 	fmt.Fprintf(os.Stderr, "    --days=N                   Only show messages from last N days (default: all)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool count-mail       Show message counts per label\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool count-mail       Show message counts by label\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool read-mail        Read a specific message body\n")
 	fmt.Fprintf(os.Stderr, "    --id=MSGID                 Message ID (required)\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool mark-read        Mark messages as read\n")
 	fmt.Fprintf(os.Stderr, "    --id=MSGID1,MSGID2,...     Message IDs (required, comma-separated)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool send-mail        Send a new email\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool send-mail        Send an email\n")
 	fmt.Fprintf(os.Stderr, "    --to=ADDR                  Recipient address (required, comma-separated for multiple)\n")
 	fmt.Fprintf(os.Stderr, "    --cc=ADDR                  CC addresses (optional, comma-separated)\n")
-	fmt.Fprintf(os.Stderr, "    --subject=TEXT             Subject line (required)\n")
-	fmt.Fprintf(os.Stderr, "    --body=TEXT                Body text (reads stdin if omitted)\n")
+	fmt.Fprintf(os.Stderr, "    --subject=TEXT              Subject line (required)\n")
+	fmt.Fprintf(os.Stderr, "    --body=TEXT                 Body text (reads stdin if omitted)\n")
 	fmt.Fprintf(os.Stderr, "    --html                     Send as HTML (default: plain text)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool reply-mail       Reply to an existing message\n")
-	fmt.Fprintf(os.Stderr, "    --id=MSGID                 Message ID to reply to (required)\n")
-	fmt.Fprintf(os.Stderr, "    --body=TEXT                Reply body (reads stdin if omitted)\n")
-	fmt.Fprintf(os.Stderr, "    --all                      Reply all (includes original To/CC)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool trash-mail       Move messages to trash\n")
-	fmt.Fprintf(os.Stderr, "    --id=MSGID1,MSGID2,...     Message IDs (required, comma-separated)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool labels           List custom labels and folders\n")
 	fmt.Fprintf(os.Stderr, "\nEnvironment:\n")
-	fmt.Fprintf(os.Stderr, "  PROTON_USERNAME      Proton account email\n")
-	fmt.Fprintf(os.Stderr, "  PROTON_PASSWORD      Proton account password\n")
+	fmt.Fprintf(os.Stderr, "  PROTON_USERNAME   Proton account email\n")
+	fmt.Fprintf(os.Stderr, "  PROTON_PASSWORD   Proton account password\n")
 	fmt.Fprintf(os.Stderr, "  PROTON_SESSION_FILE  Path to session cache (default: /sandbox/.proton-session.json)\n")
 	os.Exit(1)
 }
@@ -121,17 +113,6 @@ func fatal(msg string, err error) {
 }
 
 func login(ctx context.Context) (*proton.Manager, *proton.Client) {
-	return loginWithScope(ctx, false)
-}
-
-// loginFull performs a full SRP login, bypassing session cache.
-// Use for commands that need key decryption (events, read-mail, send-mail,
-// reply-mail) since refreshed tokens have insufficient scope for /core/v4/keys/salts.
-func loginFull(ctx context.Context) (*proton.Manager, *proton.Client) {
-	return loginWithScope(ctx, true)
-}
-
-func loginWithScope(ctx context.Context, needFullScope bool) (*proton.Manager, *proton.Client) {
 	username := os.Getenv("PROTON_USERNAME")
 	password := os.Getenv("PROTON_PASSWORD")
 	if username == "" || password == "" {
@@ -146,18 +127,14 @@ func loginWithScope(ctx context.Context, needFullScope bool) (*proton.Manager, *
 
 	// Try to restore session from cached tokens (uses /auth/v4/refresh,
 	// which is NOT subject to the same rate limit as SRP /auth/v4).
-	// Skip for commands needing full scope (key decryption) — refresh
-	// tokens return limited scope that can't access /core/v4/keys/salts.
-	if !needFullScope {
-		if sess, err := loadSession(); err == nil {
-			c, auth, err := m.NewClientWithRefresh(ctx, sess.UID, sess.RefreshToken)
-			if err == nil {
-				saveSession(auth)
-				return m, c
-			}
-			fmt.Fprintf(os.Stderr, "Session refresh failed, falling back to SRP login: %v\n", err)
-			clearSession()
+	if sess, err := loadSession(); err == nil {
+		c, auth, err := m.NewClientWithRefresh(ctx, sess.UID, sess.RefreshToken)
+		if err == nil {
+			saveSession(auth)
+			return m, c
 		}
+		fmt.Fprintf(os.Stderr, "Session refresh failed, falling back to SRP login: %v\n", err)
+		clearSession()
 	}
 
 	// Full SRP login — this is rate-limited by Proton to ~10/hour.
@@ -267,7 +244,7 @@ func getAllCalendarEvents(ctx context.Context, c *proton.Client, calendarID stri
 
 func cmdEvents(ctx context.Context, args []string) {
 	password := []byte(os.Getenv("PROTON_PASSWORD"))
-	m, c := loginFull(ctx)
+	m, c := login(ctx)
 	defer c.Close()
 	defer m.Close()
 
@@ -276,11 +253,6 @@ func cmdEvents(ctx context.Context, args []string) {
 	days, _ := strconv.Atoi(daysStr)
 	if days <= 0 {
 		days = 7
-	}
-	pastStr := getArg(args, "--past=", "0")
-	past, _ := strconv.Atoi(pastStr)
-	if past < 0 {
-		past = 0
 	}
 
 	if calendarID == "" {
@@ -297,11 +269,10 @@ func cmdEvents(ctx context.Context, args []string) {
 	}
 
 	now := time.Now().UTC()
-	start := now.Add(-time.Duration(past) * 24 * time.Hour)
 	end := now.Add(time.Duration(days) * 24 * time.Hour)
 
 	filter := url.Values{}
-	filter.Set("Start", strconv.FormatInt(start.Unix(), 10))
+	filter.Set("Start", strconv.FormatInt(now.Unix(), 10))
 	filter.Set("End", strconv.FormatInt(end.Unix(), 10))
 
 	events, err := getAllCalendarEvents(ctx, c, calendarID, filter)
@@ -310,7 +281,7 @@ func cmdEvents(ctx context.Context, args []string) {
 	}
 
 	if len(events) == 0 {
-		fmt.Printf("No events in the requested window (%d past, %d ahead days).\n", past, days)
+		fmt.Printf("No events in the next %d days.\n", days)
 		return
 	}
 
@@ -320,21 +291,15 @@ func cmdEvents(ctx context.Context, args []string) {
 
 	fmt.Printf("Found %d events:\n\n", len(events))
 	for i, ev := range events {
-		evStart := time.Unix(ev.StartTime, 0).UTC()
+		start := time.Unix(ev.StartTime, 0).UTC()
 		evEnd := time.Unix(ev.EndTime, 0).UTC()
 
-		// Decrypt SharedEvents (SUMMARY, DESCRIPTION, LOCATION, RRULE)
-		summary, description, location, rrule := decryptSharedEvent(ev, calKR)
-
-		// Decrypt CalendarEvents (ORGANIZER, full ATTENDEE list)
-		organizer, attendeeEmails := decryptCalendarEventParts(ev, calKR)
+		// Decrypt shared event data (contains SUMMARY, DESCRIPTION, LOCATION).
+		summary, description, location := decryptSharedEvent(ev, calKR)
 
 		fmt.Printf("[%d] Event ID: %s\n", i+1, ev.ID)
 		if summary != "" {
 			fmt.Printf("    Summary:   %s\n", summary)
-		}
-		if organizer != "" {
-			fmt.Printf("    Organizer: %s\n", organizer)
 		}
 		if location != "" {
 			fmt.Printf("    Location:  %s\n", location)
@@ -342,55 +307,14 @@ func cmdEvents(ctx context.Context, args []string) {
 		if description != "" {
 			fmt.Printf("    Desc:      %s\n", description)
 		}
-		if rrule != "" {
-			fmt.Printf("    Recurs:    %s\n", rrule)
-		}
-		fmt.Printf("    Start:     %s\n", evStart.Format(time.RFC3339))
+		fmt.Printf("    UID:       %s\n", ev.UID)
+		fmt.Printf("    Start:     %s\n", start.Format(time.RFC3339))
 		fmt.Printf("    End:       %s\n", evEnd.Format(time.RFC3339))
-		if ev.StartTimezone != "" {
-			fmt.Printf("    Timezone:  %s\n", ev.StartTimezone)
-		}
+		fmt.Printf("    Timezone:  %s / %s\n", ev.StartTimezone, ev.EndTimezone)
 		fmt.Printf("    Full Day:  %v\n", bool(ev.FullDay))
 		fmt.Printf("    Author:    %s\n", ev.Author)
-
-		// Show attendees: emails from CalendarEvents, statuses from Attendees array
-		if len(attendeeEmails) > 0 {
-			fmt.Printf("    Attendees: %s\n", strings.Join(attendeeEmails, ", "))
-		} else if len(ev.Attendees) > 0 {
-			fmt.Printf("    Attendees: %d\n", len(ev.Attendees))
-		}
-
-		// Show attendee status breakdown from the API (Pending/Yes/No/Maybe)
 		if len(ev.Attendees) > 0 {
-			yes, no, maybe, pending := 0, 0, 0, 0
-			for _, a := range ev.Attendees {
-				switch a.Status {
-				case proton.CalendarAttendeeStatusYes:
-					yes++
-				case proton.CalendarAttendeeStatusNo:
-					no++
-				case proton.CalendarAttendeeStatusMaybe:
-					maybe++
-				default:
-					pending++
-				}
-			}
-			parts := []string{}
-			if yes > 0 {
-				parts = append(parts, fmt.Sprintf("%d accepted", yes))
-			}
-			if no > 0 {
-				parts = append(parts, fmt.Sprintf("%d declined", no))
-			}
-			if maybe > 0 {
-				parts = append(parts, fmt.Sprintf("%d maybe", maybe))
-			}
-			if pending > 0 {
-				parts = append(parts, fmt.Sprintf("%d pending", pending))
-			}
-			if len(parts) > 0 {
-				fmt.Printf("    RSVP:      %s\n", strings.Join(parts, ", "))
-			}
+			fmt.Printf("    Attendees: %d\n", len(ev.Attendees))
 		}
 		fmt.Println()
 	}
@@ -441,13 +365,14 @@ func unlockCalendarKeys(ctx context.Context, c *proton.Client, calendarID string
 }
 
 // decryptSharedEvent decrypts the SharedEvents parts of a CalendarEvent and
-// extracts SUMMARY, DESCRIPTION, LOCATION, and RRULE from the VEVENT data.
-// SharedEvents use SharedKeyPacket.
-func decryptSharedEvent(ev proton.CalendarEvent, calKR *crypto.KeyRing) (summary, description, location, rrule string) {
+// extracts SUMMARY, DESCRIPTION, and LOCATION from the iCalendar VEVENT data.
+func decryptSharedEvent(ev proton.CalendarEvent, calKR *crypto.KeyRing) (summary, description, location string) {
 	if calKR == nil || len(ev.SharedEvents) == 0 {
 		return
 	}
 
+	// Decode the shared key packet (used as the symmetric key packet for all
+	// SharedEvents parts on this event).
 	var kp []byte
 	if ev.SharedKeyPacket != "" {
 		var err error
@@ -462,6 +387,7 @@ func decryptSharedEvent(ev proton.CalendarEvent, calKR *crypto.KeyRing) (summary
 		if decrypted == "" {
 			continue
 		}
+		// Parse iCalendar properties from the decrypted VEVENT fragment.
 		if v := icalProp(decrypted, "SUMMARY"); v != "" && summary == "" {
 			summary = v
 		}
@@ -471,50 +397,8 @@ func decryptSharedEvent(ev proton.CalendarEvent, calKR *crypto.KeyRing) (summary
 		if v := icalProp(decrypted, "LOCATION"); v != "" && location == "" {
 			location = v
 		}
-		if v := icalProp(decrypted, "RRULE"); v != "" && rrule == "" {
-			rrule = v
-		}
 	}
 	return
-}
-
-// decryptCalendarEventParts decrypts CalendarEvents parts (which use
-// CalendarKeyPacket, distinct from SharedKeyPacket) and extracts ORGANIZER
-// and full ATTENDEE email addresses.
-func decryptCalendarEventParts(ev proton.CalendarEvent, calKR *crypto.KeyRing) (organizer string, attendees []string) {
-	if calKR == nil || len(ev.CalendarEvents) == 0 {
-		return
-	}
-
-	var kp []byte
-	if ev.CalendarKeyPacket != "" {
-		var err error
-		kp, err = base64.StdEncoding.DecodeString(ev.CalendarKeyPacket)
-		if err != nil {
-			return
-		}
-	}
-
-	for _, part := range ev.CalendarEvents {
-		decrypted := decryptEventPart(part, calKR, kp)
-		if decrypted == "" {
-			continue
-		}
-		if v := icalProp(decrypted, "ORGANIZER"); v != "" && organizer == "" {
-			organizer = stripMailto(v)
-		}
-		for _, email := range icalAllProps(decrypted, "ATTENDEE") {
-			attendees = append(attendees, stripMailto(email))
-		}
-	}
-	return
-}
-
-func stripMailto(s string) string {
-	if strings.HasPrefix(strings.ToLower(s), "mailto:") {
-		return s[7:]
-	}
-	return s
 }
 
 // decryptEventPart decrypts a single CalendarEventPart and returns the
@@ -552,35 +436,26 @@ func decryptEventPart(part proton.CalendarEventPart, calKR *crypto.KeyRing, kp [
 // Handles simple "KEY:value" lines and folded lines (continuation with
 // leading space/tab). Also handles parameters like "KEY;PARAM=X:value".
 func icalProp(ical, key string) string {
-	vals := icalAllProps(ical, key)
-	if len(vals) > 0 {
-		return vals[0]
-	}
-	return ""
-}
-
-// icalAllProps extracts all values of a property from an iCalendar text blob.
-// Used for multi-value properties like ATTENDEE.
-func icalAllProps(ical, key string) []string {
 	// Unfold: iCalendar continuation lines start with a space or tab.
 	ical = strings.ReplaceAll(ical, "\r\n ", "")
 	ical = strings.ReplaceAll(ical, "\r\n\t", "")
 	ical = strings.ReplaceAll(ical, "\n ", "")
 	ical = strings.ReplaceAll(ical, "\n\t", "")
 
-	var values []string
 	for _, line := range strings.Split(ical, "\n") {
 		line = strings.TrimRight(line, "\r")
+		// Match "KEY:value" or "KEY;params:value"
 		if strings.HasPrefix(line, key+":") {
-			values = append(values, line[len(key)+1:])
-		} else if strings.HasPrefix(line, key+";") {
+			return line[len(key)+1:]
+		}
+		if strings.HasPrefix(line, key+";") {
 			idx := strings.Index(line, ":")
 			if idx >= 0 {
-				values = append(values, line[idx+1:])
+				return line[idx+1:]
 			}
 		}
 	}
-	return values
+	return ""
 }
 
 func cmdMail(ctx context.Context, args []string) {
@@ -595,7 +470,7 @@ func cmdMail(ctx context.Context, args []string) {
 	}
 
 	filter := proton.MessageFilter{
-		LabelID: proton.InboxLabel,
+		LabelID: "0",
 	}
 
 	messages, err := c.GetMessageMetadata(ctx, filter)
@@ -619,38 +494,9 @@ func cmdMail(ctx context.Context, args []string) {
 		if msg.Sender != nil {
 			fmt.Printf("    From:    %s <%s>\n", msg.Sender.Name, msg.Sender.Address)
 		}
-		if len(msg.CCList) > 0 {
-			ccAddrs := make([]string, 0, len(msg.CCList))
-			for _, a := range msg.CCList {
-				ccAddrs = append(ccAddrs, a.Address)
-			}
-			fmt.Printf("    CC:      %s\n", strings.Join(ccAddrs, ", "))
-		}
 		fmt.Printf("    Date:    %s\n", t.Format(time.RFC3339))
 		fmt.Printf("    ID:      %s\n", msg.ID)
-
-		// State indicators
-		flags := []string{}
-		if bool(msg.Unread) {
-			flags = append(flags, "UNREAD")
-		}
-		if bool(msg.IsReplied) {
-			flags = append(flags, "replied")
-		}
-		if bool(msg.IsForwarded) {
-			flags = append(flags, "forwarded")
-		}
-		if msg.NumAttachments > 0 {
-			flags = append(flags, fmt.Sprintf("%d attachment(s)", msg.NumAttachments))
-		}
-		if msg.Flags.Has(proton.MessageFlagPhishingAuto) || msg.Flags.Has(proton.MessageFlagPhishingManual) {
-			flags = append(flags, "⚠ PHISHING")
-		} else if msg.Flags.Has(proton.MessageFlagSpamAuto) || msg.Flags.Has(proton.MessageFlagSpamManual) {
-			flags = append(flags, "⚠ SPAM")
-		}
-		if len(flags) > 0 {
-			fmt.Printf("    Flags:   %s\n", strings.Join(flags, ", "))
-		}
+		fmt.Printf("    Unread:  %v\n", bool(msg.Unread))
 		fmt.Println()
 	}
 }
@@ -670,7 +516,7 @@ func cmdSent(ctx context.Context, args []string) {
 	days, _ := strconv.Atoi(daysStr)
 
 	filter := proton.MessageFilter{
-		LabelID: proton.AllSentLabel,
+		LabelID: "2", // Sent label
 	}
 
 	messages, err := c.GetMessageMetadata(ctx, filter)
@@ -721,38 +567,12 @@ func cmdCountMail(ctx context.Context) {
 	defer c.Close()
 	defer m.Close()
 
-	counts, err := c.GetGroupedMessageCount(ctx)
+	count, err := c.CountMessages(ctx)
 	if err != nil {
 		fatal("count messages", err)
 	}
 
-	// Map well-known label IDs to readable names
-	labelNames := map[string]string{
-		proton.InboxLabel:        "Inbox",
-		proton.AllDraftsLabel:    "All Drafts",
-		proton.AllSentLabel:      "All Sent",
-		proton.TrashLabel:        "Trash",
-		proton.SpamLabel:         "Spam",
-		proton.AllMailLabel:      "All Mail",
-		proton.ArchiveLabel:      "Archive",
-		proton.SentLabel:         "Sent",
-		proton.DraftsLabel:       "Drafts",
-		proton.StarredLabel:      "Starred",
-		proton.AllScheduledLabel: "Scheduled",
-	}
-
-	fmt.Println("Message counts by label:")
-	for _, count := range counts {
-		name, ok := labelNames[count.LabelID]
-		if !ok {
-			name = "Label:" + count.LabelID
-		}
-		if count.Unread > 0 {
-			fmt.Printf("  %-16s total=%-6d  unread=%d\n", name, count.Total, count.Unread)
-		} else {
-			fmt.Printf("  %-16s total=%d\n", name, count.Total)
-		}
-	}
+	fmt.Printf("Total messages: %d\n", count)
 }
 
 // unlockKeys returns the address keyring for the primary send address.
@@ -828,7 +648,7 @@ func cmdReadMail(ctx context.Context, args []string) {
 	}
 
 	password := []byte(os.Getenv("PROTON_PASSWORD"))
-	m, c := loginFull(ctx)
+	m, c := login(ctx)
 	defer c.Close()
 	defer m.Close()
 
@@ -855,24 +675,7 @@ func cmdReadMail(ctx context.Context, args []string) {
 	if msg.Sender != nil {
 		fmt.Printf("From:    %s <%s>\n", msg.Sender.Name, msg.Sender.Address)
 	}
-	if len(msg.ToList) > 0 {
-		toAddrs := make([]string, 0, len(msg.ToList))
-		for _, a := range msg.ToList {
-			toAddrs = append(toAddrs, a.Address)
-		}
-		fmt.Printf("To:      %s\n", strings.Join(toAddrs, ", "))
-	}
-	if len(msg.CCList) > 0 {
-		ccAddrs := make([]string, 0, len(msg.CCList))
-		for _, a := range msg.CCList {
-			ccAddrs = append(ccAddrs, a.Address)
-		}
-		fmt.Printf("CC:      %s\n", strings.Join(ccAddrs, ", "))
-	}
 	fmt.Printf("Date:    %s\n", time.Unix(msg.Time, 0).UTC().Format(time.RFC3339))
-	if msg.NumAttachments > 0 {
-		fmt.Printf("Attachments: %d\n", msg.NumAttachments)
-	}
 	fmt.Printf("Type:    %s\n", msg.MIMEType)
 	fmt.Printf("ID:      %s\n", msg.ID)
 	fmt.Println()
@@ -913,77 +716,6 @@ func cmdMarkRead(ctx context.Context, args []string) {
 	}
 }
 
-// buildAndSend constructs and sends a draft. Shared by send-mail and reply-mail.
-func buildAndSend(
-	ctx context.Context,
-	c *proton.Client,
-	addrKR *crypto.KeyRing,
-	addr proton.Address,
-	req proton.CreateDraftReq,
-	bodyText string,
-	mimeType rfc822.MIMEType,
-) {
-	draft, err := c.CreateDraft(ctx, addrKR, req)
-	if err != nil {
-		fatal("create draft", err)
-	}
-	fmt.Printf("Draft created: %s\n", draft.ID)
-
-	allRecipients := append(req.Message.ToList, req.Message.CCList...)
-	internalPrefs := make(map[string]proton.SendPreferences)
-	clearPrefs := make(map[string]proton.SendPreferences)
-
-	for _, rcpt := range allRecipients {
-		email := rcpt.Address
-		pubKeys, recipientType, err := c.GetPublicKeys(ctx, email)
-		if err != nil {
-			fatal("get public keys for "+email, err)
-		}
-
-		if recipientType == proton.RecipientTypeInternal && len(pubKeys) > 0 {
-			rcptKR, err := pubKeys.GetKeyRing()
-			if err != nil {
-				fatal("build keyring for "+email, err)
-			}
-			internalPrefs[email] = proton.SendPreferences{
-				Encrypt:          true,
-				PubKey:           rcptKR,
-				SignatureType:    proton.DetachedSignature,
-				EncryptionScheme: proton.InternalScheme,
-				MIMEType:         mimeType,
-			}
-		} else {
-			clearPrefs[email] = proton.SendPreferences{
-				Encrypt:          false,
-				SignatureType:    proton.NoSignature,
-				EncryptionScheme: proton.ClearScheme,
-				MIMEType:         mimeType,
-			}
-		}
-	}
-
-	var sendReq proton.SendDraftReq
-	if len(internalPrefs) > 0 {
-		if err := sendReq.AddTextPackage(addrKR, bodyText, mimeType, internalPrefs, nil); err != nil {
-			fatal("add internal package", err)
-		}
-	}
-	if len(clearPrefs) > 0 {
-		if err := sendReq.AddTextPackage(addrKR, bodyText, mimeType, clearPrefs, nil); err != nil {
-			fatal("add clear package", err)
-		}
-	}
-
-	sent, err := c.SendDraft(ctx, draft.ID, sendReq)
-	if err != nil {
-		fatal("send draft", err)
-	}
-
-	fmt.Printf("Email sent successfully!\n")
-	fmt.Printf("  Message ID: %s\n", sent.ID)
-	fmt.Printf("  Subject:    %s\n", sent.Subject)
-}
-
 func cmdSendMail(ctx context.Context, args []string) {
 	toStr := getArg(args, "--to=", "")
 	ccStr := getArg(args, "--cc=", "")
@@ -1007,24 +739,29 @@ func cmdSendMail(ctx context.Context, args []string) {
 		bodyText = string(data)
 	}
 
-	mimeType := rfc822.TextPlain
+	isHTML := false
 	for _, a := range args {
 		if a == "--html" {
-			mimeType = rfc822.TextHTML
+			isHTML = true
 		}
+	}
+
+	mimeType := rfc822.TextPlain
+	if isHTML {
+		mimeType = rfc822.TextHTML
 	}
 
 	toList := parseAddressList(toStr)
 	ccList := parseAddressList(ccStr)
 
 	password := []byte(os.Getenv("PROTON_PASSWORD"))
-	m, c := loginFull(ctx)
+	m, c := login(ctx)
 	defer c.Close()
 	defer m.Close()
 
 	_, addr, addrKR := unlockKeys(ctx, c, password)
 
-	req := proton.CreateDraftReq{
+	draft, err := c.CreateDraft(ctx, addrKR, proton.CreateDraftReq{
 		Message: proton.DraftTemplate{
 			Subject:  subject,
 			Sender:   &mail.Address{Address: addr.Email},
@@ -1033,149 +770,82 @@ func cmdSendMail(ctx context.Context, args []string) {
 			Body:     bodyText,
 			MIMEType: mimeType,
 		},
+	})
+	if err != nil {
+		fatal("create draft", err)
 	}
+
+	fmt.Printf("Draft created: %s\n", draft.ID)
+
+	allRecipients := make(map[string]proton.SendPreferences)
+
+	for _, rcpt := range append(toList, ccList...) {
+		email := rcpt.Address
+
+		pubKeys, recipientType, err := c.GetPublicKeys(ctx, email)
+		if err != nil {
+			fatal("get public keys for "+email, err)
+		}
+
+		if recipientType == proton.RecipientTypeInternal && len(pubKeys) > 0 {
+			rcptKR, err := pubKeys.GetKeyRing()
+			if err != nil {
+				fatal("build keyring for "+email, err)
+			}
+			allRecipients[email] = proton.SendPreferences{
+				Encrypt:          true,
+				PubKey:           rcptKR,
+				SignatureType:    proton.DetachedSignature,
+				EncryptionScheme: proton.InternalScheme,
+				MIMEType:         mimeType,
+			}
+		} else {
+			allRecipients[email] = proton.SendPreferences{
+				Encrypt:          false,
+				SignatureType:    proton.NoSignature,
+				EncryptionScheme: proton.ClearScheme,
+				MIMEType:         mimeType,
+			}
+		}
+	}
+
+	var sendReq proton.SendDraftReq
+
+	internalPrefs := make(map[string]proton.SendPreferences)
+	clearPrefs := make(map[string]proton.SendPreferences)
+
+	for email, prefs := range allRecipients {
+		switch prefs.EncryptionScheme {
+		case proton.InternalScheme:
+			internalPrefs[email] = prefs
+		default:
+			clearPrefs[email] = prefs
+		}
+	}
+
+	if len(internalPrefs) > 0 {
+		if err := sendReq.AddTextPackage(addrKR, bodyText, mimeType, internalPrefs, nil); err != nil {
+			fatal("add internal package", err)
+		}
+	}
+
+	if len(clearPrefs) > 0 {
+		if err := sendReq.AddTextPackage(addrKR, bodyText, mimeType, clearPrefs, nil); err != nil {
+			fatal("add clear package", err)
+		}
+	}
+
+	sent, err := c.SendDraft(ctx, draft.ID, sendReq)
+	if err != nil {
+		fatal("send draft", err)
+	}
+
+	fmt.Printf("Email sent successfully!\n")
+	fmt.Printf("  Message ID: %s\n", sent.ID)
+	fmt.Printf("  Subject:    %s\n", sent.Subject)
 	fmt.Printf("  To:         %s\n", toStr)
 	if ccStr != "" {
 		fmt.Printf("  CC:         %s\n", ccStr)
-	}
-	buildAndSend(ctx, c, addrKR, addr, req, bodyText, mimeType)
-}
-
-func cmdReplyMail(ctx context.Context, args []string) {
-	msgID := getArg(args, "--id=", "")
-	if msgID == "" {
-		fmt.Fprintln(os.Stderr, "Error: --id=MSGID is required")
-		os.Exit(1)
-	}
-	bodyText := getArg(args, "--body=", "")
-
-	replyAll := false
-	for _, a := range args {
-		if a == "--all" {
-			replyAll = true
-		}
-	}
-
-	if bodyText == "" {
-		data, err := os.ReadFile("/dev/stdin")
-		if err != nil {
-			fatal("read stdin", err)
-		}
-		bodyText = string(data)
-	}
-
-	password := []byte(os.Getenv("PROTON_PASSWORD"))
-	m, c := loginFull(ctx)
-	defer c.Close()
-	defer m.Close()
-
-	_, addr, addrKR := unlockKeys(ctx, c, password)
-
-	// Read the original message for threading and recipient info.
-	msg, err := c.GetMessage(ctx, msgID)
-	if err != nil {
-		fatal("get message", err)
-	}
-
-	// Construct reply subject
-	subject := msg.Subject
-	if !strings.HasPrefix(strings.ToLower(subject), "re:") {
-		subject = "Re: " + subject
-	}
-
-	// Reply goes to the original sender.
-	toList := []*mail.Address{}
-	if msg.Sender != nil {
-		toList = append(toList, msg.Sender)
-	}
-
-	// For reply-all: also CC the original To list minus our own address.
-	ccList := []*mail.Address{}
-	action := proton.ReplyAction
-	if replyAll {
-		action = proton.ReplyAllAction
-		for _, r := range msg.ToList {
-			if !strings.EqualFold(r.Address, addr.Email) {
-				ccList = append(ccList, r)
-			}
-		}
-		ccList = append(ccList, msg.CCList...)
-	}
-
-	req := proton.CreateDraftReq{
-		Message: proton.DraftTemplate{
-			Subject:  subject,
-			Sender:   &mail.Address{Address: addr.Email},
-			ToList:   toList,
-			CCList:   ccList,
-			Body:     bodyText,
-			MIMEType: rfc822.TextPlain,
-		},
-		ParentID: msgID,
-		Action:   action,
-	}
-
-	fmt.Printf("Replying to: %s\n", msg.Subject)
-	if msg.Sender != nil {
-		fmt.Printf("  To:    %s\n", msg.Sender.Address)
-	}
-	buildAndSend(ctx, c, addrKR, addr, req, bodyText, rfc822.TextPlain)
-}
-
-func cmdTrashMail(ctx context.Context, args []string) {
-	idsStr := getArg(args, "--id=", "")
-	if idsStr == "" {
-		fmt.Fprintln(os.Stderr, "Error: --id=MSGID1,MSGID2,... is required")
-		os.Exit(1)
-	}
-
-	m, c := login(ctx)
-	defer c.Close()
-	defer m.Close()
-
-	ids := strings.Split(idsStr, ",")
-	for i := range ids {
-		ids[i] = strings.TrimSpace(ids[i])
-	}
-	// Remove empty strings
-	filtered := ids[:0]
-	for _, id := range ids {
-		if id != "" {
-			filtered = append(filtered, id)
-		}
-	}
-	ids = filtered
-
-	if err := c.LabelMessages(ctx, ids, proton.TrashLabel); err != nil {
-		fatal("move to trash", err)
-	}
-
-	fmt.Printf("Moved %d message(s) to trash.\n", len(ids))
-}
-
-func cmdLabels(ctx context.Context) {
-	m, c := login(ctx)
-	defer c.Close()
-	defer m.Close()
-
-	labels, err := c.GetLabels(ctx, proton.LabelTypeLabel, proton.LabelTypeFolder)
-	if err != nil {
-		fatal("get labels", err)
-	}
-
-	if len(labels) == 0 {
-		fmt.Println("No custom labels or folders.")
-		return
-	}
-
-	fmt.Printf("Custom labels and folders (%d):\n\n", len(labels))
-	for _, l := range labels {
-		typeName := "label"
-		if l.Type == proton.LabelTypeFolder {
-			typeName = "folder"
-		}
-		path := strings.Join(l.Path, "/")
-		fmt.Printf("  [%s] %s  (ID: %s)\n", typeName, path, l.ID)
 	}
 }
 
@@ -1212,12 +882,6 @@ func main() {
 		cmdMarkRead(ctx, args)
 	case "send-mail":
 		cmdSendMail(ctx, args)
-	case "reply-mail":
-		cmdReplyMail(ctx, args)
-	case "trash-mail":
-		cmdTrashMail(ctx, args)
-	case "labels":
-		cmdLabels(ctx)
 	case "--help", "-h", "help":
 		usage()
 	default:

@@ -11,51 +11,20 @@
 
 | Command | Path |
 |---------|------|
-| List inbox | `/usr/local/bin/proton-tool mail --limit=20` |
-| List sent | `/usr/local/bin/proton-tool sent --limit=15 --days=3` |
-| Read message | `/usr/local/bin/proton-tool read-mail --id=MSGID` |
-| Mark as read | `/usr/local/bin/proton-tool mark-read --id=MSGID1,MSGID2` |
-| Reply to message | `/usr/local/bin/proton-tool reply-mail --id=MSGID --body=TEXT` |
-| Reply all | `/usr/local/bin/proton-tool reply-mail --id=MSGID --all --body=TEXT` |
-| Send new email | `/usr/local/bin/proton-tool send-mail --to=ADDR --subject=TEXT --body=TEXT` |
+| List inbox | `/sandbox/proton-tool mail --limit=20` |
+| List sent | `/sandbox/proton-tool sent --limit=15 --days=3` |
+| Read message | `/sandbox/proton-tool read-mail --id=MSGID` |
+| Mark as read | `/sandbox/proton-tool mark-read --id=MSGID1,MSGID2` |
+| Send email | `/sandbox/proton-tool send-mail --to=ADDR --subject=TEXT --body=TEXT` |
+| Count messages | `/sandbox/proton-tool count-mail` |
+| List calendars | `/sandbox/proton-tool calendars` |
+| List events | `/sandbox/proton-tool events --days=7` |
 
-> **`--body` is required.** The sandbox Landlock blocks `/dev/stdin`, so
-> omitting `--body` causes an immediate "permission denied" crash. For
-> multi-line bodies write to a file first:
-> ```bash
-> body=$(cat /tmp/email-body.txt)
-> proton-tool reply-mail --id=MSGID --body="$body"
-> ```
-| Trash messages | `/usr/local/bin/proton-tool trash-mail --id=MSGID1,MSGID2` |
-| Count per label | `/usr/local/bin/proton-tool count-mail` |
-| List calendars | `/usr/local/bin/proton-tool calendars` |
-| List events | `/usr/local/bin/proton-tool events --days=7` |
-| Past events | `/usr/local/bin/proton-tool events --past=7 --days=0` |
-
-> **Stable path:** `/usr/local/bin/proton-tool` is a copy of the latest build
+> **Stable path:** `/sandbox/proton-tool` is a copy of the latest build
 > from `/sandbox/.openclaw-data/skills/proton-calendar/proton-tool`.
 > After rebuilding (`bash scripts/build.sh`), run:
-> `cp /sandbox/.openclaw-data/skills/proton-calendar/proton-tool /usr/local/bin/proton-tool`
+> `cp /sandbox/.openclaw-data/skills/proton-calendar/proton-tool /sandbox/proton-tool`
 > Do **not** use a symlink — the proxy blocks binaries under `.openclaw-data/`.
-
-## Sender-specific routing
-
-### tjcooke@protonmail.com / tjcooke@pm.me — fitness coach
-
-TJ's emails are almost always content creation requests. Apply this routing
-before the generic task-weight rules:
-
-| Request type | Action |
-|---|---|
-| Article / post topics or a content schedule | Weight 4 — acknowledge, then `chad-intake --from proton --message-id MSGID` which will spawn researcher → writer pipeline |
-| Client check-in or programming question | Weight 3 — spawn `fitness` sub-agent for strength/mobility answers from gbrain |
-| Quick question / confirmation | Weight 1–2 — reply inline |
-
-For content requests: the researcher sub-agent collects sources per topic,
-then one writer sub-agent per article produces a draft (fan-out, not all in
-one spawn). Do not attempt to write articles inline in the cron session.
-
----
 
 ## Admin users (respond to these)
 
@@ -91,7 +60,7 @@ Everything else is **non-admin** and subject to the anti-spam rules below.
 4. **Bulk mark-read:** All newsletters, marketing, automated notifications,
    and unrecognised senders must be marked read in a single batch call:
    ```
-   /usr/local/bin/proton-tool mark-read --id=ID1,ID2,ID3
+   /sandbox/proton-tool mark-read --id=ID1,ID2,ID3
    ```
 5. **No draft creation** for non-admin mail. Do not start composing replies
    that will never be sent — it wastes API calls and leaves orphan drafts.
@@ -117,13 +86,10 @@ Every admin email gets a weight based on effort required:
 - **Weight 3:** Handle if this is the only pending item. Otherwise add to
   `Pending Follow-ups` in `memory/YYYY-MM-DD.md` and reply with an
   acknowledgment: _"Noted — I'll handle this shortly."_
-- **Weight 4:** Always defer. Reply with a short acknowledgment, then route
-  through the orchestrator pipeline — do **not** attempt the work inline:
-  ```bash
-  chad-intake --from proton --message-id MSGID
-  ```
-  `chad-intake` handles task-file creation, budget check, spawn queuing, and
-  memory logging. Inline weight-4 work will be killed by the cron timeout.
+- **Weight 4:** Always defer. Add to `Pending Follow-ups` and reply with an
+  acknowledgment including the estimated scope:
+  _"Received. This looks like a [brief description]. I'll work on it and
+  follow up."_
 
 ## Acknowledgment protocol
 
@@ -144,7 +110,7 @@ conversations the agent is waiting on.
 
 ### How it works
 
-1. Run `/usr/local/bin/proton-tool sent --limit=15 --days=3` to list recent
+1. Run `/sandbox/proton-tool sent --limit=15 --days=3` to list recent
    outbound messages.
 2. For each sent message to an admin user, check whether a reply has arrived
    in the inbox (match by subject thread — look for `Re:` prefix or same
@@ -183,22 +149,22 @@ Each **30-minute** cron execution must follow these steps in order:
    and `Awaiting Responses` from previous runs. Act on follow-ups first.
 2. **List inbox:**
    ```
-   /usr/local/bin/proton-tool mail --limit=20
+   /sandbox/proton-tool mail --limit=20
    ```
 3. **For each unread message from an admin user:**
    ```
-   /usr/local/bin/proton-tool read-mail --id=MSGID
+   /sandbox/proton-tool read-mail --id=MSGID
    ```
    (This auto-marks the message as read.)
    If the message is a reply to something in `Awaiting Responses`, clear
    that entry — the thread is now active again.
 4. **For newsletters / spam / non-admin unread:** batch mark-read:
    ```
-   /usr/local/bin/proton-tool mark-read --id=MSGID1,MSGID2
+   /sandbox/proton-tool mark-read --id=MSGID1,MSGID2
    ```
 5. **Scan sent messages for context recovery:**
    ```
-   /usr/local/bin/proton-tool sent --limit=15 --days=3
+   /sandbox/proton-tool sent --limit=15 --days=3
    ```
    Cross-reference with inbox to identify threads still awaiting a reply.
    Update `Awaiting Responses` in today's log.
