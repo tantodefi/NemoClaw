@@ -886,24 +886,193 @@ whether the L7 policy was the block.
 
 # Linked docs
 
-## Official OpenWebUI
+Chad's experiment surface is bounded by what OpenWebUI can do. This
+section is the read-this-before-designing-an-experiment reference —
+every major feature has an upstream doc that explains the model
+chad can use, the schema, the access-control implications, and (often)
+example code chad can adapt as an experiment surface.
 
-- [OpenWebUI docs](https://docs.openwebui.com/)
-- [Environment variables](https://docs.openwebui.com/getting-started/env-configuration)
-- [API reference](https://docs.openwebui.com/getting-started/api-endpoints)
-- [Functions][owui-functions] — Python pipeline filter / pipe / action
-- [Tools][owui-tools] — OpenAI-style tool specs
-- [Pipelines](https://docs.openwebui.com/pipelines/) — long-form pipeline framework
-- [GitHub releases](https://github.com/open-webui/open-webui/releases)
+## Top-level orientation
 
-[owui-functions]: https://docs.openwebui.com/features/plugin/functions/
-[owui-tools]: https://docs.openwebui.com/features/plugin/tools/
+- [OpenWebUI docs](https://docs.openwebui.com/) — landing
+- [Getting started → Environment variables](https://docs.openwebui.com/getting-started/env-configuration) — every flag exposed on the container; useful for `chad-webui health` debugging
+- [Getting started → API endpoints](https://docs.openwebui.com/getting-started/api-endpoints) — REST surface chad-webui wraps
+- [GitHub releases](https://github.com/open-webui/open-webui/releases) — version history, breaking changes per version (currently :main = post-v0.9.5)
+
+## Feature reference (organized by what chad can experiment with)
+
+### Functions — the in-pipeline Python plugin layer
+
+[**Functions overview**][owui-functions] — the entry point.
+
+Three types, each a different experiment surface:
+
+- **Filters** — run before/after every chat turn; mutate request or
+  response. Best for: pre-processing user messages (e.g. inject
+  context from operator's calendar), post-processing model output
+  (e.g. strip PII), changing parameters per turn.
+  [docs](https://docs.openwebui.com/features/plugin/functions/filter)
+- **Pipes** — replace the upstream model entirely with custom Python.
+  Best for: routing decisions, multi-model orchestration, calling
+  an external service that returns chat-completion-shaped responses.
+  [docs](https://docs.openwebui.com/features/plugin/functions/pipe)
+- **Actions** — add a clickable button under each assistant message.
+  Best for: one-click follow-ups ("Save to notes", "Regenerate with
+  longer answer", "Email to operator").
+  [docs](https://docs.openwebui.com/features/plugin/functions/action)
+
+Community catalog of installable functions:
+**https://openwebui.com/functions** — browse for inspiration; many
+filters and pipes are 1-screen Python and easy to A/B against.
+
+### Tools — OpenAI-style tool/function calling
+
+[**Tools overview**][owui-tools] — Python tool specs the model can
+invoke on demand (different from Functions, which run automatically).
+
+Community catalog: **https://openwebui.com/tools**
+
+External tool servers via OpenAPI spec:
+
+- [Tool Servers / OpenAPI integration](https://docs.openwebui.com/openapi-servers) — chad can register external HTTP tools as if they were native
+- [MCP (Model Context Protocol)](https://docs.openwebui.com/openapi-servers/mcp) — OpenWebUI's MCP bridge; relevant because chad-webui-mcp uses the same protocol
+
+### Pipelines — the long-form pipeline framework
+
+[**Pipelines docs**](https://docs.openwebui.com/pipelines/) — a
+separate server that hosts more complex multi-stage pipelines than
+Functions allow. Higher overhead, more capability. Useful for chad
+when an experiment needs more than a single Python file.
+
+### Knowledge (RAG)
+
+- [**RAG / Knowledge overview**](https://docs.openwebui.com/features/rag)
+- Schema: collections contain files; each file goes through
+  embedder + chunker; queries are top-k similarity retrieval.
+- Access control: collections support `access_control.read.user_ids`
+  and `.group_ids` — **how chad shares a RAG collection with a
+  specific operator without using their key.**
+- Embedder config: lives under Admin → Settings → Documents.
+
+### Memory
+
+- [**Memory overview**](https://docs.openwebui.com/features/memory)
+- Per-user, no sharing. Chad creates memories via
+  `chad-webui memories create` for the matching operator slug.
+- Memories surface as context on every chat turn for that user.
+
+### Web search
+
+- [**Web search overview**](https://docs.openwebui.com/features/web-search)
+- Configurable per-engine (Brave is what chad has wired); the
+  search results are injected as a tool call before the model
+  generates. Good experiment surface for "does web grounding
+  improve answers in topic X?"
+
+### Image generation
+
+- [**Image generation overview**](https://docs.openwebui.com/features/image-generation)
+- Pluggable backend (default: ComfyUI). Chad can experiment with
+  prompt-template variations for image automations.
+
+### Code interpreter
+
+- [**Code interpreter**](https://docs.openwebui.com/features/code-interpreter)
+- Sandboxed Python execution per chat turn. Experiment surface for
+  "should this automation include code-interpreter output?"
+
+### Automations (scheduled prompts)
+
+- [**Automations overview**](https://docs.openwebui.com/features/workspace/automations)
+- RRULE-scheduled prompts that fire and post results to the
+  operator's chat list. Primary experiment artifact for Category 1
+  (prompt opt), 2 (workflow), 6 (timing).
+- Schema is exposed at `AutomationData`: `prompt`, `model_id`,
+  `rrule`, `terminal` (optional). Top-level: `name`, `is_active`,
+  `access_control`.
+
+### Channels (shared chat spaces)
+
+- [**Channels overview**](https://docs.openwebui.com/features/workspace/channels)
+- Multi-user chat rooms with member lists. **The way chad creates
+  artifacts both operators see without needing per-operator API
+  keys.** Webhook support for inbound events from external systems.
+
+### Notes
+
+- [**Notes overview**](https://docs.openwebui.com/features/workspace/notes)
+- Per-user markdown notes; chad creates with `chad-webui notes
+  create`. Lives in the workspace sidebar. Experiment surface for
+  "auto-summary as a note vs as a chat".
+
+### Calendar
+
+OpenWebUI 0.9+ ships a built-in calendar:
+
+- Endpoints at `/api/v1/calendar/*` — full CRUD on calendars and events.
+- Per-user calendars; events bound to the API key holder's user_id
+  (confirmed by reading the router source — no admin override
+  parameter).
+- Used by chad for `[chad-block]` / `[chad-experiment]` /
+  `[operator-sync]` / `[experiment-review]` events.
+- Experiment surface for Category 6 (calendar timing).
+
+### Workspace (models, knowledge, automations, prompts)
+
+- [**Workspace overview**](https://docs.openwebui.com/features/workspace)
+- The admin-managed model registry, plus the workspace-level
+  knowledge / automation / prompt / function management. This is
+  the surface for **admin-shared** artifacts (Categories 3 + 4 from
+  the chad-experiment skill).
+
+### Permissions, access control, sharing
+
+- [**Permissions overview**](https://docs.openwebui.com/features/permissions)
+- [Users + Groups](https://docs.openwebui.com/getting-started/quick-start/community#users--groups) — for tjcooke-visible artifacts without his key, add him to a group and grant the group access
+- `BYPASS_MODEL_ACCESS_CONTROL=True` (current config) — every signed-in user sees every model regardless of `access_control`. This is on for chad's deployment.
+
+## Reading list by chad-experiment category
+
+When chad picks a category from the experiment skill, the right
+upstream docs to consult are:
+
+| Category | OpenWebUI docs to consult |
+|---|---|
+| **1 — Prompt optimization** | Automations · Functions (filter/pipe) · Models (system prompt + params) |
+| **2 — Workflow optimization** | Automations + RRULE conventions · Functions (action type for one-click follow-ups) · Notes · Calendar |
+| **3 — Tool spec / function deployment** | Functions (3 types) · Tools · MCP · OpenAPI tool servers · Pipelines |
+| **4 — Knowledge curation** | RAG / Knowledge · Web search (for live grounding) · Permissions (sharing collections without per-user keys) |
+| **5 — Memory tuning** | Memory · Permissions (per-user only — no cross-operator) |
+| **6 — Calendar timing** | Calendar · Automations (RRULE format) |
+| **7 — Drift detection** | API endpoints · Workspace (model registry) · GitHub releases (track upstream changes) |
+
+## Community resources (inspiration for experiment designs)
+
+- [openwebui.com/functions](https://openwebui.com/functions) — installable function catalog (filters, pipes, actions)
+- [openwebui.com/tools](https://openwebui.com/tools) — installable tools
+- [openwebui.com/prompts](https://openwebui.com/prompts) — installable prompts
+- [openwebui.com/models](https://openwebui.com/models) — model presets (params + system prompts to A/B test against)
+
+When chad designs a Category 1 (prompt opt) experiment, the prompts
+catalog is a sanity check: if someone in the community has already
+A/B'd this pattern, the docs there often summarize what won.
+
+## Cross-experiment design references
+
+- [Access control matrix](https://docs.openwebui.com/features/permissions/) — which artifacts can be shared without per-user keys (knowledge, functions, tools, models, channels) vs. which cannot (automations, notes, calendar, memories)
+- [OpenAPI server architecture](https://docs.openwebui.com/openapi-servers) — when building a Category 3 tool, chad should consider whether to ship as a native function (in-Python) or an external OpenAPI server
+- [Connection providers](https://docs.openwebui.com/getting-started/quick-start/integrations) — the model dropdown's backend configs; Category 1.3 (system-prompt experiments on custom model rows) uses this layer
 
 ## Local docs (in this repo)
 
 - `docs/operations/openwebui.md` — host-side deployment guide
 - `docs/operations/chad-devflow.md` — full chad-* wrapper catalog
 - `docs/operations/wrapper-bugs.md` — tracked bugs + shim workarounds
+- `docs/operations/chad-experiments.md` — operator's-eye view of the experiment lifecycle
+- The sibling **chad-experiment** skill at `/sandbox/.openclaw-data/skills/chad-experiment/SKILL.md` — methodology + the 7 experiment categories
+
+[owui-functions]: https://docs.openwebui.com/features/plugin/functions/
+[owui-tools]: https://docs.openwebui.com/features/plugin/tools/
 
 ## Source
 
