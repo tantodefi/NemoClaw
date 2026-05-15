@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-tunnel-watchdog — Mac-side liveness probe for the chad-shim SSH tunnel.
+#
+# Background: dev.nemoclaw.chad-tunnel is an SSH -L tunnel from Mac:8901 to
+# the chad sandbox's port 8901 (chad-shim). Under normal failure modes
+# (process crash, network drop) the plist's ServerAliveInterval=30 +
+# ServerAliveCountMax=3 + KeepAlive cycles it within ~90 s. But the
+# openshell ssh-proxy occasionally goes "half-open": the outer SSH session
+# still answers ServerAlive packets, so SSH keeps the listener bound on
+# 127.0.0.1:8901, but the multiplexed channel underneath is dead and new
+# connections get "Recv failure: Connection reset by peer". ssh doesn't
+# notice; the user sees "chad model not found" in open-webui.
+#
+# This watchdog probes the actual functional endpoint (HTTP /healthz via the
+# tunnel) every minute. Two consecutive failures → `launchctl kickstart -k`
+# the tunnel job, which tears down the wedged ssh and restarts it cleanly.
+#
+# Run via dev.nemoclaw.chad-tunnel-watchdog.plist (StartInterval=60).
+# Manual smoke test: `bash chad-tunnel-watchdog` then check
+# /tmp/chad-tunnel-watchdog.log.
+
+set -uo pipefail
+
+TUNNEL_LABEL="${CHAD_TUNNEL_LABEL:-dev.nemoclaw.chad-tunnel}"
+PROBE_URL="${CHAD_TUNNEL_PROBE_URL:-http://127.0.0.1:8901/healthz}"
+PROBE_TIMEOUT_SECS="${CHAD_TUNNEL_PROBE_TIMEOUT:-4}"
+FAILURE_THRESHOLD="${CHAD_TUNNEL_FAILURE_THRESHOLD:-2}"
+
+STATE_DIR="${TMPDIR:-/tmp}"
+COUNT_FILE="${STATE_DIR}/chad-tunnel-watchdog.fails"
+LOG_FILE="${CHAD_TUNNEL_WATCHDOG_LOG:-/tmp/chad-tunnel-watchdog.log}"
+
+log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG_FILE"
+}
+
+probe() {
+  # Return 0 if /healthz returns 200, 1 otherwise. Curl exit codes for
+  # connection errors (CONNREFUSED, RST) are non-zero, in which case the
+  # -w code is "000" — also a failure.
+  local code
+  code="$(curl -sS --max-time "$PROBE_TIMEOUT_SECS" -o /dev/null \
+    -w '%{http_code}' "$PROBE_URL" 2>/dev/null || echo "000")"
+  [ "$code" = "200" ]
+}
+
+if probe; then
+  if [ -f "$COUNT_FILE" ]; then
+    log "recovered (probe ok); clearing fail count"
+    rm -f "$COUNT_FILE"
+  fi
+  exit 0
+fi
+
+count=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+count=$((count + 1))
+printf '%s' "$count" >"$COUNT_FILE"
+log "probe failed (consecutive=$count, url=$PROBE_URL)"
+
+if [ "$count" -ge "$FAILURE_THRESHOLD" ]; then
+  # Kick the tunnel. The -k flag tears it down first if it's already running
+  # (which it usually is — wedged), then launchd brings it back up under the
+  # plist's KeepAlive.
+  uid="$(id -u)"
+  log "threshold reached ($count >= $FAILURE_THRESHOLD); kicking $TUNNEL_LABEL"
+  if launchctl kickstart -k "gui/${uid}/${TUNNEL_LABEL}" >>"$LOG_FILE" 2>&1; then
+    log "kickstart issued"
+  else
+    log "kickstart FAILED (rc=$?)"
+  fi
+  # Reset the count regardless — next tick will reprobe and confirm recovery.
+  rm -f "$COUNT_FILE"
+  # Brief settle wait. Launchd takes ~1-2 s to spawn a new ssh, plus
+  # ServerAliveInterval timing.
+  sleep 5
+  if probe; then
+    log "post-kick probe ok"
+  else
+    log "post-kick probe still failing — needs human attention"
+  fi
+fi
