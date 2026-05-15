@@ -389,7 +389,7 @@ def cmd_automations_create(args):
         "name": args.name,
         "data": {
             "prompt": args.prompt,
-            "model": args.model or "chad",
+            "model_id": args.model or "chad",
             "rrule": args.rrule,
         },
         "is_active": not args.inactive,
@@ -405,7 +405,7 @@ def cmd_automations_update(args):
     if args.prompt:
         data["prompt"] = args.prompt
     if args.model:
-        data["model"] = args.model
+        data["model_id"] = args.model
     if args.rrule:
         data["rrule"] = args.rrule
     if data:
