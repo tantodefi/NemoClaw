@@ -254,6 +254,216 @@ chad-experiment ab-pick --id <any-pair-id> --winner B
 Each variant counts toward the operator's budget (so ab-start needs
 2 free slots).
 
+## Experiment categories — what to optimize, with concrete patterns
+
+This section is Chad's reference catalog of experiment types. Each
+pattern includes a hypothesis template, success metric, and concrete
+chad-experiment commands. **Use these as starting points** — adapt
+the specifics to the operator's observed behavior.
+
+### Category 1: Prompt optimization (A/B test prompts on existing artifacts)
+
+When to use: an automation, function, or tool is firing but the
+operator engages with the output less than expected. A/B test the
+prompt to find what lands.
+
+**Pattern 1.1 — Tone A/B on a daily-brief automation**
+```
+chad-experiment ab-start \
+  --hypothesis "Terse 3-bullet prompts outperform warm-prose prompts for early-morning briefs" \
+  --type automation \
+  --success-metric "Operator opens the resulting chat within 2h (chat.updated_at - automation.last_fire < 2h) AND replies or scrolls past first 200 chars" \
+  --baseline "current 60% open-within-2h rate per webui__chats_search filtered to current automation's outputs over 30d" \
+  --surface-cmd "automations create" \
+  --surface-args-a '{"name":"daily-brief A terse","prompt":"3 bullets. Each <15 words. No prose.","rrule":"FREQ=DAILY;BYHOUR=7"}' \
+  --surface-args-b '{"name":"daily-brief B warm","prompt":"Good morning! Heres your daily picture in plain prose.","rrule":"FREQ=DAILY;BYHOUR=7"}'
+```
+
+**Pattern 1.2 — Instruction-grounding test on a function**
+Two versions of a filter function: one with explicit instructions
+inline, one that calls a knowledge collection for grounding. Compare
+output quality on the same chat inputs.
+
+**Pattern 1.3 — System-prompt experiment on a custom model row**
+```
+# Create a model with custom params (admin only)
+chad-webui models create \
+  --id chad-terse-experiment \
+  --base-model-id chad \
+  --name "Chad - terse variant (experiment)" \
+  --params '{"system":"Be very terse. Single sentences. No emojis. No follow-up questions unless critical."}'
+
+# Design + start the experiment
+chad-experiment design \
+  --hypothesis "A terser system prompt reduces operator time-on-reply without reducing reply-rate" \
+  --type model \
+  --success-metric "Operator replies to chad-terse-experiment chats at >=90% the rate of chad chats over 14d, with median operator-message length <=80% of baseline"
+
+# (no `start` needed — model row already exists; just observe usage)
+```
+
+### Category 2: Workflow optimization (multi-step automations)
+
+When to use: a manual operator workflow exists across multiple
+surfaces (read email → draft response → schedule follow-up). Compress
+into a single automation, measure time saved.
+
+**Pattern 2.1 — Pre-research automation**
+Operator regularly searches before drafting content. Automation
+pre-fetches search results into a daily knowledge brief.
+```
+chad-experiment design \
+  --hypothesis "Pre-research at Mon 6am saves operator ~20min of drafting search before content writing" \
+  --type automation \
+  --success-metric "On Monday content-writing chats, time from chat-start to first published note <=80% of baseline (measured by chat duration in webui__chats_get)" \
+  --baseline "Operator's recent 4 Mondays show 22min median from chat-open to first note save"
+```
+
+**Pattern 2.2 — Calendar-aware automation**
+Automation that fires only on days the operator has training (per
+their calendar) and skips on rest days.
+```
+chad-experiment design \
+  --hypothesis "Training-day-only fitness reminders feel less spammy and get more compliance than daily reminders" \
+  --type automation \
+  --success-metric "Operator replies 'yes done' or equivalent on >=80% of training-day fires AND mutes <=1 weekly notification" \
+  --baseline "Currently no automated reminders; operator self-reports skipping ~30% of planned sessions"
+```
+
+**Pattern 2.3 — Folder-organized workflow**
+Auto-organize the operator's chats by topic into folders, see if
+search/retrieval improves. Measured by chat-find latency on a
+follow-up question.
+
+### Category 3: Tool spec / function deployment
+
+When to use: a new MCP tool or Python function might add value but
+needs validation before global rollout. Self-scope toggle, observe
+in real chats, then promote or retire.
+
+**Pattern 3.1 — Tool addition A/B**
+Two filter functions, one of which adds context about operator's
+recent calendar; compare model's contextual awareness in outputs.
+```
+chad-experiment ab-start \
+  --hypothesis "Adding calendar-context as a pipe filter reduces operator's need to remind chad about meetings/conflicts" \
+  --type function \
+  --success-metric "Across 7d, operator messages mentioning 'remind me' or 'I have a meeting' drop by >=30%" \
+  --surface-cmd "functions create" \
+  --surface-args-a '{"id":"ctx_cal","name":"Calendar context (A)","type":"filter","content":"<python with cal lookup>"}' \
+  --surface-args-b '{"id":"ctx_no","name":"No calendar context (B)","type":"filter","content":"<pass-through>"}'
+```
+
+### Category 4: Knowledge curation
+
+When to use: chat history shows the operator asking about a topic
+the model hallucinates on. Build a knowledge collection, measure
+hallucination reduction.
+
+**Pattern 4.1 — Topical RAG collection**
+```
+chad-experiment design \
+  --hypothesis "A topical knowledge collection on Strength Training fundamentals will reduce hallucinated technique advice when tjcooke asks programming questions" \
+  --type knowledge \
+  --success-metric "On 5 follow-up training questions over 7d, no operator-flagged corrections AND citations from knowledge file in >=3 responses"
+```
+After design, use `chad-webui knowledge create` then `chad-webui files
+upload` then `chad-webui knowledge add-file` to populate the
+collection. The next chat turn from the operator will RAG against it.
+
+### Category 5: Memory tuning
+
+When to use: operator-specific preferences are not being surfaced
+reliably. Create or update memories to test what context the model
+adapts to.
+
+**Pattern 5.1 — Preference capture experiment**
+```
+chad-experiment design \
+  --hypothesis "Surfacing the operator's stated lift order preference as a memory makes the model match it without re-prompting" \
+  --type memory \
+  --success-metric "In next 5 lift-order discussions, model proposes operator's preferred order 4+ times without operator correcting"
+```
+
+### Category 6: Calendar timing optimization
+
+When to use: an automation is firing but at a bad time. Test alternate
+fire times.
+
+**Pattern 6.1 — Fire-time A/B**
+```
+chad-experiment ab-start \
+  --hypothesis "07:00 fire time outperforms 08:00 for operator engagement with the morning summary" \
+  --type automation \
+  --success-metric "Chat open within 1h of fire" \
+  --surface-cmd "automations create" \
+  --surface-args-a '{"name":"summary @ 0700","prompt":"<same>","rrule":"FREQ=DAILY;BYHOUR=7"}' \
+  --surface-args-b '{"name":"summary @ 0800","prompt":"<same>","rrule":"FREQ=DAILY;BYHOUR=8"}'
+```
+
+### Category 7: Drift detection (negative-result experiments)
+
+Sometimes the worthwhile experiment is "does this CHANGE help" rather
+than "what new thing should we build". Detect drift in an existing
+automation's output quality after an upstream change (new model
+version, new prompt, new function).
+
+**Pattern 7.1 — Pre/post change monitoring**
+Design an experiment WITHOUT starting a new artifact — observe an
+existing one before vs after a change.
+```
+chad-experiment design \
+  --hypothesis "Upgrading openwebui model dropdown to include the new gpt-oss model improves variance in answers (more model diversity used)" \
+  --type chad-cron \
+  --success-metric "Over 7d post-change, operator uses >=3 different models per week vs <=2 in baseline"
+```
+
+## Pattern-selection guide for the nightly loop
+
+When chad scans memory and finds candidates, he applies this
+decision tree:
+
+```
+operator says "I always do X" / "remind me to Y"
+    → Category 1 (prompt opt) if it's about model behavior
+    → Category 2 (workflow opt) if it's a multi-step process
+    → Category 4 (knowledge) if it's research/grounding
+
+operator references a specific tool / function gap
+    → Category 3 (tool spec)
+
+operator mentions schedule / timing complaints
+    → Category 6 (calendar timing)
+
+operator's chats show repeated correction of model output
+    → Category 1 (prompt opt) on the artifact producing the output
+    → Category 4 (knowledge) if hallucination-driven
+    → Category 5 (memory) if preference-driven
+
+an automation is firing but operator never engages
+    → Category 1 + 6 (prompt + timing A/B)
+
+a recent upstream change might have shifted behavior
+    → Category 7 (drift detection)
+```
+
+## Operator-specific patterns
+
+**tantodefi** (developer, admin role):
+- Most-likely categories: 1 (prompt opt for daily briefs / chad
+  responses), 3 (tool spec for new dev workflows), 7 (drift detection
+  on model changes)
+- Failure mode to watch: pushing through too many experiments at once;
+  honor the budget cap
+
+**tjcooke** (personal trainer, user role):
+- Most-likely categories: 2 (workflow opt for content drafting,
+  client coordination), 4 (knowledge curation around training
+  protocols), 6 (calendar timing for client touchpoints)
+- Failure mode to watch: cross-operator dependencies (creating
+  events that need tantodefi's input) — propose [operator-sync]
+  instead of unilateral writes
+
 ## Calendar conventions
 
 Chad uses tagged calendar events to coordinate **between operators**
