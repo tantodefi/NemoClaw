@@ -274,8 +274,51 @@ class Handler(BaseHTTPRequestHandler):
         op = self._operator_context()
         self._log_request(op, body)
 
+        # Structured request-tracker — every POST gets one JSONL line on
+        # completion regardless of success/failure. This is what we use to
+        # debug "why are automation chats empty?" without having to grep
+        # multiple log streams. Persists to /tmp/chad-shim-requests.jsonl;
+        # rotates at ~10MB.
+        req_start = time.time()
+        req_id = uuid.uuid4().hex[:12]
+        request_model = body.get("model") or "?"
+        request_chars = sum(len(m.get("content") or "") for m in (body.get("messages") or []) if isinstance(m, dict))
+        request_stream = bool(body.get("stream"))
+
+        def _emit_trace(*, status, reply_chars, error=None, openclaw_ms=None):
+            """One JSONL line per POST. Captures everything we'd want to know
+            when investigating an empty-reply / connection-error incident."""
+            try:
+                entry = {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "req_id": req_id,
+                    "operator": op.get("slug") or "anon",
+                    "operator_role": op.get("role") or "",
+                    "chat_id": op.get("chat_id") or "",
+                    "model_requested": request_model,
+                    "request_chars": request_chars,
+                    "stream": request_stream,
+                    "duration_ms": int((time.time() - req_start) * 1000),
+                    "openclaw_ms": openclaw_ms,
+                    "status": status,                      # ok | timeout | empty_reply | error | binary_missing
+                    "reply_chars": reply_chars,
+                    "error": (error or "")[:200],
+                }
+                trace_path = "/tmp/chad-shim-requests.jsonl"
+                # Naive rotation: when file exceeds 10MB, move to .1 and start fresh.
+                try:
+                    if os.path.getsize(trace_path) > 10 * 1024 * 1024:
+                        os.replace(trace_path, trace_path + ".1")
+                except OSError:
+                    pass
+                with open(trace_path, "a") as fh:
+                    fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            except Exception as e:
+                sys.stderr.write(f"[chad-shim] trace emit failed: {e}\n")
+
         message = last_user_text(body)
         if not message:
+            _emit_trace(status="error", reply_chars=0, error="no user message")
             self._send_json(400, {"error": {"message": "no user message in body"}})
             return
 
@@ -291,14 +334,33 @@ class Handler(BaseHTTPRequestHandler):
         else:
             session_id = fallback_session_id(body)
 
+        oc_start = time.time()
         try:
             reply = run_openclaw(session_id, final_message, op=op)
         except subprocess.TimeoutExpired:
+            _emit_trace(status="timeout", reply_chars=0,
+                       openclaw_ms=int((time.time() - oc_start) * 1000),
+                       error="openclaw subprocess.TimeoutExpired")
             self._send_json(504, {"error": {"message": "openclaw timed out"}})
             return
         except FileNotFoundError:
+            _emit_trace(status="binary_missing", reply_chars=0,
+                       openclaw_ms=int((time.time() - oc_start) * 1000),
+                       error=f"openclaw bin not found: {OPENCLAW_BIN}")
             self._send_json(500, {"error": {"message": f"openclaw binary not found ({OPENCLAW_BIN})"}})
             return
+        oc_ms = int((time.time() - oc_start) * 1000)
+
+        # Classify the reply for trace status. reply that looks like
+        # "[chad-shim] ..." is one of our internal error strings.
+        if reply.startswith("[chad-shim]"):
+            trace_status = "empty_reply" if "empty reply" in reply else "error"
+        elif not reply.strip():
+            trace_status = "empty_reply"
+        else:
+            trace_status = "ok"
+        _emit_trace(status=trace_status, reply_chars=len(reply), openclaw_ms=oc_ms,
+                   error=reply[:200] if trace_status != "ok" else None)
 
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         now = int(time.time())
