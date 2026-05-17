@@ -40,22 +40,49 @@ trim_log() {
   fi
 }
 
-# Probe — cheap: just hit /v1/models on the tunnel. Tunnel pid is supervised by
-# chad-tunnel.plist; if the tunnel is wedged, kicking the shim won't fix it.
-# Empty reply / non-2xx / curl error → shim is down.
+# Probe 1 — cheap: hit /v1/models via the host-side tunnel.
+# Successful response = shim alive AND tunnel healthy. Silent exit.
 if curl -fsS -m 5 "http://127.0.0.1:${SHIM_PORT}/v1/models" >/dev/null 2>&1; then
   trim_log
   exit 0
 fi
 
+# Tunnel probe failed. Before assuming the shim is down (and tearing down
+# its potentially-healthy state), verify via direct SSH whether the shim
+# process is actually alive on the pod. The chad-tunnel half-open issue
+# (memory: feedback_chad_tunnel_halfopen) makes this routine — between
+# 2026-05-15 and 2026-05-16, the prior version of this watchdog killed +
+# restarted a healthy shim 10+ times in 24h because the tunnel was wedged.
+SHIM_ALIVE=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" \
+  "pgrep -fc 'chad-shim.py' 2>/dev/null || echo 0")
+SHIM_ALIVE="${SHIM_ALIVE:-0}"
+
+if [ "$SHIM_ALIVE" -ge 1 ]; then
+  # Shim process is alive on pod — the failure is reaching it via tunnel.
+  # Kick the tunnel and re-probe. If reachable after the kick, no restart
+  # needed; this is the tunnel-wedged path, not the shim-dead path.
+  log "shim alive on pod (count=${SHIM_ALIVE}); tunnel probe failed — kicking tunnel"
+  launchctl kickstart -k "gui/$(id -u)/dev.nemoclaw.chad-tunnel" >> "$LOG" 2>&1 || true
+  sleep 5
+  if curl -fsS -m 5 "http://127.0.0.1:${SHIM_PORT}/v1/models" >/dev/null 2>&1; then
+    log "shim reachable after tunnel kick — no restart needed"
+
+    # Emit a structured event so chad sees the recovery in the inbox.
+    INBOX_LINE=$(printf '{"ts":"%s","source":"chad-shim-watchdog","kind":"tunnel-kicked","severity":"info","note":"shim alive, tunnel was wedged, kickstart restored reachability"}' "$(ts)")
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" \
+      "mkdir -p \$(dirname '${INBOX}'); echo '${INBOX_LINE}' >> '${INBOX}'" >> "$LOG" 2>&1 || true
+
+    trim_log
+    exit 0
+  fi
+  log "shim alive on pod but still unreachable after tunnel kick — falling through to restart"
+fi
+
 log "shim not responding on :${SHIM_PORT} — checking pod state"
 
-# Check whether the process is alive on the pod side. If alive but unresponsive,
-# kill it first to avoid two competing instances on the same port.
-RUNNING=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" \
-  "pgrep -fc 'chad-shim.py' || true")
-RUNNING="${RUNNING:-0}"
-
+# Real restart path. If alive but truly unresponsive (or zero processes),
+# kill any stragglers + relaunch.
+RUNNING="$SHIM_ALIVE"
 if [ "$RUNNING" -gt 0 ]; then
   log "found ${RUNNING} chad-shim process(es) on pod — killing before relaunch"
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" \
