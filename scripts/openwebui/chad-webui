@@ -398,18 +398,25 @@ def cmd_automations_create(args):
 
 
 def cmd_automations_update(args):
-    body = {}
-    if args.name:
-        body["name"] = args.name
-    data = {}
-    if args.prompt:
-        data["prompt"] = args.prompt
-    if args.model:
-        data["model_id"] = args.model
-    if args.rrule:
-        data["rrule"] = args.rrule
-    if data:
-        body["data"] = data
+    """OpenWebUI's /automations/{id}/update endpoint requires the FULL body
+    (name + data.prompt + data.model_id + data.rrule) even when patching a
+    single field — partial bodies return HTTP 422. Fetch the current state
+    first, merge user-supplied changes, then send the full body."""
+    current = _http("GET", f"/automations/{args.automation_id}")
+    if not isinstance(current, dict):
+        sys.stderr.write(f"chad-webui: could not fetch current automation {args.automation_id}\n")
+        sys.exit(1)
+    body = {
+        "name": args.name if args.name else current.get("name", ""),
+        "data": dict(current.get("data") or {}),
+        "is_active": current.get("is_active", True),
+    }
+    if args.prompt is not None:
+        body["data"]["prompt"] = args.prompt
+    if args.model is not None:
+        body["data"]["model_id"] = args.model
+    if args.rrule is not None:
+        body["data"]["rrule"] = args.rrule
     if args.inactive is not None:
         body["is_active"] = not args.inactive
     _print(_http("POST", f"/automations/{args.automation_id}/update", body=body))
