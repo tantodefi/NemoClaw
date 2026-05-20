@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-deploy-manifest.txt — Canonical source→destination map for Chad's
+# pod. Read by scripts/chad-deploy.sh. Single source of truth so adding a
+# new wrapper means adding one line here (not editing chad-setup.sh).
+#
+# Format (whitespace-separated; '#' for comments; blank lines ignored):
+#   <src_rel_path>  <dst_path>  <mode>  <via>
+#
+# Fields:
+#   src_rel_path  Path under the repo root (REPO_ROOT/<src_rel_path>).
+#   dst_path      Absolute path inside the chad pod.
+#   mode          chmod after install (octal, e.g. 755 / 644).
+#   via           kubectl   → root-owned dest (/usr/local/**), kubectl exec.
+#                 ssh       → sandbox-owned dest (/sandbox/**), plain ssh.
+#
+# Conventions:
+#   • /usr/local/bin/        — chad-setup.sh-managed system tools. Root.
+#   • /usr/local/share/chad/ — read-only data files (registry, profiles, paths). Root.
+#   • /sandbox/.openclaw-data/bin/ — sandbox-writable tools (chad-webui,
+#                                    chad-experiment, chad-shim runtime patch).
+#                                    Chad can self-edit these.
+#
+# Adding a new entry: pick the correct dst convention above, set mode to
+# 755 for executables / 644 for data. Run `chad-deploy.sh --verify` to
+# confirm md5 matches; `--push` to install.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# CRON WRAPPERS — /usr/local/bin/ (system, root, kubectl)
+# ─────────────────────────────────────────────────────────────────────────
+scripts/chad-cron-wrappers/chad-action-gate          /usr/local/bin/chad-action-gate         755 kubectl
+scripts/chad-cron-wrappers/chad-auth-context         /usr/local/bin/chad-auth-context        755 kubectl
+scripts/chad-cron-wrappers/chad-autosend-replies     /usr/local/bin/chad-autosend-replies    755 kubectl
+scripts/chad-cron-wrappers/chad-budget-audit         /usr/local/bin/chad-budget-audit        755 kubectl
+scripts/chad-cron-wrappers/chad-cron-reload          /usr/local/bin/chad-cron-reload         755 kubectl
+scripts/chad-cron-wrappers/chad-drafter              /usr/local/bin/chad-drafter             755 kubectl
+scripts/chad-cron-wrappers/chad-dump-logs            /usr/local/bin/chad-dump-logs           755 kubectl
+scripts/chad-cron-wrappers/chad-email-check-cron     /usr/local/bin/chad-email-check-cron    755 kubectl
+scripts/chad-cron-wrappers/chad-ensure-today-memory  /usr/local/bin/chad-ensure-today-memory 755 kubectl
+scripts/chad-cron-wrappers/chad-gbrain-dream         /usr/local/bin/chad-gbrain-dream        755 kubectl
+scripts/chad-cron-wrappers/chad-gbrain-prune         /usr/local/bin/chad-gbrain-prune        755 kubectl
+scripts/chad-cron-wrappers/chad-issue-triage-cron    /usr/local/bin/chad-issue-triage-cron   755 kubectl
+scripts/chad-cron-wrappers/chad-log-event            /usr/local/bin/chad-log-event           755 kubectl
+scripts/chad-cron-wrappers/chad-mail-check           /usr/local/bin/chad-mail-check          755 kubectl
+scripts/chad-cron-wrappers/chad-mail-send            /usr/local/bin/chad-mail-send           755 kubectl
+scripts/chad-cron-wrappers/chad-memory-curator       /usr/local/bin/chad-memory-curator      755 kubectl
+scripts/chad-cron-wrappers/chad-memory-snapshot      /usr/local/bin/chad-memory-snapshot     755 kubectl
+scripts/chad-cron-wrappers/chad-premium              /usr/local/bin/chad-premium             755 kubectl
+scripts/chad-cron-wrappers/chad-premium-client       /usr/local/bin/chad-premium-client      755 kubectl
+scripts/chad-cron-wrappers/chad-proposal-apply       /usr/local/bin/chad-proposal-apply      755 kubectl
+scripts/chad-cron-wrappers/chad-route-prompt         /usr/local/bin/chad-route-prompt        755 kubectl
+scripts/chad-cron-wrappers/chad-self-improve         /usr/local/bin/chad-self-improve        755 kubectl
+scripts/chad-cron-wrappers/chad-skill-watch          /usr/local/bin/chad-skill-watch         755 kubectl
+scripts/chad-cron-wrappers/chad-workflow-batch       /usr/local/bin/chad-workflow-batch      755 kubectl
+scripts/chad-cron-wrappers/chad-workspace-backup     /usr/local/bin/chad-workspace-backup    755 kubectl
+scripts/chad-github-worker/chad-dispatch             /usr/local/bin/chad-dispatch            755 kubectl
+
+# ─────────────────────────────────────────────────────────────────────────
+# OPENWEBUI / SANDBOX TOOLS — /sandbox/.openclaw-data/bin/ (sandbox, ssh)
+# Chad can self-edit these. Backups in chad-state preserve them.
+# ─────────────────────────────────────────────────────────────────────────
+scripts/openwebui/chad-experiment       /sandbox/.openclaw-data/bin/chad-experiment   755 ssh
+scripts/openwebui/chad-webui            /sandbox/.openclaw-data/bin/chad-webui        755 ssh
+scripts/openwebui/chad-webui-mcp        /sandbox/.openclaw-data/bin/chad-webui-mcp    755 ssh
+scripts/openwebui/chad-inbox            /sandbox/.openclaw-data/bin/chad-inbox        755 ssh
+scripts/chad-cron-wrappers/chad-spawn-poll  /sandbox/.openclaw-data/bin/chad-spawn-poll  755 ssh
+scripts/chad-cron-wrappers/chad-spawn-gc    /sandbox/.openclaw-data/bin/chad-spawn-gc    755 ssh
+
+# chad-shim.py is intentionally installed in BOTH locations:
+#   /usr/local/bin/chad-shim.py            — system install via chad-setup.sh
+#   /sandbox/.openclaw-data/bin/chad-shim.py — runtime-patched copy that the
+#       chad-shim-watchdog actually starts/restarts. Keeping both in sync
+#       with the same source avoids a divergence we'd otherwise have to debug.
+scripts/openwebui/chad-shim.py          /usr/local/bin/chad-shim.py                   755 kubectl
+scripts/openwebui/chad-shim.py          /sandbox/.openclaw-data/bin/chad-shim.py      755 ssh
+
+# ─────────────────────────────────────────────────────────────────────────
+# DATA FILES — /usr/local/share/chad/ (read-only, root, kubectl)
+# ─────────────────────────────────────────────────────────────────────────
+scripts/task-profiles.json                          /usr/local/share/chad/task-profiles.json            644 kubectl
+scripts/model-registry.json                         /usr/local/share/chad/model-registry.json           644 kubectl
+scripts/chad-workspace-files.txt                    /usr/local/share/chad/chad-workspace-files.txt      644 kubectl
+scripts/chad-cron-wrappers/_chad-paths.sh           /usr/local/share/chad/_chad-paths.sh                644 kubectl
+scripts/chad-cron-wrappers/auto-actions.template.json /usr/local/share/chad/auto-actions.template.json  644 kubectl
