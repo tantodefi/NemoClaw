@@ -141,7 +141,12 @@ fi
 # posting)" and the existing detached chad-issue-triage continues to do
 # its full researcher/coder work. Failures are non-fatal.
 DRAFT_COUNT=0
-DRAFTER_STATUS="not-configured"
+# Default reflects the dominant case: drafter only runs when
+# PARK_ISSUE_COUNT > 0. "not-invoked" is truthful when no parked issues
+# arrived this sweep — "not-configured" used to be the default but
+# misled an audit on 2026-05-17. See chad-email-check-cron for the
+# same fix applied there.
+DRAFTER_STATUS="not-invoked"
 if [ "$PARK_ISSUE_COUNT" -gt 0 ]; then
   DRAFTER_CFG="$(python3 - <<PY
 import json, os
