@@ -987,12 +987,15 @@ if [ "$skip_crons" -eq 0 ]; then
   fi
 
   # Daily proposal-applier: closes the autonomy loop on cron telemetry
-  # by applying the safe-list of structured proposals (timeoutSeconds /
-  # maxOutputTokens within ±2× bounds, last-run ok). Anything riskier
-  # stays draft-only. Gated by chad-action-gate. Runs daily 04:30 UTC,
-  # right after the Mon 04:00 budget audit and 90m ahead of the 06:00
-  # email-check window.
-  proposal_apply_message='Run `chad-proposal-apply`. The wrapper reads the latest structured `### Proposals (machine-readable)` block from feedback-proposals.md, validates each entry against the safe-list, applies via `openclaw cron edit`, and appends an `## Applied` block. Confirm it printed `chad-proposal-apply: applied=N skipped=M`, then exit.'
+  # by applying the safe-list of structured proposals. v2: per-kind
+  # handlers (cron_edit default, memory) with absolute caps
+  # (timeoutSeconds ≤ 7200, maxOutputTokens ≤ 32768) replacing the old
+  # ±2× bound; entries failing the gate or exceeding caps route to a
+  # ## Pending operator review block instead of being silently dropped.
+  # ## Applied + ## Pending blocks older than 30 days are pruned.
+  # Runs daily 04:30 UTC, right after the Mon 04:00 budget audit and
+  # 90m ahead of the 06:00 email-check window.
+  proposal_apply_message='Run `chad-proposal-apply`. The wrapper reads the latest structured `### Proposals (machine-readable)` block from feedback-proposals.md, validates each entry per-kind, applies the auto-eligible ones, routes the rest to operator review. Confirm it printed `chad-proposal-apply: applied=N skipped=M pending=K`, then exit.'
 
   if echo "$existing_crons" | grep -q "chad-proposal-apply"; then
     warn "chad-proposal-apply cron already registered — skipping"

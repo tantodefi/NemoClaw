@@ -96,7 +96,7 @@
       "thinking": "off",
       "minBudgetTokens": 5000,
       "schedule": "30 4 * * *",
-      "reason": "Daily 04:30 UTC — closes the autonomy loop on cron telemetry. Reads the latest structured proposals JSON block from feedback-proposals.md, validates each entry against the safe-list (timeoutSeconds | maxOutputTokens, ±2× bound, last-run ok, gated by chad-action-gate chad_self_modify_cron), applies via `openclaw cron edit`, and appends an `## Applied` block. Anything riskier stays draft-only. Pure shell+python work, no LLM call inside the wrapper — agent only confirms the printed summary. Inherits model from registry default."
+      "reason": "Daily 04:30 UTC — closes the autonomy loop on cron telemetry. v2: per-kind handlers (cron_edit, memory) with absolute caps (timeoutSeconds ≤ 7200, maxOutputTokens ≤ 32768) replacing the old ±2× bound that blocked evidence-based proposals. Entries failing chad-action-gate (decision=draft) route to ## Pending operator review instead of silent skip. ## Applied + ## Pending blocks older than 30 days are pruned. Pure shell+python work, no LLM call inside the wrapper — agent only confirms the printed summary including pending=N. Inherits model from registry default."
     },
 
     "chad-skill-watch": {

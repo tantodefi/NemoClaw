@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# chad-self-improve.sh — Weekly self-improvement loop.
+# chad-self-improve — Weekly self-improvement loop.
 #
 # Scans recent signal (failed sub-agent spawns, feedback memory entries,
 # budget exhaustion events, bug reports filed by chad-report-bug) and

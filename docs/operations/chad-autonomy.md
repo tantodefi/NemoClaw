@@ -50,7 +50,7 @@ extension. The autonomy loops are no longer one-way:
 
 | Loop | Closing wrapper | Trigger | What it does |
 |---|---|---|---|
-| Loop 1 / 3 | **`chad-proposal-apply`** | daily 04:30 UTC cron | Reads the latest `### Proposals (machine-readable)` JSON block from `feedback-proposals.md`, validates each entry against the safe-list (field ∈ `{timeoutSeconds, maxOutputTokens}`, `±2×` bounded multiplier, last-run ok, gated by `chad-action-gate chad_self_modify_cron`), applies via `openclaw cron edit`, and appends an `## Applied — <ts>` block. Anything riskier (new kind manifest, schedule change, code edit) stays draft-only. |
+| Loop 1 / 3 | **`chad-proposal-apply`** | daily 04:30 UTC cron | Reads the latest `### Proposals (machine-readable)` JSON block from `feedback-proposals.md`. Per-`kind` handlers: `cron_edit` (default) applies via `openclaw cron edit` if (field ∈ `{timeoutSeconds, maxOutputTokens}`, value ≤ absolute cap `7200`/`32768`, change ≥ 1.1×, last run ok, `chad-action-gate chad_self_modify_cron` returns `auto`); `memory` appends content via `chad_self_modify_memory` (auto by default); `automation`/`note`/`calendar_event` are recognised but parked for v3. Entries failing the gate (decision=`draft`) or above the cap route to a `## Pending operator review` table so they don't disappear. `## Applied` + `## Pending` blocks older than 30 days are pruned. |
 | Loop 1 (signals) | **`chad-self-improve` extension** | weekly Sun 03:00 UTC cron | Now also pulls `openclaw cron runs --limit 50` per registered cron and the last 7 days of `auto-action-log.jsonl` failures, plus a tail of outstanding (unapplied) proposals. The researcher sees infrastructure failures it was previously deaf to. |
 | Loop 4 | **`chad-dream-digest`** (appended to `chad-gbrain-dream`) | nightly 03:30 UTC | After the dream cycle, writes `memory/dream-digest-<date>.md` with new pages since yesterday + `gbrain doctor` tail + stats. If doctor reports `[WARN]`/`[FAIL]`/`[ERROR]`, mirrors them into `memory/feedback_brain_health_<date>.md` so the next self-improve sees them as a recurring rule. |
 | Loop 5 | **`chad-skill-watch`** | daily 09:00 UTC cron | Diffs `openclaw skills list --json` against `/sandbox/.openclaw-data/state/skills-snapshot.json` and surfaces added / removed / description-drifted skills under `## Skill catalog diff` in today's memory. The signal-detector skill picks them up on chad's next reasoning cycle. |
@@ -62,9 +62,11 @@ extension. The autonomy loops are no longer one-way:
   Code changes still round-trip through bug-intake → researcher →
   coder → human PR review.
 - **Bounded knob tweaks.** `chad-proposal-apply` only ever moves
-  `timeoutSeconds`/`maxOutputTokens` within `±2×` the current value,
-  and only on a cron whose last run was `ok`. A failing cron's
-  knobs are off-limits to autonomous repair.
+  `timeoutSeconds`/`maxOutputTokens` for an existing cron, up to
+  absolute caps (`7200` / `32768`) — values above the cap route to
+  operator review instead of being silently rejected. Replaces the
+  earlier `±2×` bound that blocked evidence-based proposals from
+  `chad-budget-audit`.
 - **Per-action gating.** Every applied tweak passes
   `chad-action-gate check chad_self_modify_cron <name>` first; the
   global kill-switch file (`/sandbox/.openclaw/workspace/.auto-disabled`)
@@ -75,6 +77,25 @@ extension. The autonomy loops are no longer one-way:
   `(target, field, new)` within 24h.
 - **Fully audited.** Every apply emits one line to the audit log and
   one row to the `## Applied` table in `feedback-proposals.md`.
+
+## Always finish with text after tool calls
+
+Chad's runtime expectation, enforced via `AGENTS.md` on the chad pod
+(at `/sandbox/.openclaw/workspace/AGENTS.md`): every agent turn must
+end with a text response, even when the substantive work was done via
+tool calls. The pattern breaks when a turn ends with a `read` /
+`exec` / `gbrain_search` / `webui__*` tool call but no closing text —
+the morning-summary automation hit this on 2026-05-17, producing
+empty replies in OpenWebUI chats despite the underlying tools
+succeeding.
+
+Source-of-truth note: `AGENTS.md` is not git-tracked in NemoClaw
+because the canonical copy lives on the (ephemeral) chad pod and gets
+backed up to `CHAD_STATE_REPO` (`tantodefi/chad-state` by default)
+via the `chad-workspace-backup` cron. The "always finish with text"
+rule was added to the pod copy on 2026-05-17. When the next major
+refactor pulls workspace identity files into source (planned), this
+rule moves into the source template.
 
 ## Cross-reference
 

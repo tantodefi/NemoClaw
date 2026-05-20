@@ -197,15 +197,42 @@ the watchdog's PATH order is honored.
 
 ---
 
+## Bug 6 — misleading `DRAFTER_STATUS="not-configured"` default
+
+**Files:** `scripts/chad-cron-wrappers/chad-email-check-cron:347`,
+`scripts/chad-cron-wrappers/chad-issue-triage-cron:144`
+
+```bash
+DRAFTER_STATUS="not-configured"      # ← default, set BEFORE the gate
+if [ "$PARK_COUNT" -gt 0 ]; then     # ← only overwrites status if there's work
+  ...
+fi
+```
+
+When no admin email arrives (or no issue parks), the gate never fires
+and the status string stays at the default. The cron's summary line
+then reads `drafter=not-configured` even though the drafter IS fully
+configured in `task-profiles.json` — it just had nothing to draft.
+Misled an audit on 2026-05-17 into diagnosing a broken email loop
+that was actually healthy.
+
+**Fix (landed):** renamed default to `"not-invoked"` with an
+explanatory comment in both wrappers. Active cases (`drafter=ok
+(drafts=N)`, `drafter=skipped (budget=…)`, `drafter=failed (...)`,
+`drafter=degraded (...)`) are unchanged.
+
+---
+
 ## Summary table
 
-| # | File | Line(s) | Bug class | Shim path |
-|---|------|---------|-----------|-----------|
+| # | File | Line(s) | Bug class | Shim path / fix |
+|---|------|---------|-----------|-----------------|
 | 1 | `chad-budget` | 43 | unset export | env-var override in watchdog |
 | 2 | `chad-issue-triage` | 163, 181, 246 | argv-vs-env (`F=…` suffix) | `/sandbox/.openclaw-data/bin/chad-issue-triage` |
 | 3 | `chad-mail-check` | 70 | proton-tool `--limit` cap + ascending order | `/sandbox/.openclaw-data/bin/chad-mail-check` |
 | 4 | `chad-issue-triage-cron` | 231 | hardcoded `/usr/local/bin` path | `/sandbox/.openclaw-data/bin/chad-issue-triage-cron` |
 | 5 | `chad-email-check-cron` | 60 | hardcoded `/usr/local/bin` path | `/sandbox/.openclaw-data/bin/chad-email-check-cron` |
+| 6 | `chad-email-check-cron`, `chad-issue-triage-cron` | 347, 144 | misleading `DRAFTER_STATUS` default | source fix landed; redeploy via `chad-deploy.sh --push` |
 
 When these land upstream and a fresh `chad-setup.sh` runs, delete the
 five shims under `/sandbox/.openclaw-data/bin/` and the cron-payload
