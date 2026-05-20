@@ -6,18 +6,30 @@
 # proposals from feedback-proposals.md.
 #
 # Reads the LATEST `### Proposals (machine-readable)` JSON block emitted
-# by chad-budget-audit (most recent first). For each entry, applies the
-# change ONLY if all four guards pass:
+# by chad-budget-audit (most recent first). Each entry has an optional
+# `kind`; if absent, it's treated as a cron-edit (backward-compatible
+# with v1 proposals that omit the field).
 #
-#   1. The cron exists in `openclaw cron list`.
-#   2. The field is in the safe-list (timeoutSeconds | maxOutputTokens).
-#   3. The new value is within ±2× the old value (bounded multiplier).
-#   4. chad-action-gate `chad_self_modify_cron <cron-name>` returns auto.
+# Supported kinds:
+#   • cron_edit (default) — patch timeoutSeconds/maxOutputTokens via
+#     `openclaw cron edit`. Guarded by:
+#       (a) cron exists; (b) field in safe-list; (c) new value within
+#       absolute sanity cap (timeoutSeconds ≤ 7200, maxOutputTokens
+#       ≤ 32768) and at least 1.1× difference; (d) chad-action-gate
+#       chad_self_modify_cron returns "auto" — otherwise the entry is
+#       routed to ### Pending operator review for one-click apply.
+#   • memory      — append a memory line via chad-action-gate
+#                   chad_self_modify_memory (default policy: auto).
+#   • automation, note, calendar_event — recognised but parked under
+#     ### Pending operator review until handlers ship (v3 scope).
 #
-# Anything else stays draft-only. The applier never edits code, never
-# changes schedules, never registers new crons, never modifies policy.
-# That whole class of change must round-trip through human review per
-# the autonomy roadmap.
+# The applier never edits code, never changes schedules, never
+# registers new crons, never modifies policy directly. Riskier classes
+# of change always round-trip through operator review per the autonomy
+# roadmap.
+#
+# Aging: ### Applied blocks older than 30 days are pruned at the start
+# of each run so the proposals file doesn't grow unbounded.
 #
 # Output: appends `## Applied — <ts>` block to feedback-proposals.md
 # listing what was applied and what was skipped, plus an entry per apply
@@ -139,21 +151,88 @@ except Exception as exc:
     raise SystemExit(3)
 
 SAFE_FIELDS = {"timeoutSeconds", "maxOutputTokens"}
+# Absolute sanity caps for cron-edit proposals. Anything beyond gets
+# routed to operator review instead of silently rejected. These caps
+# are intentionally permissive — the goal is to block runaway/typo
+# proposals (e.g. timeoutSeconds=999999), not evidence-based ones
+# (chad-budget-audit's 1.5× p95 recommendations).
+FIELD_CAPS = {
+    "timeoutSeconds": 7200,    # 2 hours — longer than any sane cron
+    "maxOutputTokens": 32768,  # upstream max for our models
+}
+MIN_CHANGE_RATIO = 1.1  # don't bother applying changes < 10%
+
 applied = []
 skipped = []
+pending = []  # routed to operator review (gate=draft, or kind not yet auto)
 applies_left = max_apply
 
+def park_for_review(name, field, old, new, reason, why):
+    """Route an entry to ### Pending operator review."""
+    pending.append((name, field, old, new, reason, why))
+
 for p in applies:
-    name = p.get("cron")
+    kind = p.get("kind") or "cron_edit"
+    name = p.get("cron") or p.get("target") or p.get("name")
     field = p.get("field")
     old = p.get("old")
     new = p.get("new")
     reason = p.get("reason", "")
-    detail = f"field={field},old={old},new={new}"
+    detail = f"kind={kind},field={field},old={old},new={new}"
 
     if applies_left <= 0:
         skipped.append((name, field, old, new, "max-apply cap reached"))
         continue
+
+    # ── kind: memory — chad_self_modify_memory defaults to "auto" ──
+    if kind == "memory":
+        content = p.get("content") or p.get("value")
+        if not content:
+            skipped.append((name or "memory", field or "-", old, new, "missing content"))
+            continue
+        try:
+            gate = subprocess.run(
+                ["chad-action-gate", "check", "chad_self_modify_memory",
+                 name or "memory"],
+                capture_output=True, text=True, timeout=10,
+            )
+            decision = gate.stdout.strip()
+        except Exception as exc:
+            skipped.append((name or "memory", "memory", old, new,
+                            f"gate check failed: {exc}"))
+            continue
+        if decision != "auto":
+            park_for_review(name or "memory", "memory", "-", "-", reason,
+                            f"gate returned {decision!r}")
+            continue
+        if dry_run:
+            applied.append((name or "memory", "memory", "-",
+                            content[:60], reason, "[dry-run]"))
+            applies_left -= 1
+            continue
+        # Append to today's memory file under ## Self-modify
+        memfile = subprocess.run(
+            ["chad-ensure-today-memory"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if memfile and os.path.isfile(memfile):
+            with open(memfile, "a") as fh:
+                fh.write(f"\n### Self-modify (memory) — {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n{content}\n")
+            applied.append((name or "memory", "memory", "-",
+                            content[:60], reason, "applied"))
+            applies_left -= 1
+        else:
+            skipped.append((name or "memory", "memory", old, new,
+                            "could not resolve today memory file"))
+        continue
+
+    # ── kinds parked for v3: automation, note, calendar_event ──
+    if kind in ("automation", "note", "calendar_event"):
+        park_for_review(name or kind, kind, old, new, reason,
+                        f"kind={kind} handler not yet implemented (v3)")
+        continue
+
+    # ── kind: cron_edit (default) ──
     if not name or not field:
         skipped.append((name or "?", field or "?", old, new, "missing cron/field"))
         continue
@@ -166,9 +245,19 @@ for p in applies:
     if not isinstance(old, int) or not isinstance(new, int) or old <= 0 or new <= 0:
         skipped.append((name, field, old, new, "non-positive int values"))
         continue
-    # ±2× bound — protects against runaway proposals.
-    if new > old * 2 or old > new * 2:
-        skipped.append((name, field, old, new, f"out of ±2× bound ({old}↔{new})"))
+    # Absolute cap: anything beyond gets routed to operator review,
+    # not silently rejected. Replaces the old ±2× bound that was
+    # blocking evidence-based proposals (where new=p95×1.5 can be
+    # 30-100× old when old was set conservatively).
+    if new > FIELD_CAPS[field]:
+        park_for_review(name, field, old, new, reason,
+                        f"new={new} > sanity cap {FIELD_CAPS[field]} — operator review")
+        continue
+    # Trivial-change suppression
+    ratio = max(new, old) / max(min(new, old), 1)
+    if ratio < MIN_CHANGE_RATIO:
+        skipped.append((name, field, old, new,
+                        f"change < {MIN_CHANGE_RATIO}× — not worth applying"))
         continue
     # Idempotency: skip if we already applied this exact change today.
     if (name, detail) in seen:
@@ -186,7 +275,11 @@ for p in applies:
         skipped.append((name, field, old, new, f"gate check failed: {exc}"))
         continue
     if decision != "auto":
-        skipped.append((name, field, old, new, f"gate returned {decision!r}"))
+        # Don't silently skip — surface for operator review. This is
+        # the dominant outcome under the current "draft" default for
+        # chad_self_modify_cron, so failing loud here closes the loop.
+        park_for_review(name, field, old, new, reason,
+                        f"gate returned {decision!r} — operator review")
         continue
 
     if dry_run:
@@ -226,6 +319,37 @@ for p in applies:
     applied.append((name, field, old, new, reason, "applied"))
     applies_left -= 1
 
+# ── Prune ### Applied blocks older than 30 days ──
+# Keeps the proposals file from growing unbounded. Operates by reading
+# the whole file, removing matched ranges, writing back. Only runs in
+# non-dry-run mode so smoke tests don't mutate the file.
+if not dry_run:
+    try:
+        full = open(proposals_file).read()
+        prune_cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)
+        # Each block: "## Applied — <ts>\n…(until next ## or end)"
+        # or "## Pending operator review — <ts>\n…"
+        pruned_count = 0
+        def _strip_old(match):
+            global pruned_count
+            ts_str = match.group(1)
+            try:
+                btime = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except Exception:
+                return match.group(0)
+            if btime < prune_cutoff:
+                pruned_count += 1
+                return ""
+            return match.group(0)
+        full_new = re.sub(
+            r"\n## (?:Applied|Pending operator review) — (\S+).*?(?=\n## |\Z)",
+            _strip_old, full, flags=re.DOTALL,
+        )
+        if pruned_count:
+            open(proposals_file, "w").write(full_new)
+    except Exception:
+        pass  # pruning is best-effort
+
 # ── Append "## Applied — <ts>" block to proposals file ──
 ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 out = ["", f"## Applied — {ts}", ""]
@@ -249,6 +373,21 @@ if skipped:
 else:
     out.append("- (nothing skipped)")
 out.append("")
+if pending:
+    # Separate "## Pending operator review" block so the operator can
+    # spot it without scanning past the routine applied/skipped tables.
+    out.append("")
+    out.append(f"## Pending operator review — {ts}")
+    out.append("")
+    out.append("_These proposals are evidence-based but were not auto-applied "
+               "(gate=draft, sanity cap, or v3-scope kind). Apply manually or "
+               "flip the action-gate policy if you trust them._")
+    out.append("")
+    out.append("| target | field | old | new | reason | why parked |")
+    out.append("|--------|-------|----:|----:|--------|-----------|")
+    for n, f, o, w, r, w2 in pending:
+        out.append(f"| {n} | {f} | {o} | {w} | {r} | {w2} |")
+    out.append("")
 
 # Append in-place. Don't prepend — the applier is downstream of the
 # proposals log; ordering within the file is "newest header at top,
@@ -257,5 +396,5 @@ with open(proposals_file, "a") as f:
     f.write("\n".join(out) + "\n")
 
 print(f"chad-proposal-apply: applied={len(applied)} skipped={len(skipped)} "
-      f"(dry_run={dry_run}, max_apply={max_apply})")
+      f"pending={len(pending)} (dry_run={dry_run}, max_apply={max_apply})")
 PY
