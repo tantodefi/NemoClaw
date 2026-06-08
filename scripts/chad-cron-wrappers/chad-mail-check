@@ -6,7 +6,7 @@
 #
 # Writes the following sections to today's memory file:
 #   ## Mail check — <ts>
-#   ### Inbox (last 20)
+#   ### Inbox (unread)
 #   ### Recent sent (7d)
 #   ### Already handled (last 7d)
 #
@@ -66,8 +66,8 @@ INBOX="$(mktemp)"
 SENT="$(mktemp)"
 HANDLED_VIEW="$(mktemp)"
 
-# Inbox sweep.
-if /usr/local/bin/proton-tool mail --limit=20 >"$INBOX" 2>&1; then
+# Inbox sweep — unread only so the classifier never misses new messages regardless of inbox size.
+if /usr/local/bin/proton-tool mail --unread >"$INBOX" 2>&1; then
   INBOX_STATUS="ok"
 else
   INBOX_STATUS="FAILED (exit $?)"
@@ -117,7 +117,7 @@ PY
   echo "Sent status: ${SENT_STATUS}"
   echo "Budget remaining: ${REMAINING}"
   echo ""
-  echo "### Inbox (last 20)"
+  echo "### Inbox (unread)"
   echo '```'
   head -100 "$INBOX"
   echo '```'

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -84,25 +85,34 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  proton-tool events           List events from default calendar\n")
 	fmt.Fprintf(os.Stderr, "    --calendar-id=ID           Calendar ID (uses first if omitted)\n")
 	fmt.Fprintf(os.Stderr, "    --days=N                   Look-ahead days (default: 7)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool mail             List inbox messages\n")
-	fmt.Fprintf(os.Stderr, "    --limit=N                  Number of messages (default: 10)\n")
+	fmt.Fprintf(os.Stderr, "    --past=N                   Also show N past days (default: 0)\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool mail             List inbox messages (newest first)\n")
+	fmt.Fprintf(os.Stderr, "    --limit=N                  Number of messages to show (default: 50)\n")
+	fmt.Fprintf(os.Stderr, "    --unread                   Only show unread messages\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool sent             List sent messages\n")
 	fmt.Fprintf(os.Stderr, "    --limit=N                  Number of messages (default: 10)\n")
 	fmt.Fprintf(os.Stderr, "    --days=N                   Only show messages from last N days (default: all)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool count-mail       Show message counts by label\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool count-mail       Show message counts per label\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool read-mail        Read a specific message body\n")
 	fmt.Fprintf(os.Stderr, "    --id=MSGID                 Message ID (required)\n")
 	fmt.Fprintf(os.Stderr, "  proton-tool mark-read        Mark messages as read\n")
 	fmt.Fprintf(os.Stderr, "    --id=MSGID1,MSGID2,...     Message IDs (required, comma-separated)\n")
-	fmt.Fprintf(os.Stderr, "  proton-tool send-mail        Send an email\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool send-mail        Send a new email\n")
 	fmt.Fprintf(os.Stderr, "    --to=ADDR                  Recipient address (required, comma-separated for multiple)\n")
 	fmt.Fprintf(os.Stderr, "    --cc=ADDR                  CC addresses (optional, comma-separated)\n")
-	fmt.Fprintf(os.Stderr, "    --subject=TEXT              Subject line (required)\n")
-	fmt.Fprintf(os.Stderr, "    --body=TEXT                 Body text (reads stdin if omitted)\n")
+	fmt.Fprintf(os.Stderr, "    --subject=TEXT             Subject line (required)\n")
+	fmt.Fprintf(os.Stderr, "    --body=TEXT                Body text (reads stdin if omitted)\n")
 	fmt.Fprintf(os.Stderr, "    --html                     Send as HTML (default: plain text)\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool reply-mail       Reply to an existing message\n")
+	fmt.Fprintf(os.Stderr, "    --id=MSGID                 Message ID to reply to (required)\n")
+	fmt.Fprintf(os.Stderr, "    --body=TEXT                Reply body (required; stdin blocked by Landlock)\n")
+	fmt.Fprintf(os.Stderr, "    --all                      Reply all (includes original To/CC)\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool trash-mail       Move messages to trash\n")
+	fmt.Fprintf(os.Stderr, "    --id=MSGID1,MSGID2,...     Message IDs (required, comma-separated)\n")
+	fmt.Fprintf(os.Stderr, "  proton-tool labels           List custom labels and folders\n")
 	fmt.Fprintf(os.Stderr, "\nEnvironment:\n")
-	fmt.Fprintf(os.Stderr, "  PROTON_USERNAME   Proton account email\n")
-	fmt.Fprintf(os.Stderr, "  PROTON_PASSWORD   Proton account password\n")
+	fmt.Fprintf(os.Stderr, "  PROTON_USERNAME      Proton account email\n")
+	fmt.Fprintf(os.Stderr, "  PROTON_PASSWORD      Proton account password\n")
 	fmt.Fprintf(os.Stderr, "  PROTON_SESSION_FILE  Path to session cache (default: /sandbox/.proton-session.json)\n")
 	os.Exit(1)
 }
@@ -163,6 +173,15 @@ func getArg(args []string, prefix string, defaultVal string) string {
 		}
 	}
 	return defaultVal
+}
+
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
 }
 
 func cmdWhoami(ctx context.Context) {
@@ -254,6 +273,8 @@ func cmdEvents(ctx context.Context, args []string) {
 	if days <= 0 {
 		days = 7
 	}
+	pastStr := getArg(args, "--past=", "0")
+	pastDays, _ := strconv.Atoi(pastStr)
 
 	if calendarID == "" {
 		calendars, err := c.GetCalendars(ctx)
@@ -269,10 +290,11 @@ func cmdEvents(ctx context.Context, args []string) {
 	}
 
 	now := time.Now().UTC()
+	start := now.Add(-time.Duration(pastDays) * 24 * time.Hour)
 	end := now.Add(time.Duration(days) * 24 * time.Hour)
 
 	filter := url.Values{}
-	filter.Set("Start", strconv.FormatInt(now.Unix(), 10))
+	filter.Set("Start", strconv.FormatInt(start.Unix(), 10))
 	filter.Set("End", strconv.FormatInt(end.Unix(), 10))
 
 	events, err := getAllCalendarEvents(ctx, c, calendarID, filter)
@@ -463,31 +485,61 @@ func cmdMail(ctx context.Context, args []string) {
 	defer c.Close()
 	defer m.Close()
 
-	limitStr := getArg(args, "--limit=", "10")
+	limitStr := getArg(args, "--limit=", "50")
 	limit, _ := strconv.Atoi(limitStr)
 	if limit <= 0 {
-		limit = 10
+		limit = 50
 	}
 
+	unreadOnly := hasFlag(args, "--unread")
+
+	// Desc=true fetches newest first from the API.
 	filter := proton.MessageFilter{
-		LabelID: "0",
+		LabelID: "0", // Inbox
+		Desc:    proton.Bool(true),
 	}
 
+	// GetMessageMetadata handles pagination internally (fetches all pages).
 	messages, err := c.GetMessageMetadata(ctx, filter)
 	if err != nil {
 		fatal("get messages", err)
 	}
 
+	// Apply unread filter in Go (Proton API MessageFilter has no Unread field).
+	if unreadOnly {
+		filtered := messages[:0]
+		for _, msg := range messages {
+			if bool(msg.Unread) {
+				filtered = append(filtered, msg)
+			}
+		}
+		messages = filtered
+	}
+
 	if len(messages) == 0 {
-		fmt.Println("No messages in inbox.")
+		if unreadOnly {
+			fmt.Println("No unread messages in inbox.")
+		} else {
+			fmt.Println("No messages in inbox.")
+		}
 		return
 	}
 
+	// Sort newest first — the API returns oldest first by default.
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Time > messages[j].Time
+	})
+
+	total := len(messages)
 	if len(messages) > limit {
 		messages = messages[:limit]
 	}
 
-	fmt.Printf("Inbox (%d messages shown):\n\n", len(messages))
+	label := "messages"
+	if unreadOnly {
+		label = "unread messages"
+	}
+	fmt.Printf("Inbox (%d %s, showing %d newest):\n\n", total, label, len(messages))
 	for i, msg := range messages {
 		t := time.Unix(msg.Time, 0).UTC()
 		fmt.Printf("[%d] %s\n", i+1, msg.Subject)
@@ -517,8 +569,10 @@ func cmdSent(ctx context.Context, args []string) {
 
 	filter := proton.MessageFilter{
 		LabelID: "2", // Sent label
+		Desc:    proton.Bool(true),
 	}
 
+	// GetMessageMetadata paginates internally; Desc=true gives newest first.
 	messages, err := c.GetMessageMetadata(ctx, filter)
 	if err != nil {
 		fatal("get sent messages", err)
@@ -567,12 +621,39 @@ func cmdCountMail(ctx context.Context) {
 	defer c.Close()
 	defer m.Close()
 
-	count, err := c.CountMessages(ctx)
+	counts, err := c.GetGroupedMessageCount(ctx)
 	if err != nil {
-		fatal("count messages", err)
+		fatal("get message counts", err)
 	}
 
-	fmt.Printf("Total messages: %d\n", count)
+	// Label ID → human name for the system labels.
+	systemLabels := map[string]string{
+		"0":  "Inbox",
+		"1":  "All Drafts",
+		"2":  "All Sent",
+		"3":  "Trash",
+		"4":  "Spam",
+		"5":  "All Mail",
+		"6":  "Archive",
+		"7":  "Sent",
+		"8":  "Drafts",
+		"10": "Outbox",
+		"12": "Starred",
+		"15": "Scheduled",
+	}
+
+	fmt.Println("Message counts by label:")
+	for _, g := range counts {
+		name, ok := systemLabels[g.LabelID]
+		if !ok {
+			name = "Label:" + g.LabelID
+		}
+		if g.Unread > 0 {
+			fmt.Printf("  %-16s total=%-6d unread=%d\n", name, g.Total, g.Unread)
+		} else {
+			fmt.Printf("  %-16s total=%d\n", name, g.Total)
+		}
+	}
 }
 
 // unlockKeys returns the address keyring for the primary send address.
@@ -694,26 +775,21 @@ func cmdMarkRead(ctx context.Context, args []string) {
 	defer m.Close()
 
 	ids := strings.Split(idsStr, ",")
-	for i := range ids {
-		ids[i] = strings.TrimSpace(ids[i])
-	}
-
-	var failed []string
+	clean := ids[:0]
 	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		if err := c.MarkMessagesRead(ctx, id); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to mark %s as read: %v\n", id, err)
-			failed = append(failed, id)
+		id = strings.TrimSpace(id)
+		if id != "" {
+			clean = append(clean, id)
 		}
 	}
 
-	marked := len(ids) - len(failed)
-	fmt.Printf("Marked %d/%d messages as read.\n", marked, len(ids))
-	if len(failed) > 0 {
-		fmt.Printf("Failed: %s\n", strings.Join(failed, ", "))
+	// Batch mark-read: pass all IDs in a single API call.
+	if err := c.MarkMessagesRead(ctx, clean...); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to mark messages as read: %v\n", err)
+		os.Exit(1)
 	}
+
+	fmt.Printf("Marked %d messages as read.\n", len(clean))
 }
 
 func cmdSendMail(ctx context.Context, args []string) {
@@ -775,22 +851,40 @@ func cmdSendMail(ctx context.Context, args []string) {
 		fatal("create draft", err)
 	}
 
-	fmt.Printf("Draft created: %s\n", draft.ID)
+	sent, err := sendDraft(ctx, c, addrKR, draft.ID, bodyText, mimeType, toList, ccList)
+	if err != nil {
+		fatal("send draft", err)
+	}
 
+	fmt.Printf("Email sent successfully!\n")
+	fmt.Printf("  Message ID: %s\n", sent.ID)
+	fmt.Printf("  Subject:    %s\n", sent.Subject)
+	fmt.Printf("  To:         %s\n", toStr)
+	if ccStr != "" {
+		fmt.Printf("  CC:         %s\n", ccStr)
+	}
+}
+
+// sendDraft builds recipient send preferences and sends the named draft.
+func sendDraft(
+	ctx context.Context,
+	c *proton.Client,
+	addrKR *crypto.KeyRing,
+	draftID, bodyText string,
+	mimeType rfc822.MIMEType,
+	toList, ccList []*mail.Address,
+) (proton.Message, error) {
 	allRecipients := make(map[string]proton.SendPreferences)
-
 	for _, rcpt := range append(toList, ccList...) {
 		email := rcpt.Address
-
 		pubKeys, recipientType, err := c.GetPublicKeys(ctx, email)
 		if err != nil {
-			fatal("get public keys for "+email, err)
+			return proton.Message{}, fmt.Errorf("get public keys for %s: %w", email, err)
 		}
-
 		if recipientType == proton.RecipientTypeInternal && len(pubKeys) > 0 {
 			rcptKR, err := pubKeys.GetKeyRing()
 			if err != nil {
-				fatal("build keyring for "+email, err)
+				return proton.Message{}, fmt.Errorf("build keyring for %s: %w", email, err)
 			}
 			allRecipients[email] = proton.SendPreferences{
 				Encrypt:          true,
@@ -810,42 +904,164 @@ func cmdSendMail(ctx context.Context, args []string) {
 	}
 
 	var sendReq proton.SendDraftReq
-
 	internalPrefs := make(map[string]proton.SendPreferences)
 	clearPrefs := make(map[string]proton.SendPreferences)
-
 	for email, prefs := range allRecipients {
-		switch prefs.EncryptionScheme {
-		case proton.InternalScheme:
+		if prefs.EncryptionScheme == proton.InternalScheme {
 			internalPrefs[email] = prefs
-		default:
+		} else {
 			clearPrefs[email] = prefs
 		}
 	}
-
 	if len(internalPrefs) > 0 {
 		if err := sendReq.AddTextPackage(addrKR, bodyText, mimeType, internalPrefs, nil); err != nil {
-			fatal("add internal package", err)
+			return proton.Message{}, fmt.Errorf("add internal package: %w", err)
 		}
 	}
-
 	if len(clearPrefs) > 0 {
 		if err := sendReq.AddTextPackage(addrKR, bodyText, mimeType, clearPrefs, nil); err != nil {
-			fatal("add clear package", err)
+			return proton.Message{}, fmt.Errorf("add clear package: %w", err)
 		}
 	}
 
-	sent, err := c.SendDraft(ctx, draft.ID, sendReq)
-	if err != nil {
-		fatal("send draft", err)
+	return c.SendDraft(ctx, draftID, sendReq)
+}
+
+func cmdReplyMail(ctx context.Context, args []string) {
+	msgID := getArg(args, "--id=", "")
+	bodyText := getArg(args, "--body=", "")
+	replyAll := hasFlag(args, "--all")
+
+	if msgID == "" {
+		fmt.Fprintln(os.Stderr, "Error: --id=MSGID is required")
+		os.Exit(1)
+	}
+	if bodyText == "" {
+		fmt.Fprintln(os.Stderr, "Error: --body=TEXT is required (stdin is blocked by Landlock)")
+		os.Exit(1)
 	}
 
-	fmt.Printf("Email sent successfully!\n")
-	fmt.Printf("  Message ID: %s\n", sent.ID)
-	fmt.Printf("  Subject:    %s\n", sent.Subject)
-	fmt.Printf("  To:         %s\n", toStr)
-	if ccStr != "" {
-		fmt.Printf("  CC:         %s\n", ccStr)
+	password := []byte(os.Getenv("PROTON_PASSWORD"))
+	m, c := login(ctx)
+	defer c.Close()
+	defer m.Close()
+
+	_, addr, addrKR := unlockKeys(ctx, c, password)
+
+	// Fetch original message for headers.
+	orig, err := c.GetMessage(ctx, msgID)
+	if err != nil {
+		fatal("get original message", err)
+	}
+
+	// Build subject with Re: prefix.
+	subject := orig.Subject
+	if !strings.HasPrefix(strings.ToLower(subject), "re:") {
+		subject = "Re: " + subject
+	}
+
+	// Reply goes to original sender; reply-all adds original To recipients as CC.
+	toList := []*mail.Address{}
+	if orig.Sender != nil {
+		toList = append(toList, &mail.Address{Name: orig.Sender.Name, Address: orig.Sender.Address})
+	}
+	ccList := []*mail.Address{}
+	if replyAll {
+		for _, a := range orig.ToList {
+			if !strings.EqualFold(a.Address, addr.Email) {
+				ccList = append(ccList, &mail.Address{Name: a.Name, Address: a.Address})
+			}
+		}
+	}
+
+	mimeType := rfc822.TextPlain
+
+	draft, err := c.CreateDraft(ctx, addrKR, proton.CreateDraftReq{
+		Message: proton.DraftTemplate{
+			Subject:  subject,
+			Sender:   &mail.Address{Address: addr.Email},
+			ToList:   toList,
+			CCList:   ccList,
+			Body:     bodyText,
+			MIMEType: mimeType,
+		},
+		ParentID:     orig.ID,
+		Action:       proton.ReplyAction,
+	})
+	if err != nil {
+		fatal("create reply draft", err)
+	}
+
+	sent, err := sendDraft(ctx, c, addrKR, draft.ID, bodyText, mimeType, toList, ccList)
+	if err != nil {
+		fatal("send reply", err)
+	}
+
+	// Auto-mark original as read after replying.
+	if bool(orig.Unread) {
+		c.MarkMessagesRead(ctx, orig.ID)
+	}
+
+	fmt.Printf("Reply sent!\n")
+	fmt.Printf("  Reply ID:  %s\n", sent.ID)
+	fmt.Printf("  Subject:   %s\n", sent.Subject)
+	if orig.Sender != nil {
+		fmt.Printf("  To:        %s <%s>\n", orig.Sender.Name, orig.Sender.Address)
+	}
+}
+
+func cmdTrashMail(ctx context.Context, args []string) {
+	idsStr := getArg(args, "--id=", "")
+	if idsStr == "" {
+		fmt.Fprintln(os.Stderr, "Error: --id=MSGID1,MSGID2,... is required")
+		os.Exit(1)
+	}
+
+	m, c := login(ctx)
+	defer c.Close()
+	defer m.Close()
+
+	ids := strings.Split(idsStr, ",")
+	clean := ids[:0]
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			clean = append(clean, id)
+		}
+	}
+
+	// LabelMessages with Trash label ID ("3") moves messages to trash.
+	if err := c.LabelMessages(ctx, clean, "3"); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to trash messages: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Moved %d messages to trash.\n", len(clean))
+}
+
+func cmdLabels(ctx context.Context) {
+	m, c := login(ctx)
+	defer c.Close()
+	defer m.Close()
+
+	// Fetch user-created labels and folders (system labels excluded by type filter).
+	custom, err := c.GetLabels(ctx, proton.LabelTypeLabel, proton.LabelTypeFolder)
+	if err != nil {
+		fatal("get labels", err)
+	}
+
+	if len(custom) == 0 {
+		fmt.Println("No custom labels or folders.")
+		return
+	}
+
+	fmt.Printf("Custom labels and folders (%d):\n\n", len(custom))
+	for _, l := range custom {
+		lType := "label"
+		if l.Type == proton.LabelTypeFolder {
+			lType = "folder"
+		}
+		fmt.Printf("  ID: %-30s  Type: %-7s  Name: %s\n", l.ID, lType, l.Name)
 	}
 }
 
@@ -854,7 +1070,9 @@ func main() {
 		usage()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// 120s gives enough headroom for mark-read of large batches + key operations.
+	// The old 60s limit caused spurious timeouts when the inbox had many messages.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	cmd := os.Args[1]
@@ -882,6 +1100,12 @@ func main() {
 		cmdMarkRead(ctx, args)
 	case "send-mail":
 		cmdSendMail(ctx, args)
+	case "reply-mail":
+		cmdReplyMail(ctx, args)
+	case "trash-mail":
+		cmdTrashMail(ctx, args)
+	case "labels":
+		cmdLabels(ctx)
 	case "--help", "-h", "help":
 		usage()
 	default:
