@@ -2,13 +2,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# chad-spawn-gc — Branch retention for the gha spawn substrate.
+# chad-spawn-gc — Ledger orphan reconciliation + branch retention for
+# the gha spawn substrate.
 #
-# Each chad-spawn --substrate gha call leaves a chad-spawn/<task_id>
-# branch on tantodefi/chad-state. With ~24 spawns/day budget that's
-# ~700 branches/month if nothing prunes them. This cron deletes
-# branches whose corresponding ledger entry has been terminal-ized
-# AND the spawn is older than the retention window.
+# Phase 1 — orphan reconcile (local, no gh needed):
+#   Ledger entries stuck in queued/running older than --orphan-hours
+#   (default 24h) whose workdir has no result.json are terminal-ized as
+#   failed with a reconcile note. This catches spawns whose parent cron
+#   session was killed mid-flight (observed 2026-06-07: 5 researcher
+#   spawns orphaned by a cron timeout). If a result.json DOES exist, the
+#   entry is marked done instead — the work finished, only the parent
+#   died before recording it.
+#
+# Phase 2 — branch retention (needs gh):
+#   Each chad-spawn --substrate gha call leaves a chad-spawn/<task_id>
+#   branch on tantodefi/chad-state. With ~24 spawns/day budget that's
+#   ~700 branches/month if nothing prunes them. Deletes branches whose
+#   corresponding ledger entry has been terminal-ized AND the spawn is
+#   older than the retention window.
 #
 # Default retention:
 #   - done    branches: 7 days (audit trail for recent successes)
@@ -16,18 +27,21 @@
 #   - "running" branches with no matching ledger entry are left alone
 #     (might be a state-of-the-world drift — operator investigates)
 #
+# If gh is missing/unauthenticated, phase 2 is SKIPPED (warning, exit 0)
+# rather than failing the whole run — phase 1 still does real work.
+#
 # Designed to run weekly. Idempotent — re-running doesn't double-delete.
 #
 # Usage:
 #   chad-spawn-gc                          # default retention
 #   chad-spawn-gc --done-days N            # override done retention
 #   chad-spawn-gc --failed-days N          # override failed retention
-#   chad-spawn-gc --dry-run                # show what would be deleted
+#   chad-spawn-gc --orphan-hours N         # override orphan threshold
+#   chad-spawn-gc --dry-run                # show what would be done
 #
 # Exit codes:
-#   0  ran (zero or more branches deleted)
+#   0  ran (zero or more reconciles/deletes; or phase 2 skipped)
 #   2  usage error
-#   3  setup failure
 
 set -uo pipefail
 
@@ -38,30 +52,97 @@ OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
 QUEUE_FILE="${CHAD_QUEUE_FILE:-${OPENCLAW_DATA}/queue/tasks.jsonl}"
 REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
 
+SUBAGENTS_DIR="${CHAD_SUBAGENTS_DIR:-${OPENCLAW_DATA}/subagents}"
+
 done_days=7
 failed_days=30
+orphan_hours=24
 dry_run=0
 
 usage() {
   cat <<'EOF'
-Usage: chad-spawn-gc [--done-days N] [--failed-days N] [--dry-run]
+Usage: chad-spawn-gc [--done-days N] [--failed-days N] [--orphan-hours N] [--dry-run]
 EOF
   exit 2
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --done-days)   done_days="$2"; shift 2 ;;
-    --failed-days) failed_days="$2"; shift 2 ;;
-    --dry-run)     dry_run=1; shift ;;
-    -h|--help)     usage ;;
+    --done-days)    done_days="$2"; shift 2 ;;
+    --failed-days)  failed_days="$2"; shift 2 ;;
+    --orphan-hours) orphan_hours="$2"; shift 2 ;;
+    --dry-run)      dry_run=1; shift ;;
+    -h|--help)      usage ;;
     *) echo "chad-spawn-gc: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-command -v gh >/dev/null 2>&1 || { echo "gh CLI required" >&2; exit 3; }
-gh auth status --hostname github.com >/dev/null 2>&1 || { echo "gh not authenticated" >&2; exit 3; }
 [ -f "$QUEUE_FILE" ] || { echo "no ledger; nothing to gc"; exit 0; }
+
+# ── Phase 1: orphan reconcile (local; no gh dependency) ─────────────
+# Appends terminal entries for spawns stuck in queued/running past the
+# threshold. Done in Python so the latest-status fold and the append
+# happen in one pass; appends are newline-delimited JSON like chad-spawn's.
+reconciled="$(QUEUE_FILE="$QUEUE_FILE" SUBAGENTS_DIR="$SUBAGENTS_DIR" \
+  ORPHAN_HOURS="$orphan_hours" DRY_RUN="$dry_run" python3 <<'PY'
+import json, os, datetime, pathlib
+UTC = datetime.timezone.utc
+now = datetime.datetime.now(UTC)
+queue = pathlib.Path(os.environ["QUEUE_FILE"])
+subagents = pathlib.Path(os.environ["SUBAGENTS_DIR"])
+threshold = datetime.timedelta(hours=float(os.environ["ORPHAN_HOURS"]))
+dry = os.environ["DRY_RUN"] == "1"
+
+latest = {}
+for line in queue.read_text().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if "id" in r:
+        latest[r["id"]] = r
+
+count = 0
+with queue.open("a") as out:
+    for tid, r in latest.items():
+        if r.get("status") not in ("queued", "running"):
+            continue
+        try:
+            ts = datetime.datetime.strptime(
+                r.get("ts_utc", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if now - ts < threshold:
+            continue
+        workdir = pathlib.Path(r.get("workdir") or (subagents / tid))
+        has_result = (workdir / "result.json").is_file()
+        new = dict(r)
+        new["status"] = "done" if has_result else "failed"
+        new["ts_utc"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        new["note"] = ("orphan-reconcile: result.json present but parent never "
+                       "recorded terminal status" if has_result else
+                       "orphan-reconcile: parent session died before terminal status")
+        if not dry:
+            out.write(json.dumps(new) + "\n")
+        print(f"  {tid}: {r.get('status')} -> {new['status']} "
+              f"(age {(now - ts).total_seconds() / 3600:.1f}h"
+              f"{', DRY RUN' if dry else ''})")
+        count += 1
+print(f"RECONCILED={count}")
+PY
+)"
+echo "$reconciled" | grep -v '^RECONCILED=' || true
+reconciled_count="$(echo "$reconciled" | sed -n 's/^RECONCILED=//p')"
+
+# ── Phase 2: branch retention (needs gh; skip gracefully if not) ────
+if ! command -v gh >/dev/null 2>&1 || ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "chad-spawn-gc: ${reconciled_count:-0} reconciled; branch gc SKIPPED (gh unavailable/unauthenticated)" >&2
+  echo "chad-spawn-gc: ${reconciled_count:-0} reconciled, 0 deleted (branch gc skipped)"
+  exit 0
+fi
 
 # Build a map of task_id -> latest_status from the ledger
 declare -A id_status
@@ -160,4 +241,4 @@ while IFS= read -r branch; do
   fi
 done <<<"$remote_branches"
 
-echo "chad-spawn-gc: ${deleted} deleted, ${kept} kept, ${unknown} unknown"
+echo "chad-spawn-gc: ${reconciled_count:-0} reconciled, ${deleted} deleted, ${kept} kept, ${unknown} unknown"

@@ -305,6 +305,7 @@ Quickstart <get-started/quickstart>
 :hidden:
 
 Inference Options <inference/inference-options>
+Providers and Routing <inference/providers>
 Use Local Inference <inference/use-local-inference>
 Switch Inference Providers <inference/switch-inference-providers>
 Set Up Task-Specific Sub-Agents <inference/set-up-sub-agent>
@@ -353,6 +354,21 @@ Monitor Sandbox Activity <monitoring/monitor-sandbox-activity>
 ```
 
 ```{toctree}
+:caption: Operations
+:hidden:
+
+Chad Autonomy Loops <operations/chad-autonomy>
+Chad Experiments <operations/chad-experiments>
+Chad Devflow <operations/chad-devflow>
+Chad Skills <operations/chad-skills>
+Chad Workflows <operations/chad-workflows>
+GBrain <operations/gbrain>
+OpenWebUI <operations/openwebui>
+Log Locations <operations/log-locations>
+Wrapper Bugs <operations/wrapper-bugs>
+```
+
+```{toctree}
 :caption: Reference
 :hidden:
 
@@ -367,6 +383,7 @@ Troubleshooting <reference/troubleshooting>
 :hidden:
 
 Agent Skills <resources/agent-skills>
+Backup & Recovery Policy <resources/backup-policy>
 Report Vulnerabilities <https://github.com/NVIDIA/NemoClaw/blob/main/SECURITY.md>
 resources/license
 Discord <https://discord.gg/XFpfPv9Uvx>

@@ -63,8 +63,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -f "$QUEUE_FILE" ] || { echo "no ledger at $QUEUE_FILE — nothing to poll"; exit 0; }
-command -v gh >/dev/null 2>&1 || { echo "gh CLI required" >&2; exit 3; }
-gh auth status --hostname github.com >/dev/null 2>&1 || { echo "gh not authenticated" >&2; exit 3; }
 
 # Find unique task_ids whose LATEST ledger entry has status=running and
 # substrate=gha. We treat older entries as superseded — running may
@@ -100,6 +98,13 @@ if [ -z "$running_ids" ]; then
   echo "no async gha spawns running"
   exit 0
 fi
+
+# gh checks deferred to here: with zero running gha entries (the common
+# case on a 5-min cadence) the poll is a pure-local no-op and must not
+# fail on a missing/expired GitHub token. Only pending reconciliations
+# make gh a hard requirement.
+command -v gh >/dev/null 2>&1 || { echo "gh CLI required" >&2; exit 3; }
+gh auth status --hostname github.com >/dev/null 2>&1 || { echo "gh not authenticated" >&2; exit 3; }
 
 # Single shared chad-state checkout for all reconciliations
 state_dir="$(mktemp -d -t "chad-spawn-poll-XXXXXX")"

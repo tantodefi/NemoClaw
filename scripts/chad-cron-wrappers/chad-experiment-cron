@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-experiment-cron — deterministic driver for the nightly-experiments cron.
+#
+# Replaces the old multi-phase agent prompt (8+ sequential tool calls that
+# Nemotron could not drive reliably in an isolated cron session — the run
+# logs show "Channel is required" delivery errors and stalls mid-loop).
+# All control flow is deterministic Python; the LLM is used for exactly two
+# single-turn, no-tools calls (same contract as chad-drafter):
+#
+#   • EVALUATE — verdict for each experiment whose evaluates_at is due
+#   • DESIGN   — at most ONE new experiment per night
+#
+# Phases (each independently skippable, failures never abort the run):
+#   1. lock + budget gate (task-profiles.json profile "nightly-experiments")
+#   2. observe   — heartbeat observation on every running experiment
+#   3. evaluate  — due experiments via single-turn LLM; fallback = extend
+#                  the window with an explanatory note (safe + visible)
+#   4. design    — if active < max_active_per_operator, design + start ONE
+#                  experiment with an operator-visible OpenWebUI artifact
+#   5. report    — section in today's memory file + one-line stdout
+#
+# Success criterion (operator feedback, 2026-05): a nightly run must
+# produce operator-visible OpenWebUI artifacts (automations, notes,
+# memories), not just ledger entries. The DESIGN whitelist below enforces
+# that every started experiment surfaces something in OpenWebUI.
+#
+# Usage:
+#   chad-experiment-cron [--no-design] [--dry-run] [--timeout SECS]
+#                        [--max-evaluate N]
+
+import datetime
+import fcntl
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+UTC = getattr(datetime, "UTC", datetime.timezone.utc)
+
+STATE_DIR = Path(os.environ.get(
+    "CHAD_EXPERIMENT_STATE_DIR", "/sandbox/.openclaw-data/state/experiments"))
+EXP_BIN = os.environ.get(
+    "CHAD_EXPERIMENT_BIN", "/sandbox/.openclaw-data/bin/chad-experiment")
+PROFILES_FILE = os.environ.get(
+    "CHAD_PROFILES_FILE", "/usr/local/share/chad/task-profiles.json")
+BUDGET_FILE = os.environ.get(
+    "CHAD_BUDGET_FILE", "/sandbox/.openclaw-data/budget.json")
+ENSURE_MEMORY = "/usr/local/bin/chad-ensure-today-memory"
+MEMORY_DIR = Path("/sandbox/.openclaw/workspace/memory")
+LOCK_FILE = "/tmp/chad-experiment-cron.lock"
+
+MIN_BUDGET_FALLBACK = 20000
+
+# Only surfaces that materialize an operator-visible OpenWebUI artifact
+# and whose required flags the designer LLM can fully specify. Calendar is
+# excluded: create-event needs a calendar-id the LLM cannot know.
+SURFACE_WHITELIST = {
+    "notes create": {
+        "required": ["title", "content"],
+        "schema": '{"title": str, "content": str(markdown)}',
+    },
+    "automations create": {
+        "required": ["name", "prompt", "rrule"],
+        "schema": '{"name": str, "prompt": str, '
+                  '"rrule": str("FREQ=DAILY;BYHOUR=9;BYMINUTE=0" style RFC5545)}',
+    },
+    "memories create": {
+        "required": ["content"],
+        "schema": '{"content": str}',
+    },
+}
+
+
+def now():
+    return datetime.datetime.now(UTC)
+
+
+def iso(dt=None):
+    return (dt or now()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(s):
+    try:
+        return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def find_json(s):
+    """Extract the first balanced {...} span (same algorithm as chad-drafter)."""
+    start = s.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(s)):
+            c = s[i]
+            if esc:
+                esc = False
+                continue
+            if c == "\\":
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+        start = s.find("{", start + 1)
+    return None
+
+
+def run_env(cmd, timeout=60, home="/sandbox"):
+    """Run a subprocess with HOME=/sandbox; return (rc, stdout, stderr).
+    Never raises. HOME matters: the gateway config lives under
+    /sandbox/.openclaw, and kubectl-exec'd shells default HOME to /root."""
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            env=dict(os.environ, HOME=home))
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+    except OSError as exc:
+        return 127, "", str(exc)
+
+
+def llm(prompt, timeout, retries=1):
+    """Single-turn, no-tools LLM call via the local gateway (chad-drafter
+    contract: the prompt forbids tool use; nothing is attached to
+    round-trip). Returns (parsed_json_or_None, error_or_None).
+
+    Retries once on a malformed/truncated response: NVIDIA free inference
+    occasionally cuts the stream mid-JSON (observed 2026-06-10), and a
+    fresh attempt with a new session id usually succeeds."""
+    last_err = "no attempts"
+    for attempt in range(retries + 1):
+        rc, out, err = run_env(
+            ["timeout", "--kill-after=5", f"{timeout}s",
+             "openclaw", "agent", "--agent", "main", "--local",
+             "--session-id", f"exp-cron-{int(now().timestamp())}-{attempt}",
+             "-m", prompt],
+            timeout=timeout + 15)
+        if rc != 0 and not out.strip():
+            last_err = f"agent exit {rc}: {err.strip()[:200]}"
+            continue
+        raw = find_json(out)
+        if not raw:
+            last_err = f"no JSON in response: {out.strip()[:200]}"
+            continue
+        try:
+            return json.loads(raw), None
+        except json.JSONDecodeError as exc:
+            last_err = f"json decode: {exc}"
+            continue
+    return None, last_err
+
+
+def load_config():
+    path = STATE_DIR / "config.json"
+    try:
+        return json.load(path.open())
+    except (OSError, json.JSONDecodeError):
+        return {
+            "allowed_types": ["automation", "note", "memory"],
+            "max_active_per_operator": 3,
+            "regression_threshold": -0.30,
+            "default_evaluation_window_days": 7,
+        }
+
+
+def active_records():
+    recs = []
+    for f in sorted((STATE_DIR / "active").glob("*.json")):
+        try:
+            recs.append(json.load(f.open()))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return recs
+
+
+def past_hypotheses(limit=12):
+    """Recent designed hypotheses from the ledger — fed to the designer so
+    it does not repeat itself."""
+    path = STATE_DIR / "ledger.jsonl"
+    rows = []
+    try:
+        for line in path.open():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("event") == "designed":
+                h = (e.get("data") or {}).get("hypothesis", "")
+                if h:
+                    rows.append(h)
+    except OSError:
+        pass
+    return rows[-limit:]
+
+
+def memory_digest(days=2, max_chars=4000):
+    """Tail of the last N daily memory files — the designer's signal source."""
+    chunks = []
+    today = now().date()
+    for d in range(days):
+        day = today - datetime.timedelta(days=d)
+        f = MEMORY_DIR / f"{day.isoformat()}.md"
+        if f.is_file():
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            chunks.append(f"--- memory {day.isoformat()} (tail) ---\n"
+                          + text[-(max_chars // days):])
+    return "\n".join(chunks)[:max_chars] or "(no recent memory files)"
+
+
+def budget_remaining():
+    try:
+        return int(json.load(open(BUDGET_FILE)).get("remaining_tokens", 0))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return 0
+
+
+def min_budget():
+    try:
+        prof = json.load(open(PROFILES_FILE)).get("profiles", {}) \
+            .get("nightly-experiments", {})
+        return int(prof.get("minBudgetTokens", MIN_BUDGET_FALLBACK))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return MIN_BUDGET_FALLBACK
+
+
+def exp_cli(*args, timeout=120):
+    return run_env([EXP_BIN, *args], timeout=timeout)
+
+
+def memory_append(lines):
+    rc, out, _ = run_env([ENSURE_MEMORY], timeout=30)
+    mem_file = out.strip()
+    if rc != 0 or not mem_file:
+        mem_file = str(MEMORY_DIR / f"{now().date().isoformat()}.md")
+    try:
+        with open(mem_file, "a") as f:
+            f.write("\n" + "\n".join(lines) + "\n")
+    except OSError as exc:
+        print(f"warn: memory append failed: {exc}", file=sys.stderr)
+    return mem_file
+
+
+# ─────────────────────────────────────────────────────────────────
+# Phases
+# ─────────────────────────────────────────────────────────────────
+
+def phase_observe(running, dry_run):
+    done = []
+    for rec in running:
+        started = parse_ts(rec.get("started_at")) or parse_ts(rec.get("designed_at"))
+        days = round((now() - started).total_seconds() / 86400, 1) if started else None
+        data = {"days_running": days,
+                "surface_id": (rec.get("surface") or {}).get("id")}
+        if dry_run:
+            done.append(f"{rec['id']} (dry-run)")
+            continue
+        rc, _, err = exp_cli(
+            "observe", "--id", rec["id"], "--kind", "cron-checkin",
+            "--data", json.dumps(data))
+        done.append(rec["id"] if rc == 0 else f"{rec['id']} FAILED({err.strip()[:80]})")
+    return done
+
+
+EVAL_RULES = (
+    "STRICT RULES:\n"
+    "  • Output exactly ONE valid JSON object on a SINGLE line. No prose. No code fences.\n"
+    "  • Do NOT call any tools. Do NOT request more information.\n"
+    "  • verdict must be one of promote|retire|extend.\n"
+    "  • promote = the artifact proved useful, keep it permanently.\n"
+    "  • retire = no evidence of value or it caused problems; the artifact will be rolled back.\n"
+    "  • extend = genuinely not enough signal yet (use sparingly; max one extension).\n"
+    "  • notes ≤200 chars. score is optional, 0..1 vs baseline (1.0 = no change).\n"
+)
+
+
+def phase_evaluate(due, cfg, digest, llm_timeout, max_eval, dry_run):
+    results = []
+    for rec in due[:max_eval]:
+        already_extended = any(
+            "extend" in json.dumps(o).lower() for o in rec.get("observations", [])
+        ) or (rec.get("evaluation") or {}).get("verdict") == "extend"
+        trimmed = {
+            "id": rec["id"],
+            "type": rec.get("type"),
+            "hypothesis": rec.get("hypothesis"),
+            "success_metric": rec.get("success_metric"),
+            "baseline": rec.get("baseline"),
+            "designed_at": rec.get("designed_at"),
+            "started_at": rec.get("started_at"),
+            "evaluates_at": rec.get("evaluates_at"),
+            "surface_cmd": (rec.get("surface") or {}).get("cmd"),
+            "surface_id": (rec.get("surface") or {}).get("id"),
+            "observations": rec.get("observations", [])[-10:],
+            "already_extended_once": already_extended,
+        }
+        prompt = (
+            "You are Chad's experiment evaluator. Decide the verdict for this "
+            "experiment based on its success metric, observations, and the "
+            "recent memory digest.\n\n" + EVAL_RULES +
+            '\nSchema: {"verdict":"promote|retire|extend","score":0.0,"notes":"<why>"}'
+            "\n\nExperiment record:\n" + json.dumps(trimmed, ensure_ascii=False) +
+            "\n\nRecent memory digest:\n" + digest +
+            "\n\nReturn ONLY the JSON object."
+        )
+        verdict, score, notes, source = None, None, "", "llm"
+        parsed, err = (None, "dry-run") if dry_run else llm(prompt, llm_timeout)
+        if parsed:
+            v = str(parsed.get("verdict", "")).strip().lower()
+            if v in {"promote", "retire", "extend"}:
+                verdict = v
+                notes = str(parsed.get("notes", ""))[:200]
+                try:
+                    score = float(parsed["score"]) if parsed.get("score") is not None else None
+                except (ValueError, TypeError):
+                    score = None
+        if verdict is None:
+            # Deterministic fallback: extending is safe and operator-visible.
+            # But never extend twice on fallback — retire instead so a dead
+            # evaluator can't keep an experiment alive forever.
+            source = "fallback"
+            verdict = "retire" if already_extended else "extend"
+            notes = f"auto-{verdict}: evaluator LLM unavailable ({(err or '')[:120]})"
+        if verdict == "extend" and already_extended and source == "llm":
+            verdict = "retire"
+            notes = (notes + " | forced retire: already extended once")[:200]
+
+        if dry_run:
+            results.append(f"{rec['id']}: would {verdict} ({source})")
+            continue
+        args = ["evaluate", "--id", rec["id"], "--verdict", verdict,
+                "--notes", notes or "(none)"]
+        if score is not None:
+            # NOTE: --score with --verdict — verdict wins (explicit beats auto).
+            args += ["--score", str(score)]
+        if verdict == "extend":
+            args += ["--extend-days", "3"]
+        rc, _, err2 = exp_cli(*args)
+        status = verdict if rc == 0 else f"FAILED({err2.strip()[:80]})"
+        results.append(f"{rec['id']}: {status} ({source})")
+    return results
+
+
+DESIGN_RULES = (
+    "STRICT RULES:\n"
+    "  • Output exactly ONE valid JSON object on a SINGLE line. No prose. No code fences.\n"
+    "  • Do NOT call any tools. Do NOT request more information.\n"
+    "  • Propose at most ONE experiment. If nothing in the digest suggests a "
+    "worthwhile bet, return {\"experiment\":null,\"reason\":\"<why>\"}.\n"
+    "  • The hypothesis must be testable within evaluation_days and must NOT "
+    "repeat any past hypothesis listed below.\n"
+    "  • The artifact must be useful to the operators on its own merits "
+    "(a note they would read, an automation that saves them a step, a memory "
+    "that improves chat answers) — not a placeholder.\n"
+    "  • success_metric must be observable from memory files or OpenWebUI usage.\n"
+)
+
+
+def phase_design(cfg, digest, past, llm_timeout, dry_run):
+    surfaces_desc = "\n".join(
+        f'  • "{cmd}" — surface_args schema: {meta["schema"]}'
+        for cmd, meta in SURFACE_WHITELIST.items())
+    prompt = (
+        "You are Chad's nightly experiment designer. Chad is an always-on "
+        "assistant for two operators (tantodefi, a developer; tjcooke, a "
+        "personal trainer). Based on the recent memory digest, design ONE "
+        "small experiment that creates an operator-visible OpenWebUI "
+        "artifact.\n\n" + DESIGN_RULES +
+        "\nAllowed surface commands:\n" + surfaces_desc +
+        "\nAllowed types: " + ", ".join(cfg.get("allowed_types", [])) +
+        '\n\nSchema: {"experiment":{"type":"<type>","hypothesis":"<bet>",'
+        '"success_metric":"<observable>","baseline":"<current state>",'
+        '"evaluation_days":3,"surface_cmd":"<from whitelist>",'
+        '"surface_args":{...}},"reason":"<one line>"}'
+        "\n\nPast hypotheses (do NOT repeat):\n" +
+        "\n".join(f"  - {h}" for h in past[-12:]) +
+        "\n\nRecent memory digest:\n" + digest +
+        "\n\nReturn ONLY the JSON object."
+    )
+    parsed, err = llm(prompt, llm_timeout)
+    if not parsed:
+        return None, f"designer LLM failed: {err}"
+    exp = parsed.get("experiment")
+    if not exp:
+        return None, f"designer declined: {str(parsed.get('reason', ''))[:160]}"
+    # Validate
+    cmd = str(exp.get("surface_cmd", "")).strip()
+    if cmd not in SURFACE_WHITELIST:
+        return None, f"rejected: surface_cmd {cmd!r} not in whitelist"
+    sargs = exp.get("surface_args")
+    if not isinstance(sargs, dict):
+        return None, "rejected: surface_args not an object"
+    missing = [k for k in SURFACE_WHITELIST[cmd]["required"] if not sargs.get(k)]
+    if missing:
+        return None, f"rejected: surface_args missing {missing}"
+    etype = str(exp.get("type", "")).strip()
+    if etype not in cfg.get("allowed_types", []):
+        return None, f"rejected: type {etype!r} not allowed"
+    hypothesis = str(exp.get("hypothesis", "")).strip()
+    metric = str(exp.get("success_metric", "")).strip()
+    if not hypothesis or not metric:
+        return None, "rejected: empty hypothesis or success_metric"
+    try:
+        eval_days = max(1, min(7, int(exp.get("evaluation_days", 3))))
+    except (ValueError, TypeError):
+        eval_days = 3
+
+    if dry_run:
+        return f"(dry-run) would design: {hypothesis[:100]}", None
+
+    rc, out, err2 = exp_cli(
+        "design", "--hypothesis", hypothesis, "--type", etype,
+        "--success-metric", metric, "--baseline", str(exp.get("baseline", "")),
+        "--evaluation-days", str(eval_days))
+    if rc != 0:
+        return None, f"design failed: {err2.strip()[:160]}"
+    try:
+        exp_id = json.loads(find_json(out) or "{}").get("id")
+    except json.JSONDecodeError:
+        exp_id = None
+    if not exp_id:
+        return None, "design succeeded but no id in output"
+    rc, _, err3 = exp_cli(
+        "start", "--id", exp_id, "--surface-cmd", cmd,
+        "--surface-args", json.dumps(sargs), timeout=180)
+    if rc != 0:
+        return None, f"designed {exp_id} but start failed: {err3.strip()[:160]}"
+    return f"{exp_id} started ({cmd}): {hypothesis[:100]}", None
+
+
+# ─────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(prog="chad-experiment-cron")
+    ap.add_argument("--no-design", action="store_true",
+                    help="Skip the design phase (observe + evaluate only)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="No writes; print what would happen")
+    ap.add_argument("--timeout", type=int, default=120,
+                    help="Per-LLM-call timeout in seconds (default 120)")
+    ap.add_argument("--max-evaluate", type=int, default=3,
+                    help="Max experiments to evaluate per run (default 3)")
+    args = ap.parse_args()
+
+    # Overlap lock — a slow LLM call must not stack runs.
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("skipped: another chad-experiment-cron run holds the lock")
+        return 0
+
+    ts = iso()
+    remaining = budget_remaining()
+    floor = min_budget()
+    if remaining < floor:
+        memory_append([f"## Nightly experiments skipped (low budget) — {ts}",
+                       f"remaining_tokens={remaining} (< {floor})"])
+        print(f"skipped: budget={remaining} < {floor}")
+        return 0
+
+    cfg = load_config()
+    recs = active_records()
+    running = [r for r in recs if r.get("state") == "running"]
+    due = [r for r in running
+           if (parse_ts(r.get("evaluates_at")) or now()) <= now()]
+    digest = memory_digest()
+
+    observed = phase_observe(running, args.dry_run)
+    evaluated = phase_evaluate(due, cfg, digest, args.timeout,
+                               args.max_evaluate, args.dry_run)
+
+    designed, design_note = None, "skipped (--no-design)"
+    if not args.no_design:
+        # Re-count after evaluation (promote/retire frees slots).
+        active_after = len([r for r in active_records()
+                            if r.get("state") in {"designed", "running"}])
+        if active_after >= int(cfg.get("max_active_per_operator", 3)):
+            design_note = (f"skipped: {active_after} active >= max "
+                           f"{cfg.get('max_active_per_operator', 3)}")
+        else:
+            designed, design_err = phase_design(
+                cfg, digest, past_hypotheses(), args.timeout, args.dry_run)
+            design_note = designed or design_err
+
+    lines = [f"## Nightly experiments — {ts}",
+             f"Budget remaining: {remaining}",
+             f"Observed ({len(observed)}): " + (", ".join(observed) or "(none running)"),
+             f"Evaluated ({len(evaluated)}): " + ("; ".join(evaluated) or "(none due)"),
+             f"Designed: {design_note}"]
+    if not args.dry_run:
+        memory_append(lines)
+    else:
+        print("\n".join(lines))
+
+    print(f"chad-experiment-cron: observed={len(observed)} "
+          f"evaluated={len(evaluated)} designed={'yes' if designed else 'no'} "
+          f"({design_note})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

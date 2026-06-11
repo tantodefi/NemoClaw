@@ -8,10 +8,11 @@ description: |
   threshold. Uses chad-webui MCP tools to materialize artifacts
   (automations, functions, tools, knowledge bases, calendar events,
   memories, notes) and a structured ledger to track state. Supports A/B
-  testing of paired variants. Use at the nightly cron tick (02:00 UTC)
-  to: (1) propose new experiments from memory, (2) observe ongoing ones,
-  (3) evaluate ones at their evaluation window, (4) auto-schedule
-  calendar coordination on operators' behalf.
+  testing of paired variants. The nightly tick (02:00 UTC) is driven by
+  the deterministic `chad-experiment-cron` wrapper (observe → evaluate →
+  design); use this skill when an operator asks about experiments, when
+  designing/evaluating one interactively, or for calendar coordination
+  on operators' behalf (not automated by the wrapper).
 triggers:
   - experiment
   - automate this
@@ -93,7 +94,7 @@ Counter-indicators (reject):
 
 ## Hypothesis sourcing — where to look
 
-The nightly cron has access to:
+Hypothesis discovery draws on:
 
 ```sh
 chad-experiment recent-memory --days 7
@@ -575,7 +576,8 @@ without requiring them to log into the experiment dashboard.
 
 ### Step 4 — Observe (during the evaluation window)
 
-This step runs as the **nightly cron's Phase 2**. For each running
+`chad-experiment-cron` records a heartbeat observation nightly; richer
+evidence-gathering happens interactively. For each running
 experiment, chad checks what happened since the last observation
 and appends to the ledger:
 
@@ -913,10 +915,17 @@ Additional non-config rules:
    should include a "Last night's experiment activity" section so
    operators see what Chad did unsupervised.
 
-## Nightly cron loop (what the agent does at 02:00 UTC)
+## Nightly loop (what `chad-experiment-cron` automates at 02:00 UTC)
 
-The cron payload runs four phases sequentially. Each phase has a
-budget; if it's exceeded, skip to the next:
+> **As of 2026-06**: the nightly tick is NOT an agent turn. The
+> `nightly-experiments` cron runs `chad-experiment-cron`, a
+> deterministic driver that executes phases 2 → 3 → 1 below
+> (observe → evaluate → design) via single-turn, no-tools LLM calls.
+> Phase 4 (calendar coordination) is not automated — do it
+> interactively when an operator asks or a review is due. The phase
+> descriptions below remain the methodology: follow them when working
+> an experiment by hand, and they describe what the wrapper does on
+> your behalf each night.
 
 ### Phase 1 — Propose
 
@@ -963,22 +972,22 @@ For each operator:
    propose [operator-sync] events with both operators
 ```
 
-After all four phases, write a single summary block to today's memory:
+After its run, `chad-experiment-cron` appends a one-line summary to
+today's memory and emits the same line as its only stdout:
 
-```markdown
-## Nightly experiment loop — 2026-05-15T02:00Z
-- Phase 1 proposed: 2 new (tjcooke: pre-research, tantodefi: model A/B)
-- Phase 2 observed: 5 events across 3 running experiments
-- Phase 3 evaluated: 1 promoted (tjcooke: weekly review automation), 1 retired (tantodefi: terse-prompt — regression)
-- Phase 4 calendar: 1 [chad-experiment] added (tomorrow Mon 06:00), 1 [experiment-review] proposed (Fri 15:00 tantodefi)
+```text
+chad-experiment-cron: observed=3 evaluated=1 designed=yes
 ```
+
+When working experiments interactively, write a richer summary block
+to today's memory so operators see what changed and why.
 
 ## Integration with existing systems
 
 | System | How experiments plug in |
 |---|---|
 | **`gbrain-dream`** (03:30 UTC) | Runs AFTER the experiment cron. Picks up new ledger entries + memory summary → searchable by tomorrow's chat |
-| **`chad-budget`** | The cron reserves `experiment` tokens; if budget low (<140k), Phase 1 skipped, Phases 2-3 reduced |
+| **`chad-budget`** | `chad-experiment-cron` is budget-gated via the `nightly-experiments` profile in `task-profiles.json` (20k minBudget); below the gate the whole run is skipped with a reason line |
 | **`chad-mail-check`** | Inbox messages mentioning operator pain points feed Phase 1 hypothesis sourcing |
 | **`chad-issue-triage`** | Triage proposals that match the worthy-of-automation criteria become experiments instead of bug tickets |
 | **`chad-self-improve`** (Sunday) | Weekly meta-review: are experiments succeeding? Should `regression_threshold` change? Should `max_active_per_operator` go up/down? |
@@ -1003,7 +1012,7 @@ chad-experiment recent-memory  [--days 7] [--sample-chars 3000]
 chad-experiment recent-ledger  [--limit 40]
 ```
 
-## Worked example — full nightly turn
+## Worked example — full experiment lifecycle (interactive)
 
 Day 1 (2026-05-15 02:00Z):
 
@@ -1055,7 +1064,7 @@ chad-experiment evaluate --id exp-2026-05-15-tjcooke-001 \
 
 - **Vague success metrics.** "Operator likes it" is unmeasurable. Always reduce to a number Chad can count from his own surfaces.
 - **Cross-operator side-effects.** If experiment touches both tantodefi and tjcooke, propose a `[operator-sync]` first; don't auto-run.
-- **Over-budget proposals.** Phase 1 must check `chad-experiment budget` before designing. Designing an unowned experiment is wasted ledger entry.
+- **Over-budget proposals.** Check `chad-experiment budget` before designing. Designing an unowned experiment is a wasted ledger entry.
 - **Forgetting to observe.** A running experiment with zero observations always evaluates as inconclusive (or retire if no positive evidence by `evaluates_at`).
 - **Rollback path that won't run.** Custom rollback strings ARE NOT auto-executed — only `chad-webui …` lines. For custom paths, you have to retire-and-fix manually.
 

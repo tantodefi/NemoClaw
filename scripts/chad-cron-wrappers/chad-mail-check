@@ -62,6 +62,29 @@ if [ "$REMAINING" -lt "$MIN_BUDGET" ]; then
   exit 0
 fi
 
+# ── Proton circuit breaker ─────────────────────────────────────────
+# A Forbidden from mail-api.proton.me means Proton is rate-limiting SRP
+# logins (~10/hour). Re-attempting hourly (×4 RESTY retries, ×2 calls
+# per sweep) keeps the block alive indefinitely — observed 2026-06-09/10
+# after a root-owned /sandbox/.proton-session.json silently disabled
+# session reuse. Back off for 2h after any Forbidden so the rate limit
+# can decay; clear the breaker on the first successful sweep.
+BREAKER_FILE="${WORKSPACE_STATE}/proton-backoff.json"
+BACKOFF_SECS="${CHAD_PROTON_BACKOFF_SECS:-7200}"
+if [ -f "$BREAKER_FILE" ]; then
+  last_fail="$(python3 -c "import json; print(json.load(open('${BREAKER_FILE}')).get('last_fail_epoch',0))" 2>/dev/null || echo 0)"
+  now_epoch="$(date +%s)"
+  if [ $((now_epoch - ${last_fail:-0})) -lt "$BACKOFF_SECS" ]; then
+    {
+      echo ""
+      echo "## Mail check skipped (proton backoff) — ${TS}"
+      echo "Last Forbidden $(((now_epoch - ${last_fail:-0}) / 60))m ago; retrying after $((BACKOFF_SECS / 60))m."
+    } >> "$MEMORY_FILE"
+    echo "skipped: proton backoff active"
+    exit 0
+  fi
+fi
+
 INBOX="$(mktemp)"
 SENT="$(mktemp)"
 HANDLED_VIEW="$(mktemp)"
@@ -73,8 +96,20 @@ else
   INBOX_STATUS="FAILED (exit $?)"
 fi
 
-# Sent sweep (7-day window).
-if /usr/local/bin/proton-tool sent --days=7 --limit=30 >"$SENT" 2>&1; then
+# Trip / clear the breaker based on the sweep outcome.
+if grep -q "Forbidden" "$INBOX" 2>/dev/null; then
+  printf '{"last_fail_epoch":%s,"reason":"mail-api Forbidden"}\n' "$(date +%s)" > "$BREAKER_FILE"
+elif [ "$INBOX_STATUS" = "ok" ]; then
+  rm -f "$BREAKER_FILE"
+fi
+
+# Sent sweep (7-day window). Skipped when the inbox sweep just tripped
+# the breaker — each extra attempt is 4 more SRP hits against an active
+# rate limit.
+if [ -f "$BREAKER_FILE" ]; then
+  SENT_STATUS="skipped (proton backoff)"
+  echo "(skipped — proton backoff active)" > "$SENT"
+elif /usr/local/bin/proton-tool sent --days=7 --limit=30 >"$SENT" 2>&1; then
   SENT_STATUS="ok"
 else
   SENT_STATUS="FAILED (exit $?)"

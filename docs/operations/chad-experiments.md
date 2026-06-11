@@ -5,13 +5,14 @@
 
 # Chad — Autonomous Experiment Lifecycle
 
-Chad runs a structured iteration loop every night at 02:00 UTC. He
-scans memory for objectives or tasks the operator does repeatedly,
-designs experiments to automate them, builds the OpenWebUI artifact
-(automation, function, tool, knowledge base, calendar event, memory,
-or note), measures outcomes against a baseline, and either promotes
-or retires the experiment — all bounded by an explicit
-concurrent-experiment budget and a regression auto-retire threshold.
+Chad runs a structured iteration loop every night at 02:00 UTC. The
+`chad-experiment-cron` wrapper scans for operator pain points in
+memory, designs experiments to address them, builds the OpenWebUI
+artifact (note, automation, or memory), records observations, and —
+once an experiment's evaluation window closes — gets a single-turn
+LLM verdict to promote, retire, or extend it. All of this is bounded
+by an explicit concurrent-experiment budget and a regression
+auto-retire threshold.
 
 This document is the operator's-eye view. Chad's playbook is the
 `chad-experiment` skill at `/sandbox/.openclaw-data/skills/chad-experiment/SKILL.md`
@@ -19,13 +20,27 @@ This document is the operator's-eye view. Chad's playbook is the
 
 ## Architecture at a glance
 
-```
-02:00 UTC nightly cron (experiment-night)
+The nightly cron is a **deterministic wrapper invocation** — the cron
+agent runs `chad-experiment-cron --timeout 150` and acks its one-line
+summary. All intelligence happens inside the wrapper via single-turn,
+no-tools LLM calls (the chad-drafter contract); there is no multi-turn
+agent loop to stall. (The previous design — an 8-tool-call multi-phase
+cron prompt — stalled nightly on free-tier inference and produced
+ledger entries without operator-visible artifacts.)
 
-  Phase 1 PROPOSE   memory + ledger scan → up to 3 designs / operator
-  Phase 2 OBSERVE   gather evidence from OpenWebUI surfaces
-  Phase 3 EVALUATE  score 0..1 vs baseline → auto promote / retire
-  Phase 4 CALENDAR  [chad-block] / [chad-experiment] / [operator-sync]
+```
+02:00 UTC nightly cron (nightly-experiments)
+  → chad-experiment-cron (deterministic driver)
+
+  Phase OBSERVE   heartbeat observation per active experiment
+                  (days_running, surface_id)
+  Phase EVALUATE  experiments past their window → ONE single-turn
+                  LLM call each → verdict promote|retire|extend
+                  (LLM failure falls back: extend once, then retire)
+  Phase DESIGN    if under the active cap → ONE single-turn LLM call
+                  proposes a new experiment against the surface
+                  whitelist (notes / automations / memories) →
+                  `chad-experiment design` + `start`
 
           ↓ writes to
   /sandbox/.openclaw-data/state/experiments/
@@ -38,10 +53,16 @@ This document is the operator's-eye view. Chad's playbook is the
           ↓ chad-proposal-apply at 04:30 UTC sees proposals
 ```
 
+The wrapper is budget-gated (`nightly-experiments` profile in
+`task-profiles.json`, 20k minBudget), flock-locked against overlap,
+and emits `chad-experiment-cron: observed=N evaluated=N designed=yes|no`
+as its only stdout — that line is the cron's whole ack.
+
 ## Files Chad touches
 
 | Path | Purpose |
 |---|---|
+| `/usr/local/bin/chad-experiment-cron` | Nightly deterministic driver (observe → evaluate → design); source-tracked at `scripts/chad-cron-wrappers/chad-experiment-cron` |
 | `/sandbox/.openclaw-data/bin/chad-experiment` | Lifecycle CLI (design, start, observe, evaluate, promote, retire, list, show, budget, ab-start, ab-pick, recent-memory, recent-ledger) |
 | `/sandbox/.openclaw-data/bin/chad-webui` | Artifact mutation surface chad-experiment calls under the hood |
 | `/sandbox/.openclaw-data/skills/chad-experiment/SKILL.md` | The methodology Chad consults |
@@ -54,7 +75,7 @@ This document is the operator's-eye view. Chad's playbook is the
 
 Default config (`config.json`):
 
-```jsonc
+```js
 {
   "max_active_per_operator": 3,
   "default_evaluation_window_days": 7,
@@ -133,8 +154,9 @@ next cron tick picks up new values (config re-read every invocation).
 
 | Symptom | Likely cause | Recovery |
 |---|---|---|
-| Cron summary says `proposed=0 observed=0 evaluated=0` repeatedly | Memory + ledger sparse OR all operators at cap | Check `chad-experiment budget`; raise cap or retire stale experiments |
-| Same hypothesis re-proposed nightly | Phase 1 not deduping against archive | Add operator memory entry "chad already tried X on YYYY-MM-DD" |
+| Cron summary says `observed=0 evaluated=0 designed=no` repeatedly | Memory digest sparse OR all operators at cap OR budget gate | Check `chad-experiment budget` and the wrapper's skip reason; raise cap or retire stale experiments |
+| `designed=no (designer LLM failed: …)` | Free-tier inference truncated the JSON mid-stream | The wrapper retries once per call; a persistent failure self-heals on the next nightly run |
+| Same hypothesis re-proposed nightly | Design prompt not deduping against archive | Add operator memory entry "chad already tried X on YYYY-MM-DD" |
 | Experiment promoted but operator never engages | Success metric too lenient | Manually retire; tighten metric in future similar designs |
 | Auto-retire on borderline winner | `regression_threshold` too tight | Loosen, then design afresh |
 | `start` fails with `chad-webui` error | Artifact creation rejected | Retire design; re-design with valid args |

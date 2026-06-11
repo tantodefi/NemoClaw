@@ -1,376 +1,470 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# chad-self-improve — Weekly self-improvement loop.
+# chad-self-improve — Weekly self-improvement loop (Hermes pattern, v2).
 #
-# Scans recent signal (failed sub-agent spawns, feedback memory entries,
-# budget exhaustion events, bug reports filed by chad-report-bug) and
-# spawns a researcher sub-agent asking it to propose 1-3 *durable*
-# improvements. Proposals land in memory/feedback-proposals.md for Chad
-# to triage on his next wake.
+# v1 collected a week of operational signal and spawned a multi-turn
+# `researcher` sub-agent to write proposals. That failed in practice:
+# the researcher hit LLM idle timeouts, never honored the JSON output
+# contract, and agent-turn timeouts caused duplicate spawns (4 spawns
+# in 5 minutes / 90k tokens burned on 2026-06-08). v2 keeps the signal
+# collection but replaces the spawn with ONE single-turn, no-tools LLM
+# call (the chad-drafter contract) plus:
+#   • flock overlap lock        — no duplicate runs, ever
+#   • daily dedupe              — at most one run section per UTC day
+#   • --detach                  — re-exec under nohup so the cron agent
+#                                 only acks the detach (cron-wrapper rule)
+#   • machine-readable applies  — cron_edit/memory proposals flow into
+#                                 the existing chad-proposal-apply →
+#                                 chad-action-gate pipeline; everything
+#                                 else stays prose for operator review
 #
-# Rules:
-#   - DRAFT-ONLY. This script never edits feedback memory entries, cron
-#     definitions, policies, or config files directly. Every output is
-#     a proposal that Chad reviews.
-#   - Budget-aware. If remaining_tokens < 2 × the researcher budget,
-#     the script exits 0 without spawning (so the weekly cron never
-#     blocks the Monday-morning token pool).
-#   - Idempotent. Writes to feedback-proposals.md with a signature
-#     header; reruns on the same day append-with-dedupe.
+# Rules (unchanged from v1):
+#   - DRAFT-ONLY for anything not covered by chad-proposal-apply's
+#     gated kinds. This script never edits cron defs or config directly.
+#   - Budget-aware: skips below minBudget without burning tokens.
+#   - Idempotent: one section per day, prepended (freshest-first, same
+#     convention as chad-budget-audit so proposal-apply's "first match
+#     wins" regex always sees the newest block).
 #
 # Usage:
-#   chad-self-improve                    # default: last 7 days of signal
-#   chad-self-improve --days 3           # shorter window
-#   chad-self-improve --dry-run          # collect signal but don't spawn
-#   chad-self-improve --budget-tokens N  # override researcher budget (default: 15000)
+#   chad-self-improve [--days N] [--dry-run] [--budget-tokens N]
+#                     [--timeout SECS] [--force] [--detach]
 #
-# Exit codes:
-#   0  ran (or intentionally skipped due to budget); see stdout
-#   2  usage error
-#   3  signal collection failed
+# Exit codes: 0 ran/skipped intentionally · 2 usage · 3 signal collection failed
 
-set -euo pipefail
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import pathlib
+import subprocess
+import sys
 
-OPENCLAW_DATA="${CHAD_OPENCLAW_DATA:-/sandbox/.openclaw-data}"
-WORKSPACE="${CHAD_WORKSPACE:-/sandbox/.openclaw/workspace}"
-# Canonical proposals path: chad-budget-audit and chad-proposal-apply both
-# use ${OPENCLAW_DATA}/memory/feedback-proposals.md. Previously this script
-# wrote to ${WORKSPACE}/memory/feedback-proposals.md, which created a
-# split-brain where self-improve drafts went to a file nobody read.
-# Override with CHAD_PROPOSALS_FILE if you need to point elsewhere (tests).
-PROPOSALS_FILE="${CHAD_PROPOSALS_FILE:-${OPENCLAW_DATA}/memory/feedback-proposals.md}"
-QUEUE_FILE="${OPENCLAW_DATA}/queue/tasks.jsonl"
-SUBAGENTS_DIR="${OPENCLAW_DATA}/subagents"
+UTC = getattr(datetime, "UTC", datetime.timezone.utc)
 
-days=7
-dry_run=0
-budget_tokens=15000
+OPENCLAW_DATA = pathlib.Path(os.environ.get("CHAD_OPENCLAW_DATA", "/sandbox/.openclaw-data"))
+WORKSPACE = pathlib.Path(os.environ.get("CHAD_WORKSPACE", "/sandbox/.openclaw/workspace"))
+# Canonical proposals path — shared with chad-budget-audit and
+# chad-proposal-apply. See v1 history: a split-brain once existed where
+# self-improve wrote to a workspace path nobody read.
+PROPOSALS_FILE = pathlib.Path(os.environ.get(
+    "CHAD_PROPOSALS_FILE", str(OPENCLAW_DATA / "memory" / "feedback-proposals.md")))
+QUEUE_FILE = OPENCLAW_DATA / "queue" / "tasks.jsonl"
+SUBAGENTS_DIR = OPENCLAW_DATA / "subagents"
+AUTO_ACTION_LOG = OPENCLAW_DATA / "state" / "auto-action-log.jsonl"
+BUDGET_FILE = pathlib.Path(os.environ.get("CHAD_BUDGET_FILE", str(OPENCLAW_DATA / "budget.json")))
+LOCK_FILE = "/tmp/chad-self-improve.lock"
 
-usage() {
-  cat <<'EOF'
-Usage: chad-self-improve [--days N] [--dry-run] [--budget-tokens N]
-EOF
-  exit 2
-}
+# Prompt budget: Nemotron via `openclaw agent --local` degrades into
+# "Agent couldn't generate a response" on oversized single-turn prompts.
+# Keep the whole prompt comfortably under this many characters.
+MAX_PROMPT_CHARS = 7000
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --days)
-      days="$2"
-      shift 2
-      ;;
-    --dry-run)
-      dry_run=1
-      shift
-      ;;
-    --budget-tokens)
-      budget_tokens="$2"
-      shift 2
-      ;;
-    -h | --help) usage ;;
-    *)
-      echo "chad-self-improve: unknown arg: $1" >&2
-      exit 2
-      ;;
-  esac
-done
 
-mkdir -p "$(dirname "$PROPOSALS_FILE")"
+def now():
+    return datetime.datetime.now(UTC)
 
-# ── Budget guard ───────────────────────────────────────────────────
-# Refuse to spawn if there isn't a comfortable reserve. The
-# self-improve cron is the lowest-priority signal consumer — it must
-# never steal budget from real work.
-if [ "$dry_run" -eq 0 ] && command -v chad-budget >/dev/null 2>&1; then
-  remaining="$(chad-budget show --field remaining_tokens 2>/dev/null || echo 0)"
-  needed=$((budget_tokens * 2))
-  if [ "${remaining:-0}" -lt "$needed" ]; then
-    echo "chad-self-improve: remaining=${remaining} < ${needed} (2× budget) — skipping weekly run" >&2
-    echo "_(skipped: budget too low on $(date -u +%Y-%m-%dT%H:%M:%SZ))_" >>"$PROPOSALS_FILE"
-    exit 0
-  fi
-fi
 
-# ── Collect signal ─────────────────────────────────────────────────
-# Writes a task file to /tmp/self-improve-<ts>.md for the researcher.
-# All string handling in Python — ledger entries and memory files can
-# contain quotes, backticks, and newlines.
-task_file="$(mktemp /tmp/self-improve.XXXXXX.md)"
+def iso(dt=None):
+    return (dt or now()).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-CHAD_SI_DAYS="$days" \
-  CHAD_SI_QUEUE_FILE="$QUEUE_FILE" \
-  CHAD_SI_SUBAGENTS_DIR="$SUBAGENTS_DIR" \
-  CHAD_SI_WORKSPACE="$WORKSPACE" \
-  CHAD_SI_TASK_FILE="$task_file" \
-  CHAD_SI_PROPOSALS_FILE="$PROPOSALS_FILE" \
-  python3 <<'PY'
-import os, json, subprocess, datetime, pathlib
-
-_UTC = getattr(datetime, "UTC", datetime.timezone.utc)
-days = int(os.environ["CHAD_SI_DAYS"])
-cutoff = datetime.datetime.now(_UTC) - datetime.timedelta(days=days)
-queue_file = pathlib.Path(os.environ["CHAD_SI_QUEUE_FILE"])
-subagents = pathlib.Path(os.environ["CHAD_SI_SUBAGENTS_DIR"])
-workspace = pathlib.Path(os.environ["CHAD_SI_WORKSPACE"])
-task_path = pathlib.Path(os.environ["CHAD_SI_TASK_FILE"])
-proposals_file = pathlib.Path(os.environ["CHAD_SI_PROPOSALS_FILE"])
 
 def parse_ts(s):
     try:
-        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
+        return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
         return None
 
-# 1. Failed or stuck spawns
-failed = []
-if queue_file.is_file():
-    for raw in queue_file.read_text().splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except Exception:
-            continue
-        ts = parse_ts(rec.get("ts_utc", ""))
-        if ts is None or ts < cutoff:
-            continue
-        if rec.get("status") in ("failed",):
-            failed.append(rec)
 
-# 2. Recent sub-agent results (last 25)
-recent_results = []
-if subagents.is_dir():
-    dirs = sorted(
-        (p for p in subagents.iterdir() if p.is_dir()),
-        key=lambda p: p.stat().st_mtime, reverse=True,
-    )[:25]
-    for d in dirs:
-        r = d / "result.json"
-        if r.is_file():
+def run_env(cmd, timeout=60):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, HOME="/sandbox"))
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+    except OSError as exc:
+        return 127, "", str(exc)
+
+
+def find_json(s):
+    """First balanced {...} span (chad-drafter algorithm)."""
+    start = s.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(s)):
+            c = s[i]
+            if esc:
+                esc = False
+                continue
+            if c == "\\":
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+        start = s.find("{", start + 1)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────
+# Signal collection (kept from v1, with per-section size caps)
+# ─────────────────────────────────────────────────────────────────
+
+def collect_signal(days):
+    cutoff = now() - datetime.timedelta(days=days)
+    sig = {}
+
+    # 1. Failed spawns
+    failed = []
+    if QUEUE_FILE.is_file():
+        for raw in QUEUE_FILE.read_text().splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
             try:
-                parsed = json.loads(r.read_text())
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            ts = parse_ts(rec.get("ts_utc", ""))
+            if ts and ts >= cutoff and rec.get("status") == "failed":
+                failed.append({k: rec.get(k) for k in
+                               ("task_id", "kind", "status", "note", "ts_utc")})
+    sig["failed_spawns"] = failed[:8]
+    sig["failed_spawns_total"] = len(failed)
+
+    # 2. Recent sub-agent results
+    results = []
+    if SUBAGENTS_DIR.is_dir():
+        dirs = sorted((p for p in SUBAGENTS_DIR.iterdir() if p.is_dir()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)[:15]
+        for d in dirs:
+            r = d / "result.json"
+            if r.is_file():
+                try:
+                    parsed = json.loads(r.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
                 if parsed.get("status") in ("failed", "done"):
-                    recent_results.append({
-                        "id": d.name,
-                        "kind": parsed.get("kind"),
-                        "status": parsed.get("status"),
-                        "summary": parsed.get("summary", "")[:300],
-                        "follow_ups": parsed.get("follow_ups", []),
-                    })
-            except Exception:
-                pass
+                    results.append({"id": d.name, "kind": parsed.get("kind"),
+                                    "status": parsed.get("status"),
+                                    "summary": str(parsed.get("summary", ""))[:160]})
+    sig["recent_subagents"] = results
 
-# 3. Cron run failures (`openclaw cron runs --limit 50` per cron).
-# Without this signal, a 3-day silent cron outage produces zero
-# proposals — the chad-self-improve loop was deaf to its own
-# infrastructure failing.
-cron_failures = []
-try:
-    raw = subprocess.check_output(
-        ["openclaw", "cron", "list", "--json"],
-        stderr=subprocess.DEVNULL, text=True, timeout=15,
-    )
-    cl = json.loads(raw)
-    items = cl if isinstance(cl, list) else (cl.get("jobs") or cl.get("items") or [])
-    for cron in items:
-        cid, name = cron.get("id"), cron.get("name")
-        if not cid:
-            continue
-        try:
-            out = subprocess.check_output(
-                ["openclaw", "cron", "runs", "--id", cid, "--limit", "50"],
-                stderr=subprocess.DEVNULL, text=True, timeout=20,
-            )
-            runs_raw = json.loads(out)
-        except Exception:
-            continue
-        runs = runs_raw if isinstance(runs_raw, list) else (runs_raw.get("entries") or [])
-        bad = []
-        for r in runs:
-            if r.get("action") != "finished":
+    # 3. Cron run failures — read the run logs directly instead of N×
+    # `openclaw cron runs` subprocesses (v1 burned up to 20s per cron and
+    # needed a live gateway; the JSONL files are the source of truth).
+    # Map job UUIDs (the runs/*.jsonl filenames) to human cron names so the
+    # LLM can emit cron_edit proposals against names, not UUIDs.
+    cron_names = {}
+    try:
+        jobs = json.load(open("/sandbox/.openclaw/cron/jobs.json"))
+        for j in jobs.get("jobs", []):
+            if j.get("id") and j.get("name"):
+                cron_names[j["id"]] = j["name"]
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    cron_failures = []
+    runs_dir = pathlib.Path("/sandbox/.openclaw/cron/runs")
+    if runs_dir.is_dir():
+        for f in sorted(runs_dir.glob("*.jsonl")):
+            bad = []
+            try:
+                lines = f.read_text().splitlines()[-200:]
+            except OSError:
                 continue
-            ts = parse_ts(datetime.datetime.fromtimestamp(
-                r.get("ts", 0) / 1000, tz=_UTC).isoformat()) if r.get("ts") else None
-            if ts is None or ts < cutoff:
+            for raw in lines:
+                try:
+                    r = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("action") != "finished":
+                    continue
+                ts = (datetime.datetime.fromtimestamp(r["ts"] / 1000, tz=UTC)
+                      if r.get("ts") else None)
+                if ts is None or ts < cutoff:
+                    continue
+                if (r.get("status") or "") not in ("ok", "completed", "success"):
+                    bad.append({"status": r.get("status"),
+                                "error": str(r.get("error") or "")[:140],
+                                "ts": iso(ts)})
+            if bad:
+                cron_failures.append({"cron": cron_names.get(f.stem, f.stem),
+                                      "fail_count": len(bad),
+                                      "samples": bad[-2:]})
+    sig["cron_failures"] = cron_failures[:10]
+
+    # 4. Auto-action errors
+    auto_failures = []
+    if AUTO_ACTION_LOG.is_file():
+        for raw in AUTO_ACTION_LOG.read_text().splitlines()[-500:]:
+            raw = raw.strip()
+            if not raw:
                 continue
-            status = r.get("status") or ""
-            if status not in ("ok", "completed", "success"):
-                bad.append({
-                    "ts": r.get("ts"),
-                    "status": status,
-                    "duration_ms": r.get("durationMs"),
-                    "error": (r.get("error") or "")[:200],
-                    "summary": (r.get("summary") or "")[:200],
-                })
-        if bad:
-            cron_failures.append({"cron": name, "fail_count": len(bad), "samples": bad[:3]})
-except Exception as exc:
-    cron_failures.append({"_error": f"could not list crons: {exc}"})
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            ts = parse_ts(entry.get("ts", ""))
+            if ts and ts >= cutoff and entry.get("result") not in ("ok", None):
+                auto_failures.append({"action": entry.get("action"),
+                                      "target": entry.get("target"),
+                                      "result": str(entry.get("result"))[:120]})
+    sig["auto_action_errors"] = auto_failures[:10]
 
-# 4. Auto-action log failures (`auto-action-log.jsonl`). Errors
-# logged here (e.g., a github_comment that 4xx'd) won't show up in
-# subagent results — they're emitted directly by the wrappers.
-auto_failures = []
-log_path = pathlib.Path("/sandbox/.openclaw-data/state/auto-action-log.jsonl")
-if log_path.is_file():
-    for raw in log_path.read_text().splitlines()[-500:]:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            entry = json.loads(raw)
-        except Exception:
-            continue
-        ts = parse_ts(entry.get("ts", ""))
-        if ts is None or ts < cutoff:
-            continue
-        if entry.get("result") not in ("ok", None):
-            auto_failures.append(entry)
+    # 5. Existing feedback memories (titles + first line only — the
+    # full 800-char heads from v1 blew the prompt budget)
+    feedback = []
+    mem_dir = WORKSPACE / "memory"
+    if mem_dir.is_dir():
+        for p in sorted(mem_dir.glob("feedback_*.md")):
+            try:
+                head = p.read_text()[:200].replace("\n", " ")
+            except OSError:
+                continue
+            feedback.append(f"{p.name}: {head}")
+    sig["existing_feedback"] = feedback[:10]
 
-# 5. Recent feedback memories (these are the *existing* rules; the
-#    researcher should propose *new* ones or amendments)
-feedback = []
-mem_dir = workspace / "memory" if (workspace / "memory").is_dir() else None
-if mem_dir:
-    for p in mem_dir.glob("feedback_*.md"):
+    # 6. Outstanding proposals sample (latest 1500 chars)
+    outstanding = ""
+    if PROPOSALS_FILE.is_file():
         try:
-            feedback.append({"file": p.name, "head": p.read_text()[:800]})
-        except Exception:
+            outstanding = PROPOSALS_FILE.read_text()[:1500]
+        except OSError:
             pass
+    sig["outstanding_proposals_sample"] = outstanding
+    return sig
 
-# 6. Outstanding proposals — proposals that have been emitted but
-# never picked up by chad-proposal-apply (or were skipped by it).
-# Helps the researcher notice when a proposal keeps recurring without
-# resolution.
-outstanding = []
-if proposals_file.is_file():
-    text = proposals_file.read_text()
-    # Take the last 4000 chars as a sample (latest blocks first per
-    # chad-budget-audit's prepend pattern).
-    outstanding = [text[:4000]]
 
-# Assemble the task brief
-lines = [
-    "# Task: propose durable self-improvements",
-    "",
-    "You are the researcher sub-agent. Chad has accumulated a week of",
-    "operational signal — failed sub-agent spawns, cron-run failures,",
-    "auto-action errors, and the existing feedback memory corpus.",
-    "Your job is to propose **1-3 durable improvements** Chad can apply",
-    "to his own behavior. Each proposal must be one of these shapes:",
-    "",
-    "- **New feedback memory entry** (filename, body)",
-    "- **Amendment to existing feedback memory** (file, diff)",
-    "- **Cron tweak** (cron name, old value, new value, reason) —",
-    "  if it's a `timeoutSeconds` or `maxOutputTokens` change,",
-    "  chad-budget-audit may already emit it; only add a *qualitative*",
-    "  cron tweak here (schedule, message, behavior change).",
-    "- **New kind manifest** (name, binary, policy, budget)",
-    "",
-    "Rules:",
-    "- Do NOT propose code changes or policy changes — those go through",
-    "  the bug-intake / PR loop, not this loop.",
-    "- Do NOT propose anything that isn't directly supported by the",
-    "  signal below. If the signal is too thin, say so and exit.",
-    "- Propose at most 3. Fewer is better. Chad will reject proposals",
-    "  that feel speculative.",
-    "- Pay special attention to crons that are erroring repeatedly —",
-    "  silent infrastructure failure is the worst class of bug.",
-    "",
-    "## Signal",
-    "",
-    f"### Failed spawns ({len(failed)} in last {days} days)",
-    "",
-    "```json",
-    *(json.dumps(f) for f in failed[:10]),
-    "```",
-    "",
-    f"### Recent sub-agent results ({len(recent_results)})",
-    "",
-    "```json",
-    *(json.dumps(r) for r in recent_results),
-    "```",
-    "",
-    f"### Cron run failures ({sum(c.get('fail_count', 0) for c in cron_failures)} across {len(cron_failures)} crons)",
-    "",
-    "```json",
-    *(json.dumps(c) for c in cron_failures),
-    "```",
-    "",
-    f"### Auto-action errors ({len(auto_failures)} in last {days} days)",
-    "",
-    "```json",
-    *(json.dumps(a) for a in auto_failures[:20]),
-    "```",
-    "",
-    f"### Existing feedback memories ({len(feedback)})",
-    "",
-]
-for f in feedback[:6]:
-    lines.append(f"**{f['file']}:**")
-    lines.append("")
-    lines.append(f["head"])
-    lines.append("")
-if outstanding:
-    lines.append("### Outstanding proposals (not yet applied)")
-    lines.append("")
-    lines.append("```")
-    lines.extend(outstanding)
-    lines.append("```")
-    lines.append("")
-lines += [
-    "## Output format",
-    "",
-    "Write the proposals as a markdown section titled",
-    "`## Self-improvement proposals (<today-UTC>)` with one H3 per",
-    "proposal. End with a JSON summary on the last line:",
-    "",
-    '    {"status":"done","proposals":<N>,"summary":"..."}',
-]
-task_path.write_text("\n".join(lines))
-print(f"wrote {task_path}")
-PY
+# ─────────────────────────────────────────────────────────────────
+# Single-turn proposal pass
+# ─────────────────────────────────────────────────────────────────
 
-# ── Spawn researcher ───────────────────────────────────────────────
-if [ "$dry_run" -eq 1 ]; then
-  echo "[dry-run] task file: $task_file"
-  echo "[dry-run] would spawn: chad-spawn --kind researcher --task-file $task_file --budget-tokens $budget_tokens"
-  exit 0
-fi
+RULES = (
+    "STRICT RULES:\n"
+    "  • Output exactly ONE valid JSON object on a SINGLE line. No prose. No code fences.\n"
+    "  • Do NOT call any tools. Do NOT request more information.\n"
+    "  • Propose 0-3 durable improvements. Fewer is better. If the signal is "
+    "too thin, return {\"proposals\":[],\"summary\":\"signal too thin\"}.\n"
+    "  • Every proposal MUST cite which signal section supports it.\n"
+    "  • Do NOT propose code or policy changes (those go through the PR loop).\n"
+    "  • kind=cron_edit only for timeoutSeconds/maxOutputTokens with integer "
+    "old/new values taken from the signal. Qualitative cron changes "
+    "(schedule, message) must use kind=prose.\n"
+    "  • kind=memory content is ONE short imperative rule (≤200 chars) that "
+    "would have prevented an observed failure.\n"
+)
 
-if ! command -v chad-spawn >/dev/null 2>&1; then
-  echo "chad-self-improve: chad-spawn not on PATH — orchestrator not installed?" >&2
-  exit 3
-fi
+SCHEMA = (
+    'Schema: {"proposals":[{"kind":"prose|memory|cron_edit",'
+    '"title":"<short>","body":"<markdown, ≤120 words>",'
+    '"reason":"<which signal supports this>",'
+    '"cron":"<name, cron_edit only>","field":"timeoutSeconds|maxOutputTokens",'
+    '"old":123,"new":456,'
+    '"content":"<memory kind only>"}],"summary":"<one line>"}'
+)
 
-task_id="$(chad-spawn --kind researcher --task-file "$task_file" \
-  --budget-tokens "$budget_tokens" \
-  --timeout 300 2>&1)" || {
-  echo "chad-self-improve: spawn failed: $task_id" >&2
-  exit 3
-}
 
-# ── Append proposal to memory/feedback-proposals.md ────────────────
-workdir="${OPENCLAW_DATA}/subagents/${task_id}"
-result_file="${workdir}/result.json"
-report_file="${workdir}/report.md"
+def build_prompt(sig, days):
+    body = json.dumps(sig, ensure_ascii=False)
+    # Trim the biggest free-text field first if over budget.
+    overhead = 1600  # rules + schema + framing
+    if len(body) + overhead > MAX_PROMPT_CHARS:
+        sig = dict(sig, outstanding_proposals_sample=sig["outstanding_proposals_sample"][:400])
+        body = json.dumps(sig, ensure_ascii=False)
+    if len(body) + overhead > MAX_PROMPT_CHARS:
+        body = body[:MAX_PROMPT_CHARS - overhead]
+    return (
+        "You are Chad's self-improvement analyst. Below is the last "
+        f"{days} days of operational signal: failed sub-agent spawns, cron "
+        "run failures, auto-action errors, the existing feedback-rule "
+        "corpus, and proposals still awaiting action. Propose durable "
+        "improvements to Chad's own behavior.\n\n" + RULES + "\n" + SCHEMA +
+        "\n\nSignal (JSON):\n" + body +
+        "\n\nReturn ONLY the JSON object."
+    )
 
-{
-  printf '\n## Self-improvement run — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf '- **task_id:** `%s`\n' "$task_id"
-  if [ -f "$result_file" ]; then
-    printf '- **result:**\n\n'
-    printf '  ```json\n'
-    sed 's/^/  /' "$result_file"
-    printf '\n  ```\n'
-  fi
-  if [ -f "$report_file" ]; then
-    printf '\n### Report\n\n'
-    cat "$report_file"
-  fi
-} >>"$PROPOSALS_FILE"
 
-echo "$task_id"
+def llm(prompt, timeout):
+    rc, out, err = run_env(
+        ["timeout", "--kill-after=5", f"{timeout}s",
+         "openclaw", "agent", "--agent", "main", "--local",
+         "--session-id", f"self-improve-{int(now().timestamp())}",
+         "-m", prompt],
+        timeout=timeout + 15)
+    if rc != 0 and not out.strip():
+        return None, f"agent exit {rc}: {err.strip()[:200]}"
+    raw = find_json(out)
+    if not raw:
+        return None, f"no JSON in response: {out.strip()[:200]}"
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError as exc:
+        return None, f"json decode: {exc}"
+
+
+def validate(parsed):
+    """Split LLM proposals into (prose_list, applies_list)."""
+    prose, applies = [], []
+    for p in (parsed.get("proposals") or [])[:3]:
+        if not isinstance(p, dict):
+            continue
+        kind = str(p.get("kind", "prose")).strip()
+        title = str(p.get("title", "")).strip()[:120]
+        body = str(p.get("body", "")).strip()[:1200]
+        reason = str(p.get("reason", "")).strip()[:300]
+        if not title or not body:
+            continue
+        entry = {"kind": kind, "title": title, "body": body, "reason": reason}
+        if kind == "cron_edit":
+            cron = str(p.get("cron", "")).strip()
+            field = str(p.get("field", "")).strip()
+            old, new = p.get("old"), p.get("new")
+            if (cron and field in ("timeoutSeconds", "maxOutputTokens")
+                    and isinstance(old, int) and isinstance(new, int)
+                    and old > 0 and new > 0):
+                applies.append({"kind": "cron_edit", "cron": cron, "field": field,
+                                "old": old, "new": new, "reason": reason or title})
+            else:
+                entry["kind"] = "prose"  # malformed cron_edit degrades to prose
+        elif kind == "memory":
+            content = str(p.get("content", "")).strip()[:200]
+            if content:
+                applies.append({"kind": "memory", "name": title,
+                                "content": content, "reason": reason or title})
+            else:
+                entry["kind"] = "prose"
+        prose.append(entry)
+    return prose, applies
+
+
+def render_section(ts, days, sig, prose, applies, summary, llm_err):
+    lines = [f"## Self-improvement run — {ts}",
+             f"- window: {days}d · failed_spawns={sig['failed_spawns_total']} "
+             f"cron_failures={sum(c.get('fail_count', 0) for c in sig['cron_failures'])} "
+             f"auto_errors={len(sig['auto_action_errors'])}"]
+    if llm_err:
+        lines += ["", f"_LLM pass failed: {llm_err} — signal collected, no proposals this run._"]
+    elif not prose:
+        lines += ["", f"_No proposals: {summary or 'signal too thin'}_"]
+    else:
+        for p in prose:
+            lines += ["", f"### {p['title']} ({p['kind']})", "", p["body"]]
+            if p["reason"]:
+                lines += ["", f"_Evidence: {p['reason']}_"]
+        if applies:
+            lines += ["", "### Proposals (machine-readable)", "", "```json",
+                      json.dumps({"ts": ts, "source": "chad-self-improve",
+                                  "applies": applies}, indent=2),
+                      "```"]
+        if summary:
+            lines += ["", f"_Summary: {summary}_"]
+    return "\n".join(lines) + "\n"
+
+
+def prepend(path, section):
+    old = path.read_text() if path.is_file() else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(section + ("\n" + old if old.strip() else ""))
+
+
+# ─────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(prog="chad-self-improve")
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--budget-tokens", type=int, default=15000,
+                    help="LLM reserve check: skip if remaining < 2x this")
+    ap.add_argument("--timeout", type=int, default=120,
+                    help="Single-turn LLM timeout (default 120s)")
+    ap.add_argument("--force", action="store_true",
+                    help="Run even if a section for today already exists")
+    ap.add_argument("--detach", action="store_true",
+                    help="Re-exec under nohup and return immediately (cron mode)")
+    args = ap.parse_args()
+
+    if args.detach:
+        argv = [a for a in sys.argv[1:] if a != "--detach"]
+        log = f"/tmp/chad-self-improve-{now().strftime('%Y%m%dT%H%M%SZ')}.log"
+        with open(log, "ab") as out:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), *argv],
+                stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+                start_new_session=True)
+        print(f"chad-self-improve detached (log: {log})")
+        return 0
+
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("skipped: another chad-self-improve run holds the lock")
+        return 0
+
+    today = now().strftime("%Y-%m-%d")
+    if not args.force and PROPOSALS_FILE.is_file():
+        if f"## Self-improvement run — {today}" in PROPOSALS_FILE.read_text():
+            print(f"skipped: already ran today ({today}); use --force to rerun")
+            return 0
+
+    # Budget gate — direct budget.json read (chad-budget has a stale
+    # env-var export bug; see chad-mail-check).
+    remaining = 0
+    try:
+        remaining = int(json.load(BUDGET_FILE.open()).get("remaining_tokens", 0))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    needed = args.budget_tokens * 2
+    if not args.dry_run and remaining < needed:
+        prepend(PROPOSALS_FILE,
+                f"## Self-improvement run — {iso()}\n"
+                f"_(skipped: remaining={remaining} < {needed})_\n")
+        print(f"skipped: budget {remaining} < {needed}")
+        return 0
+
+    try:
+        sig = collect_signal(args.days)
+    except Exception as exc:  # signal collection must fail loud
+        print(f"chad-self-improve: signal collection failed: {exc}", file=sys.stderr)
+        return 3
+
+    prompt = build_prompt(sig, args.days)
+    if args.dry_run:
+        print(f"[dry-run] prompt chars={len(prompt)} "
+              f"failed_spawns={sig['failed_spawns_total']} "
+              f"cron_failures={len(sig['cron_failures'])} "
+              f"auto_errors={len(sig['auto_action_errors'])}")
+        print(prompt)
+        return 0
+
+    parsed, llm_err = llm(prompt, args.timeout)
+    prose, applies, summary = [], [], ""
+    if parsed:
+        prose, applies = validate(parsed)
+        summary = str(parsed.get("summary", ""))[:200]
+
+    ts = iso()
+    section = render_section(ts, args.days, sig, prose, applies, summary, llm_err)
+    prepend(PROPOSALS_FILE, section)
+    print(f"chad-self-improve: proposals={len(prose)} machine_applies={len(applies)} "
+          f"llm={'ok' if parsed else 'failed'} -> {PROPOSALS_FILE}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

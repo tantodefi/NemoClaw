@@ -351,7 +351,7 @@ print(json.dumps(out, indent=2))
       }
 
       install_to_usrlocal "${REPO_ROOT}/scripts/chad-github-worker/chad-dispatch"
-      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve chad-proposal-apply chad-skill-watch chad-memory-snapshot chad-memory-curator chad-spawn-poll chad-spawn-gc; do
+      for wrapper in chad-ensure-today-memory chad-log-event chad-gbrain-dream chad-workspace-backup chad-mail-check chad-mail-send chad-issue-triage-cron chad-email-check-cron chad-budget-audit chad-auth-context chad-premium chad-premium-client chad-dump-logs chad-route-prompt chad-drafter chad-action-gate chad-autosend-replies chad-cron-reload chad-workflow-batch chad-self-improve chad-proposal-apply chad-skill-watch chad-memory-snapshot chad-memory-curator chad-spawn-poll chad-spawn-gc chad-experiment-cron chad-gbrain-prune; do
         install_to_usrlocal "${REPO_ROOT}/scripts/chad-cron-wrappers/${wrapper}"
       done
 
@@ -485,11 +485,12 @@ if [ "$skip_gbrain" -eq 0 ]; then
                      /sandbox/.gbrain/brain.pglite/.gbrain-lock 2>/dev/null; true' || true
       # Pass GBRAIN_EMBED_* at init so the schema's vector(N) column matches
       # the embedder configured in step 3b. Patched gbrain (tantodefi fork)
-      # reads these at module load — without them the column defaults to
-      # vector(1536) and embeddings at 1024 dims fail at INSERT time.
+      # reads these at module load. We standardize on 1536 dims: the live
+      # chad brain's vector column is vector(1536) (gbrain default), and a
+      # mismatched config fails at INSERT with "expected 1536 dimensions".
       ssh "$REMOTE_HOST" 'HOME=/sandbox \
-        GBRAIN_EMBED_MODEL=nvidia/llama-3.2-nv-embedqa-1b-v2 \
-        GBRAIN_EMBED_DIMENSIONS=1024 \
+        GBRAIN_EMBED_MODEL=nvidia/llama-nemotron-embed-1b-v2 \
+        GBRAIN_EMBED_DIMENSIONS=1536 \
         gbrain init 2>/dev/null || true'
       gbrain_status="$(ssh "$REMOTE_HOST" 'gbrain doctor 2>&1 | tail -3')"
       info "gbrain init done: ${gbrain_status}"
@@ -517,10 +518,16 @@ fi
 #   GBRAIN_EMBED_INPUT_TYPE  — NIM-only ("passage"/"query"), sent if non-empty
 # Plus the OpenAI SDK reads OPENAI_BASE_URL / OPENAI_API_KEY directly.
 #
-# We pick nvidia/llama-3.2-nv-embedqa-1b-v2 at 1024 dims because:
+# We pick nvidia/llama-nemotron-embed-1b-v2 at 1536 dims because:
 #   - matryoshka model accepts the `dimensions` parameter (free model choice)
-#   - 1024 dims keeps the vector column / HNSW index reasonably small
+#   - 1536 dims matches the live brain's vector(1536) column (gbrain's
+#     schema default) — a smaller value fails at INSERT time
 #   - free with the existing NVIDIA_API_KEY; no extra account or paid OpenAI
+#   - direct successor to nvidia/llama-3.2-nv-embedqa-1b-v2, which was
+#     EOL'd by NVIDIA on 2026-05-18 (endpoint returns 410 Gone). If embeds
+#     start failing with 410 again, check `curl integrate.api.nvidia.com/v1/models`
+#     for the current embedqa successor and update the three GBRAIN_EMBED_MODEL
+#     sites in this file + scripts/sandbox-bin/gbrain-wrapper.sh.
 # The network policy preset gbrain.yaml already allows
 # integrate.api.nvidia.com:443/v1/embeddings for the gbrain binary.
 
@@ -542,16 +549,16 @@ cfg = {
   'database_path': '/sandbox/.gbrain/brain.pglite',
   'openai_api_key': os.environ['NVIDIA_KEY'] or 'unused',
   'openai_base_url': 'https://integrate.api.nvidia.com/v1',
-  'embed_model': 'nvidia/llama-3.2-nv-embedqa-1b-v2',
-  'embed_dimensions': '1024',
+  'embed_model': 'nvidia/llama-nemotron-embed-1b-v2',
+  'embed_dimensions': '1536',
   'embed_input_type': 'passage',
 }
 with open('/sandbox/.gbrain/config.json', 'w') as f:
     json.dump(cfg, f, indent=2)
 os.chmod('/sandbox/.gbrain/config.json', 0o600)
-print('gbrain configured for NVIDIA NIM embeddings (llama-3.2-nv-embedqa-1b-v2 @ 1024 dims)')
+print('gbrain configured for NVIDIA NIM embeddings (llama-nemotron-embed-1b-v2 @ 1536 dims)')
 \""
-  info "gbrain configured to use NVIDIA NIM embeddings (llama-3.2-nv-embedqa-1b-v2 @ 1024 dims)"
+  info "gbrain configured to use NVIDIA NIM embeddings (llama-nemotron-embed-1b-v2 @ 1536 dims)"
 
   # Install gbrain wrapper that exports OPENAI_API_KEY before invoking the
   # real binary. The OpenAI Node SDK throws if OPENAI_API_KEY is empty even
@@ -598,8 +605,8 @@ if needs_rewrite:
       'database_path': '/sandbox/.gbrain/brain.pglite',
       'openai_api_key': os.environ['NVIDIA_KEY'] or 'unused',
       'openai_base_url': 'https://integrate.api.nvidia.com/v1',
-      'embed_model': 'nvidia/llama-3.2-nv-embedqa-1b-v2',
-      'embed_dimensions': '1024',
+      'embed_model': 'nvidia/llama-nemotron-embed-1b-v2',
+      'embed_dimensions': '1536',
       'embed_input_type': 'passage',
     }
     with open('/sandbox/.gbrain/config.json', 'w') as f:
@@ -850,10 +857,17 @@ if [ "$skip_crons" -eq 0 ]; then
   # triage from the previous afternoon has time to land reactions/labels.
   issue_triage_message='Run `chad-issue-triage-cron`. The wrapper enforces the budget gate, detaches the triage run, and returns in <1s. Confirm it printed `issue-triage detached` (or `skipped: budget=...`), then exit.'
 
-  # Weekly self-improvement: scans failed spawns + feedback memory,
-  # spawns a researcher with a "propose 1-3 improvements" task. Runs
-  # Sunday 03:00 UTC when the inbox is quiet and budget is fresh.
-  self_improve_message='Run `chad-self-improve --days 7`. Append the stdout to todays memory file under a `## Self-improvement` heading. Do NOT apply any proposals — they land in memory/feedback-proposals.md for review later.'
+  # Weekly self-improvement (v2): the wrapper collects operational signal
+  # (failed spawns, cron failures, auto-action errors, feedback memory),
+  # makes a single-turn LLM call, and prepends machine-readable proposals
+  # to memory/feedback-proposals.md. --detach re-execs under nohup so the
+  # cron turn only acks the detach line. Runs Sunday 03:00 UTC when the
+  # inbox is quiet and budget is fresh.
+  self_improve_message='Run this command and report only its stdout line, then exit:
+  chad-self-improve --detach --days 7 --budget-tokens 15000
+
+Do NOT read any memory files. Do NOT search gbrain. Do NOT call any other tools.
+The command detaches and finishes in the background; do not wait beyond the stdout line.'
 
   register_cron_via_ssh() {
     local name="$1"
@@ -917,6 +931,35 @@ if [ "$skip_crons" -eq 0 ]; then
     register_cron_via_ssh "self-improve" "0 3 * * 0" "" "$self_improve_message"
   fi
 
+  # Nightly experiments (deterministic driver): chad-experiment-cron does
+  # observe → evaluate (single-turn LLM verdict) → design (whitelisted
+  # OpenWebUI surfaces) without multi-turn agent loops. 02:00 UTC, before
+  # gbrain-dream so new surfaces land in the morning sync.
+  nightly_experiments_message='Run this command and wait for it to finish:
+  chad-experiment-cron --timeout 150
+
+Do NOT read any memory files. Do NOT search gbrain. Do NOT call any other tools.
+Report its one-line summary (observed/evaluated/designed) and exit.'
+
+  if echo "$existing_crons" | grep -q "nightly-experiments"; then
+    warn "nightly-experiments cron already registered — skipping"
+  else
+    info "Registering nightly-experiments cron (nightly 02:00 UTC)"
+    register_cron_via_ssh "nightly-experiments" "0 2 * * *" "" "$nightly_experiments_message"
+  fi
+
+  # Weekly gbrain retention sweep: deletes age-eligible dated pages
+  # (memory/events >365d, chat >180d) and stale workspace digests (>30d).
+  # `0` arg = DRY_RUN off. Sunday 02:00 UTC, before self-improve.
+  gbrain_prune_message='Run `chad-gbrain-prune 0` and wait for it to finish. The wrapper deletes age-eligible gbrain pages (memory/events >365d, chat >180d) and stale workspace digest/feedback files (>30d), writing a prune log to memory. Report its one-line summary, then exit. Do NOT read memory files or call any other tools.'
+
+  if echo "$existing_crons" | grep -q "gbrain-prune"; then
+    warn "gbrain-prune cron already registered — skipping"
+  else
+    info "Registering gbrain-prune cron (weekly Sun 02:00 UTC)"
+    register_cron_via_ssh "gbrain-prune" "0 2 * * 0" "" "$gbrain_prune_message"
+  fi
+
   # GBrain nightly dream cycle: embed stale pages, extract entity links, run
   # doctor. Runs at 03:30 UTC (after self-improve) so the brain is fresh each
   # morning. Budget-guarded by gbrain itself — safe to run even on low-token days.
@@ -935,7 +978,7 @@ if [ "$skip_crons" -eq 0 ]; then
   # (nightly), so signal collection isn't competing with its own outputs.
   # DRAFT-ONLY: emits proposals.json the operator (or future
   # chad-memory-apply) reviews. Never mutates lancedb or workspace files.
-  memory_curator_message='Run `chad-memory-curator --days 7`. The wrapper snapshots memory dirs first, then spawns a researcher that proposes consolidation actions to /sandbox/.openclaw-data/curator-runs/<utc>/proposals.json. Append a one-line summary to todays memory under `## Memory curator`. Never apply proposals.'
+  memory_curator_message='Run `chad-memory-curator --days 7` and wait for it to finish. The wrapper snapshots memory dirs first, then spawns a researcher that proposes consolidation actions to /sandbox/.openclaw-data/curator-runs/<utc>/proposals.json. Report its one-line summary, then exit. Never apply proposals; do NOT call any other tools.'
 
   if echo "$existing_crons" | grep -q "memory-curator"; then
     warn "memory-curator cron already registered — skipping"
@@ -959,11 +1002,12 @@ if [ "$skip_crons" -eq 0 ]; then
     register_cron_via_ssh "spawn-poll" "*/5 * * * *" "" "$spawn_poll_message"
   fi
 
-  # Branch retention for chad-spawn/* in chad-state. With ~24 spawns/day
-  # budget that's ~700 branches/month if nothing prunes them. Default
-  # retention: done branches 7d, failed 30d, in-flight always kept.
-  # Weekly Mon 02:30 UTC, before the busy day.
-  spawn_gc_message='Run `chad-spawn-gc`. The wrapper deletes terminal-ized chad-spawn/* branches in chad-state per retention policy (done=7d, failed=30d). Append a one-line summary to todays memory if any branches were deleted.'
+  # Orphan reconcile + branch retention for chad-spawn/* in chad-state.
+  # Phase 1 terminal-izes ledger entries stuck queued/running >24h (parent
+  # cron killed mid-spawn); phase 2 deletes terminal-ized branches per
+  # retention (done=7d, failed=30d) and skips itself when gh is
+  # unauthenticated. Weekly Mon 02:30 UTC, before the busy day.
+  spawn_gc_message='Run `chad-spawn-gc` and wait for it to finish. The wrapper reconciles orphaned ledger entries (queued/running >24h) and prunes terminal-ized chad-spawn/* branches (done=7d, failed=30d); branch gc skips itself if gh is unauthenticated. Report its one-line summary, then exit. Do NOT read memory files or call any other tools.'
 
   if echo "$existing_crons" | grep -q "spawn-gc"; then
     warn "spawn-gc cron already registered — skipping"

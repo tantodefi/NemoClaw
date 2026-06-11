@@ -148,7 +148,8 @@ available" sentinel if invoked. They're useful only on the host.
 Separate from `extraDirs`: skills under `.agents/skills/nemoclaw-*/` are
 auto-loaded by OpenClaw's managed scan when the workspace `.agents/`
 symlink is present (or the repo is checked out as `/sandbox/source`).
-Catalog them in [`nemoclaw-skills-guide`](../../.agents/skills/nemoclaw-skills-guide/SKILL.md)
+Catalog them in `nemoclaw-skills-guide` (at
+`.agents/skills/nemoclaw-skills-guide/SKILL.md` in the repo)
 rather than restating here — those skills are aimed at users + maintainers
 of the NemoClaw repo itself, not at Chad's runtime workflow.
 

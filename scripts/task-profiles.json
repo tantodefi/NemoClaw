@@ -70,13 +70,71 @@
     },
 
     "self-improve": {
-      "kind": "cron-direct-invocation",
-      "maxOutputTokens": 4096,
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 60,
+      "thinking": "off",
+      "minBudgetTokens": 30000,
+      "schedule": "0 3 * * 0",
+      "reason": "v2 (2026-06-10): agent runs `chad-self-improve --detach` and only acks the detach line — the wrapper re-execs itself under nohup, collects signal deterministically, and makes ONE single-turn no-tools LLM call (chad-drafter contract) to draft proposals into feedback-proposals.md. Replaces the v1 multi-turn researcher spawn that hit LLM idle timeouts and duplicate-spawned 4x in 5 min on 2026-06-08. flock + per-day dedupe inside the wrapper make reruns safe. minBudget=30k = 2x the wrapper's 15k LLM reserve. Inherits model from registry default.",
+      "drafter": {
+        "_comment": "Knobs for the wrapper's internal single-turn proposal call.",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "thinking": "high",
+        "maxOutputTokens": 4096,
+        "timeoutSeconds": 120,
+        "minBudgetTokens": 30000,
+        "usePremium": false
+      }
+    },
+
+    "nightly-experiments": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 600,
+      "thinking": "off",
+      "minBudgetTokens": 20000,
+      "schedule": "0 2 * * *",
+      "reason": "Nightly 02:00 UTC — agent runs `chad-experiment-cron` and confirms its one-line summary. ALL experiment intelligence (evaluate verdicts, new-experiment design) happens inside the wrapper via two single-turn no-tools LLM calls (chad-drafter contract), NOT in the cron payload. This replaced the old 8-tool-call multi-phase prompt that Nemotron stalled on nightly. timeoutSeconds=600 covers the wrapper's worst case (2 LLM calls x 120s + chad-webui artifact creation). minBudget=20k gates inside the wrapper too (same value, single source here). thinking=off LOAD-BEARING: payload is invoke-and-ack only. Inherits model from registry default.",
+      "drafter": {
+        "_comment": "Knobs for the wrapper's two internal single-turn calls (evaluator + designer). Read by chad-experiment-cron via --timeout; model is whatever `openclaw agent --local` resolves (registry default).",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "thinking": "high",
+        "maxOutputTokens": 4096,
+        "timeoutSeconds": 120,
+        "minBudgetTokens": 20000,
+        "usePremium": false
+      }
+    },
+
+    "spawn-gc": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 120,
+      "thinking": "off",
+      "minBudgetTokens": 5000,
+      "schedule": "30 2 * * 1",
+      "reason": "Weekly Mon 02:30 UTC — agent runs `chad-spawn-gc` and acks the one-line summary. Phase 1 (orphan reconcile) terminal-izes ledger entries stuck queued/running >24h — catches spawns whose parent cron was killed mid-flight (5 researcher orphans observed 2026-06-07). Phase 2 (branch retention, done=7d failed=30d) needs gh and skips itself when unauthenticated instead of failing the run. Pure shell+python, no LLM call. Inherits model from registry default."
+    },
+
+    "gbrain-prune": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
       "timeoutSeconds": 300,
       "thinking": "off",
-      "minBudgetTokens": 50000,
-      "schedule": "0 3 * * 0",
-      "reason": "Agent runs chad-self-improve --days 7 directly and pastes its stdout into memory under '## Self-improvement'. Larger output budget (4k) than other crons because the proposals get echoed; longer timeout (300s) because the helper itself does some analysis. Inherits model from registry default."
+      "minBudgetTokens": 5000,
+      "schedule": "0 2 * * 0",
+      "reason": "Weekly Sun 02:00 UTC — agent runs `chad-gbrain-prune 0` (DRY_RUN off) and acks the one-line summary. Retention sweep: gbrain memory/events >365d, chat >180d, workspace dated digests/feedback >30d. Never touches system/*, agent/*, or undated slugs. Pure local work against the gbrain HTTP API, no LLM call. Inherits model from registry default."
+    },
+
+    "memory-curator": {
+      "kind": "cron-wrapper-invocation",
+      "maxOutputTokens": 1024,
+      "timeoutSeconds": 120,
+      "thinking": "off",
+      "minBudgetTokens": 40000,
+      "schedule": "0 4 * * 6",
+      "reason": "Weekly Sat 04:00 UTC (Hermes pattern) — agent runs `chad-memory-curator --days 7` and acks the summary. Wrapper snapshots memory dirs then spawns a researcher proposing consolidation diffs to curator-runs/<utc>/proposals.json; proposals are NEVER auto-applied. minBudget=40k because the detached researcher needs ~30k. Separate day from self-improve (Sun) and gbrain-dream (nightly) so signal collection isn't competing with its own outputs. Inherits model from registry default."
     },
 
     "chad-budget-audit": {

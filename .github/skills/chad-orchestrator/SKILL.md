@@ -176,6 +176,11 @@ All of `subagents/`, `queue/`, and `budget.json` are included in the
 `chad-backup-to-github` backup set — so the sub-agent ledger survives
 sandbox resets alongside memory.
 
+Entries stuck in `queued`/`running` for more than 24h (parent cron
+killed mid-spawn) are terminal-ized by the weekly `chad-spawn-gc` cron's
+orphan-reconcile phase: `failed` with a reconcile note, or `done` if a
+`result.json` exists but the parent never recorded it.
+
 ## Canonical Workflow
 
 ```bash

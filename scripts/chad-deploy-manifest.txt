@@ -29,12 +29,18 @@
 # ─────────────────────────────────────────────────────────────────────────
 # CRON WRAPPERS — /usr/local/bin/ (system, root, kubectl)
 # ─────────────────────────────────────────────────────────────────────────
+# gbrain env-export wrapper (chad-setup.sh step 3b). NOTE: assumes the
+# original binary was already moved to /usr/local/bin/gbrain-bin by
+# chad-setup.sh — run chad-setup before chad-deploy on a fresh pod.
+# Drift here = embeddings silently 0% (OPENAI_API_KEY missing in cron env).
+scripts/sandbox-bin/gbrain-wrapper.sh                /usr/local/bin/gbrain                   755 kubectl
 scripts/chad-cron-wrappers/chad-action-gate          /usr/local/bin/chad-action-gate         755 kubectl
 scripts/chad-cron-wrappers/chad-auth-context         /usr/local/bin/chad-auth-context        755 kubectl
 scripts/chad-cron-wrappers/chad-autosend-replies     /usr/local/bin/chad-autosend-replies    755 kubectl
 scripts/chad-cron-wrappers/chad-budget-audit         /usr/local/bin/chad-budget-audit        755 kubectl
 scripts/chad-cron-wrappers/chad-cron-reload          /usr/local/bin/chad-cron-reload         755 kubectl
 scripts/chad-cron-wrappers/chad-drafter              /usr/local/bin/chad-drafter             755 kubectl
+scripts/chad-cron-wrappers/chad-experiment-cron      /usr/local/bin/chad-experiment-cron     755 kubectl
 scripts/chad-cron-wrappers/chad-dump-logs            /usr/local/bin/chad-dump-logs           755 kubectl
 scripts/chad-cron-wrappers/chad-email-check-cron     /usr/local/bin/chad-email-check-cron    755 kubectl
 scripts/chad-cron-wrappers/chad-ensure-today-memory  /usr/local/bin/chad-ensure-today-memory 755 kubectl
@@ -56,11 +62,18 @@ scripts/chad-cron-wrappers/chad-workflow-batch       /usr/local/bin/chad-workflo
 scripts/chad-cron-wrappers/chad-workspace-backup     /usr/local/bin/chad-workspace-backup    755 kubectl
 scripts/chad-github-worker/chad-dispatch             /usr/local/bin/chad-dispatch            755 kubectl
 
+# Orchestrator scripts (source of truth: .github/skills/chad-orchestrator/scripts/)
+.github/skills/chad-orchestrator/scripts/chad-spawn.sh         /usr/local/bin/chad-spawn         755 kubectl
+.github/skills/chad-orchestrator/scripts/chad-spawn-gha.sh     /usr/local/bin/chad-spawn-gha     755 kubectl
+.github/skills/chad-orchestrator/scripts/chad-spawn-status.sh  /usr/local/bin/chad-spawn-status  755 kubectl
+.github/skills/chad-orchestrator/scripts/chad-intake.sh        /usr/local/bin/chad-intake        755 kubectl
+
 # ─────────────────────────────────────────────────────────────────────────
 # OPENWEBUI / SANDBOX TOOLS — /sandbox/.openclaw-data/bin/ (sandbox, ssh)
 # Chad can self-edit these. Backups in chad-state preserve them.
 # ─────────────────────────────────────────────────────────────────────────
 scripts/openwebui/chad-experiment       /sandbox/.openclaw-data/bin/chad-experiment   755 ssh
+scripts/openwebui/chad-experiment-skill.md  /sandbox/.openclaw-data/skills/chad-experiment/SKILL.md  644 ssh
 scripts/openwebui/chad-webui            /sandbox/.openclaw-data/bin/chad-webui        755 ssh
 scripts/openwebui/chad-webui-mcp        /sandbox/.openclaw-data/bin/chad-webui-mcp    755 ssh
 scripts/openwebui/chad-inbox            /sandbox/.openclaw-data/bin/chad-inbox        755 ssh

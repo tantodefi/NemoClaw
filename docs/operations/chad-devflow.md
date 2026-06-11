@@ -112,7 +112,7 @@ Source code lives in a separate repo (`tantodefi/NemoClaw`, public). See [Backup
 | `chad-shim.py` | OpenAI-compat HTTP shim around `openclaw agent`. Listens on `127.0.0.1:8901` inside the sandbox; open-webui's `chad` model talks to it via the host SSH tunnel + `host.docker.internal`. Stdlib-only. v0.2+ does per-operator routing via `X-OpenWebUI-User-*` headers + `identities/<slug>.md`. | Supervised by `dev.nemoclaw.chad-shim-watchdog` launchd job (5-min cadence). Restart blocks in `chad-restore-from-github.sh` and `chad-backup-to-github.sh` also re-launch it as a backup safety net.
 | `chad-webui` | OpenWebUI REST API wrapper for Chad — 60 sub-commands across 10 groups (calendar/notes/automations/memories/chats/knowledge/models/functions/tools/folders) with fail-closed per-operator API-key selection. | Driven by the `openwebui` skill and `chad-experiment` runtime; also callable directly inside agent turns. Available via MCP as `webui__*` tools. |
 | `chad-webui-mcp` | MCP stdio server exposing every chad-webui sub-command as a native MCP tool (`webui__<group>_<cmd>`). | Auto-started by openclaw gateway via `mcp.servers.webui` config. |
-| `chad-experiment` | Autonomous experiment lifecycle CLI (13 verbs: design, start, observe, evaluate, promote, retire, list, show, budget, ab-start, ab-pick, recent-memory, recent-ledger). Writes structured state to `/sandbox/.openclaw-data/state/experiments/`. | Driven by the `chad-experiment-night` cron + the `chad-experiment` skill. |
+| `chad-experiment` | Autonomous experiment lifecycle CLI (13 verbs: design, start, observe, evaluate, promote, retire, list, show, budget, ab-start, ab-pick, recent-memory, recent-ledger). Writes structured state to `/sandbox/.openclaw-data/state/experiments/`. | Driven by the `nightly-experiments` cron via `chad-experiment-cron` + the `chad-experiment` skill. |
 
 ### Cron pipeline (auto-scheduled)
 
@@ -135,12 +135,13 @@ These run unattended via `openclaw cron`. Schedules and budgets live in [`script
 | `chad-workspace-backup` | `0 */6 * * *` | Wraps `chad-backup-to-github` and detaches the slow git push so the cron payload returns in <1s. |
 | `chad-gbrain-dream` | `30 3 * * *` | Nightly embed-stale + extract-graph + extract-timeline against the gbrain. Detached. Also writes `memory/dream-digest-<date>.md` (24h delta + doctor + stats) and, when doctor reports anomalies, `memory/feedback_brain_health_<date>.md` so the next self-improve sees recurring brain-health issues. |
 | `chad-budget-audit` | `0 4 * * 1` | Weekly Monday: computes p95 telemetry per task vs. `task-profiles.json`, writes prose recommendations and a structured `### Proposals (machine-readable)` JSON block to `memory/feedback-proposals.md`. |
-| `chad-self-improve` | `0 3 * * 0` | Weekly Sunday: reads last 7 days of subagent results, `openclaw cron runs` failures per cron, `auto-action-log.jsonl` errors, outstanding proposals; spawns researcher to draft 1–3 durable improvements under `## Self-improvement` in `feedback-proposals.md`. |
+| `chad-self-improve` | `0 3 * * 0` | Weekly Sunday (v2, 2026-06-10): cron agent runs `chad-self-improve --detach` and acks the detach line. The wrapper collects last-7-day signal deterministically (failed spawns, sub-agent results, cron failures read directly from `cron/runs/*.jsonl` with UUIDs mapped to job names, auto-action errors, feedback memory, outstanding proposals), makes ONE single-turn no-tools LLM call, and prepends `## Self-improvement run` prose + a `### Proposals (machine-readable)` block to `feedback-proposals.md`. Replaces the v1 researcher spawn that hit idle timeouts and duplicate-spawned. |
 | `chad-proposal-apply` | `30 4 * * *` | Daily 04:30 UTC: closes the autonomy loop on cron telemetry. Reads the latest `### Proposals (machine-readable)` JSON block from `feedback-proposals.md`. Per-kind handlers: `cron_edit` (default) applies via `openclaw cron edit` if within absolute caps (`timeoutSeconds ≤ 7200`, `maxOutputTokens ≤ 32768`) AND `chad-action-gate chad_self_modify_cron` returns `auto`; `memory` appends to today's memory file via `chad_self_modify_memory` (auto by default). Entries that hit the cap, fail the gate (decision=`draft`), or use a v3 kind (`automation`/`note`/`calendar_event`) are routed to a `## Pending operator review` block instead of being silently skipped. `## Applied` and `## Pending operator review` blocks older than 30 days are pruned. |
 | `chad-skill-watch` | `0 9 * * *` | Daily 09:00 UTC: diffs `openclaw skills list --json` against `/sandbox/.openclaw-data/state/skills-snapshot.json`, surfaces added/removed/changed skills under `## Skill catalog diff` in today's memory. Closes the gap where new gstack skills land silently and chad keeps using older patterns. |
 | `chad-memory-curator` | `0 4 * * 6` | Weekly Sat 04:00 UTC: Hermes-style memory consolidation. Snapshots first via `chad-memory-snapshot`, then spawns a researcher with the curator prompt to propose lift-to-MEMORY.md, consolidate, and archive actions over recent LTM + daily memory. **Draft-only**: writes proposals to `curator-runs/<utc>/proposals.json`. Inactivity-gated (≥7d since last + ≥1h idle) and budget-guarded. |
-| `chad-spawn-gc` | `30 2 * * 1` | Weekly Mon 02:30 UTC: branch retention for `chad-spawn/*` on chad-state. Default: done=7d, failed=30d, in-flight always kept. Without this, ~700 branches accrue/month at the 24-spawn/day budget. |
-| `chad-experiment-night` | `0 2 * * *` | Daily 02:00 UTC: runs Chad's four-phase autonomous experiment loop (propose from memory → start designed → observe running → evaluate at window → calendar coordination). Bounded by per-operator concurrent budget + regression auto-retire threshold. See `chad-experiments.md`. |
+| `chad-spawn-gc` | `30 2 * * 1` | Weekly Mon 02:30 UTC: phase 1 reconciles orphaned ledger entries (stuck queued/running >24h → failed, or done when a result.json exists); phase 2 is branch retention for `chad-spawn/*` on chad-state (done=7d, failed=30d, in-flight always kept; skips itself when gh is unauthenticated). Without retention, ~700 branches accrue/month at the 24-spawn/day budget. |
+| `chad-experiment-cron` (`nightly-experiments`) | `0 2 * * *` | Daily 02:00 UTC: deterministic observe → evaluate → design driver. Heartbeat observations on active experiments; single-turn LLM verdicts (promote/retire/extend) for those past their evaluation window; one new whitelisted experiment design (notes/automations/memories) when under the active cap. Bounded by per-operator concurrent budget + regression auto-retire threshold. See `chad-experiments.md`. |
+| `chad-gbrain-prune` | `0 2 * * 0` | Weekly Sun 02:00 UTC: retention sweep — gbrain `memory`/`events` pages >365d, `chat` pages >180d, workspace dated digests/feedback >30d. Protects `system/*`, `agent/*`, undated slugs, and the daily journal. Cron passes `0` (DRY_RUN off); bare invocations default to dry-run. |
 
 ### Inference / drafting / sending
 
@@ -235,10 +236,10 @@ See [Workspace Files §Sectioned Manifest](../workspace/workspace-files.md#secti
 - [Open WebUI Front-End](openwebui.md) — chat UI exposed via Cloudflare Tunnel + Access
 - [Workflow Scenarios](chad-workflows.md) — named email scenarios + regression spec
 - [Log Locations](log-locations.md) — where each log stream lives
-- [Chad Autonomy Loops](chad-autonomy.md) — the five self-driving loops, two known gaps, and recommended next wrappers
+- [Chad Autonomy Loops](chad-autonomy.md) — the six self-driving loops, the wrappers that close them, the sub-agent orchestration contract, and the maintenance crons behind them
 - [Chad Skills Catalog](chad-skills.md) — all 48 registered skills grouped by source
 - [Wrapper Bugs](wrapper-bugs.md) — five tracked argv-vs-env / path bugs in `/usr/local/bin/chad-*` with shim-and-repoint workarounds in place
-- [Autonomous Experiment Lifecycle](chad-experiments.md) — Chad's nightly propose → design → start → observe → evaluate → promote/retire loop with full autonomy + retire-on-regression. New `chad-experiment` CLI + `experiment-night` cron + sibling skill at `/sandbox/.openclaw-data/skills/chad-experiment/`
+- [Autonomous Experiment Lifecycle](chad-experiments.md) — Chad's nightly observe → evaluate → design loop with full autonomy + retire-on-regression. `chad-experiment` CLI + `chad-experiment-cron` deterministic driver (`nightly-experiments` cron) + sibling skill at `/sandbox/.openclaw-data/skills/chad-experiment/`
 
 ## Host-side watchdogs (no agent overhead)
 
@@ -256,7 +257,7 @@ Why launchd and not openclaw cron: the openclaw `spawn-poll` cron was costing ~1
 
 Host-side watchdogs that detect state changes append a structured event line to `/sandbox/.openclaw-data/state/agent-inbox.jsonl`. Schema:
 
-```jsonc
+```js
 {
   "ts": "2026-05-14T18:21:32Z",
   "source": "chad-spawn-poll-watchdog",   // watchdog identifier
@@ -266,6 +267,6 @@ Host-side watchdogs that detect state changes append a structured event line to 
 }
 ```
 
-Cron agent turns (`mail-check`, `issue-triage`, `experiment-night`, etc.) can read this file at startup with `tail -n N /sandbox/.openclaw-data/state/agent-inbox.jsonl` to surface anything important that happened between turns. The file is backed up under `state/agent-inbox.jsonl` in `chad-workspace-files.txt` so pod rebuilds preserve it.
+Cron agent turns (`mail-check`, `issue-triage`, `nightly-experiments`, etc.) can read this file at startup with `tail -n N /sandbox/.openclaw-data/state/agent-inbox.jsonl` to surface anything important that happened between turns. The file is backed up under `state/agent-inbox.jsonl` in `chad-workspace-files.txt` so pod rebuilds preserve it.
 
 **Quiet ticks leave no trace** — watchdogs only write to the inbox when there's a real state change (reconciliation, restart, error). The local watchdog log captures every fire for ops visibility.

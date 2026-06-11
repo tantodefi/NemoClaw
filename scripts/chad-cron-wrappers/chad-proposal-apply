@@ -80,7 +80,7 @@ AUDIT_LOG="$AUDIT_LOG" \
 DRY_RUN="$dry_run" \
 MAX_APPLY="$max_apply" \
 python3 <<'PY'
-import json, os, re, subprocess, datetime
+import json, os, re, subprocess, datetime, sys
 
 proposals_file = os.environ["PROPOSALS_FILE"]
 audit_log = os.environ["AUDIT_LOG"]
@@ -350,7 +350,27 @@ if not dry_run:
     except Exception:
         pass  # pruning is best-effort
 
+# ── Dedupe pending entries against blocks already in the file ──
+# The applier runs daily but proposal blocks refresh weekly: without
+# this, the same parked proposal lands in a fresh "## Pending operator
+# review" block every day for a week. Match on the rendered table-row
+# prefix — identical (target, field, old, new) means already surfaced.
+if pending:
+    try:
+        _existing = open(proposals_file).read()
+    except OSError:
+        _existing = ""
+    pending = [p for p in pending
+               if f"| {p[0]} | {p[1]} | {p[2]} | {p[3]} |" not in _existing]
+
 # ── Append "## Applied — <ts>" block to proposals file ──
+# Skip entirely when the run was a no-op (nothing applied, skipped, or
+# newly pending) — daily "(nothing applied)" blocks just grow the file.
+if not (applied or skipped or pending):
+    print(f"chad-proposal-apply: applied=0 skipped=0 pending=0 "
+          f"(no-op, dry_run={dry_run}, max_apply={max_apply})")
+    sys.exit(0)
+
 ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 out = ["", f"## Applied — {ts}", ""]
 out.append(f"_From proposals block ts={proposal_ts}; max_apply={max_apply}; dry_run={dry_run}._")

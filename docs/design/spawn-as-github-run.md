@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
@@ -5,7 +9,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Design — Sub-agent spawn as GitHub Actions agent-job
 
-**Status:** Design (2026-05-06). Not implemented. Inspired by
+**Status:** Implemented (Phase C, 2026-06) as `chad-spawn --substrate gha
+--async`; reconciliation via `chad-spawn-poll` (host launchd) and the
+weekly `spawn-gc` cron. This page is the original design. Inspired by
 `stephengpope/thepopebot`'s agent-job pattern (branch-as-job-record +
 GitHub Actions runner + auto-merge as policy gate).
 

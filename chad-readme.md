@@ -537,7 +537,7 @@ catch honest bugs, not attackers.
 
 ## 7. Cron integration (token-optimized)
 
-Chad runs **eleven** standing openclaw cron jobs plus **three host-side
+Chad runs **twelve** standing openclaw cron jobs plus **three host-side
 launchd watchdogs**, all registered by `chad-setup.sh` (crons) and one-shot
 plist loads (watchdogs). The schedules are **deliberately conservative**
 — every cron fire tokenizes instructions and spawns a model call, so the
@@ -549,14 +549,14 @@ rule is: fewer, cheaper runs + a budget guard at the top of each one.
 | `workspace-backup` | every 6h | n/a (no model call) | `chad-backup-to-github` with the §12 diff-check |
 | `issue-triage` | daily 10:00 UTC | skip if `remaining_tokens < 3×N×70k` | `chad-issue-triage` — scores open issues, routes top 2 through a researcher (see §12) |
 | `gbrain-dream` | nightly 03:30 UTC | skip if `remaining_tokens < 50k` | `chad-gbrain-dream` — runs `gbrain dream` to consolidate links and surface orphans |
-| `self-improve` | weekly Sun 03:00 UTC | skip if `remaining_tokens < 2×budget` | `chad-self-improve` — proposes 1–3 durable improvements based on last week's signal (see §13) |
+| `self-improve` | weekly Sun 03:00 UTC | skip if `remaining_tokens < 2×budget` | `chad-self-improve --detach` (v2, 2026-06-10) — wrapper detaches, collects last week's signal deterministically, ONE single-turn LLM call drafts prose + machine-readable proposals into `feedback-proposals.md` (see §13) |
 | `chad-budget-audit` | weekly Mon 04:00 UTC | n/a (audits, no model call) | Compares last-50-runs telemetry against `task-profiles.json`, rolls up premium spend from `/tmp/chad-premium.jsonl`, appends recommendations to `memory/feedback-proposals.md` |
 | `chad-proposal-apply` | daily 04:30 UTC | n/a (applies safe-list) | Reads structured proposals from `feedback-proposals.md`, applies bounded `timeoutSeconds`/`maxOutputTokens` edits via `openclaw cron edit`, appends `## Applied` block. |
 | `chad-skill-watch` | daily 09:00 UTC | n/a (diff only) | Diffs `openclaw skills list --json` against `state/skills-snapshot.json`, surfaces added/removed/changed skills under `## Skill catalog diff` in today's memory. |
 | `memory-curator` | weekly Sat 04:00 UTC | inactivity-gated (≥7d since last + ≥1h idle) + budget guard | `chad-memory-curator` — Hermes-style consolidation pass over memory-lancedb captures + workspace MEMORY.md. **Draft-only**: writes proposals to `curator-runs/<utc>/proposals.json`. |
-| `spawn-gc` | weekly Mon 02:30 UTC | n/a (gh API only) | `chad-spawn-gc` — branch retention for `chad-spawn/*` on chad-state. Default: done=7d, failed=30d, in-flight always kept. |
-| `experiment-night` | nightly 02:00 UTC | n/a (gated by per-operator concurrent budget) | **(NEW 2026-05-14)** Four-phase autonomous experiment loop: propose from memory, observe running experiments, evaluate at the eval window, schedule calendar coordination. Per-operator concurrent budget + regression auto-retire. See `docs/operations/chad-experiments.md`. |
-| `gbrain-prune` | weekly Sun 02:00 UTC | n/a (DRY_RUN default) | `chad-gbrain-prune` — drops stale gbrain pages older than retention windows. Defaults to dry-run. |
+| `spawn-gc` | weekly Mon 02:30 UTC | n/a (gh API only) | `chad-spawn-gc` — phase 1 reconciles orphaned ledger entries (queued/running >24h → failed/done); phase 2 prunes `chad-spawn/*` branches on chad-state (done=7d, failed=30d, in-flight kept; skips itself if gh is unauthenticated). |
+| `nightly-experiments` | nightly 02:00 UTC | skip if `remaining_tokens < 20000` (in-wrapper) | **(v2 2026-06-10)** `chad-experiment-cron` — deterministic observe → evaluate → design driver; experiment verdicts and new designs come from single-turn no-tools LLM calls, never a multi-turn cron loop. Per-operator concurrent budget + regression auto-retire. See `docs/operations/chad-experiments.md`. |
+| `gbrain-prune` | weekly Sun 02:00 UTC | n/a (no model call) | `chad-gbrain-prune 0` — drops stale gbrain pages older than retention windows (cron passes `0` = DRY_RUN off; bare invocations still default to dry-run). |
 
 **Plus three host-side launchd watchdogs** (no agent overhead, run every 5 min via SSH):
 

@@ -20,8 +20,8 @@
 #     "database_path": "/sandbox/.gbrain/brain.pglite",
 #     "openai_api_key": "<NVIDIA_API_KEY or sk-...>",
 #     "openai_base_url": "https://integrate.api.nvidia.com/v1",
-#     "embed_model": "nvidia/llama-3.2-nv-embedqa-1b-v2",
-#     "embed_dimensions": "1024",
+#     "embed_model": "nvidia/llama-nemotron-embed-1b-v2",
+#     "embed_dimensions": "1536",
 #     "embed_input_type": "passage"
 #   }
 #
