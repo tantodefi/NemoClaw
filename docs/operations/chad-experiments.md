@@ -194,6 +194,32 @@ chad-experiment ab-pick --id <either> --winner B
 Both variants count toward the operator's concurrent budget — so
 ab-start with default 3-cap requires ≤1 active going in.
 
+## Smithers evolutionary runner (host-side, 2026-06-13)
+
+A second, durable runner exists alongside `chad-experiment-cron`:
+`scripts/chad-smithers/` runs the experiment loop on
+[Smithers](https://smithers.sh) (JSX workflow orchestrator with SQLite
+crash-recovery). It implements an **evolutionary** loop — start wide,
+score candidates in parallel, keep only what works:
+
+- `agents.js` — a model router. `pickAgent(role)` routes by tier with
+  runtime auto-detection. Cron runs on **Nemotron 3 Ultra 550B** via the
+  NVIDIA API with reasoning on by default (the harness tool-loop bug that
+  blocked reasoning was retested and is absent in Ultra).
+- `lib/population.js` — the selection engine: seed to a target cohort,
+  score each candidate, promote the top-K to champion, retire persistent
+  losers (kept on record, never re-explored).
+- `experiments.jsx` — the nightly workflow; `run-experiments.sh` is the
+  launchd-scheduled driver (`dev.nemoclaw.chad-experiments`, 05:00 local)
+  that posts the leaderboard to OpenWebUI as an operator-visible note.
+- Additional workflows: `workflows/mcp-health-probe.jsx` (escalate-on-
+  change health probe of gbrain/NVIDIA/shim) and
+  `workflows/fail-only-report.jsx` (token-frugal cron health).
+
+It runs in **shadow** alongside the deterministic wrapper; the wrapper
+remains the production path until the Smithers runner proves parity.
+Full design + status: `docs/design/smithers-moshi-integration.md`.
+
 ## Next steps
 
 - [chad-devflow.md](chad-devflow.md) — full wrapper catalog

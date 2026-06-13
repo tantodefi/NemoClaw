@@ -1,0 +1,10 @@
+# Runtime artifacts — never committed. Inputs (seed-candidates.json,
+# fixtures.json) ARE tracked; evolved state and DBs are not.
+node_modules/
+.smithers/
+*.db
+*.db-shm
+*.db-wal
+state/population.json
+state/last-report.md
+state/posted-notes.log

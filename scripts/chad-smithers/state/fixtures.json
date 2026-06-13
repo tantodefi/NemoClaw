@@ -1,0 +1,14 @@
+[
+  {
+    "id": "fixture-squat-depth",
+    "operator": "tjcooke",
+    "input": "Client asks: how low should I be going on squats if my knees click?",
+    "rubric": "Actionable, safe, in-voice, asks no unnecessary follow-up."
+  },
+  {
+    "id": "fixture-pr-nudge",
+    "operator": "tantodefi",
+    "input": "Reviewer left a comment asking for a test on the new endpoint.",
+    "rubric": "Concrete next step, acknowledges the comment, no over-promising."
+  }
+]

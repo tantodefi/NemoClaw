@@ -24,7 +24,19 @@
       "providers": ["nvidia-prod"],
       "tier": "frontier",
       "modality": ["text"],
-      "_note": "Default cloud model since 2026-04-30 (replacing the deprecated Kimi K2.5). MoE: ~120B total / ~12B active. Hosted on integrate.api.nvidia.com via the NVIDIA_API_KEY."
+      "_note": "Cheap-tier cloud model since 2026-04-30 (replacing the deprecated Kimi K2.5). MoE: ~120B total / ~12B active. Hosted on integrate.api.nvidia.com via the NVIDIA_API_KEY. Fast; used for single-turn cron/draft work."
+    },
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+      "displayName": "Nemotron 3 Ultra 550B",
+      "contextWindow": 262144,
+      "maxOutputTokens": 32768,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "reasoningSafeReason": "VERIFIED 2026-06-13: with reasoning ON (system 'detailed thinking on') Ultra emits a STANDARD OpenAI tool_call with valid-JSON args and completes a 2-turn round-trip (finish_reason=stop, answer reflected the tool result) against integrate.api.nvidia.com. This is the exact round-trip Kimi K2.5 failed (K2.5 used a non-standard tool-call format) — Ultra does not have that defect. Test: scripts/chad-smithers/ harness-retest, results in docs/design/smithers-moshi-integration.md §harness-retest.",
+      "providers": ["nvidia-prod"],
+      "tier": "frontier",
+      "modality": ["text"],
+      "_note": "Newest + most capable NVIDIA open model (released 2026-06-04, Computex). 550B total / ~55B active, hybrid Mamba-Transformer MoE built for long-running autonomous agents (orchestration, coding, deep research). Hosted on integrate.api.nvidia.com via NVIDIA_API_KEY, OpenAI-compatible, free. Capable-tier default for the Smithers router (scripts/chad-smithers)."
     },
     "google/gemma-3-4b": {
       "displayName": "Gemma 3 4B (lmstudio fallback)",

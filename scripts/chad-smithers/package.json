@@ -1,0 +1,22 @@
+{
+  "name": "chad-smithers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Smithers (durable JSX workflow orchestrator) workspace for Chad. Host-side pilot; see docs/design/smithers-moshi-integration.md.",
+  "scripts": {
+    "experiments": "smithers up experiments.jsx",
+    "experiments:dry": "DRY_RUN=1 smithers up experiments.jsx",
+    "agents:probe": "node agents.js --probe",
+    "ps": "smithers ps",
+    "resume": "smithers resume"
+  },
+  "dependencies": {
+    "smithers-orchestrator": "latest",
+    "@smithers-orchestrator/agents": "latest",
+    "ai": "latest",
+    "@ai-sdk/openai-compatible": "latest",
+    "@ai-sdk/anthropic": "latest",
+    "zod": "^4.4.3"
+  }
+}

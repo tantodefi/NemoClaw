@@ -56,9 +56,12 @@ RUN chmod 755 /usr/local/bin/nemoclaw-start
 
 # Build args for config that varies per deployment.
 # nemoclaw onboard passes these at image build time.
-ARG NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b
+# Default to the newest, most capable NVIDIA open model (Ultra 550B, 2026-06-04).
+# Hosted via integrate.api.nvidia.com so there is no local-hardware implication.
+# reasoningSafe verified 2026-06-13 (tool-call round-trip; see model-registry.json).
+ARG NEMOCLAW_MODEL=nvidia/nemotron-3-ultra-550b-a55b
 ARG NEMOCLAW_PROVIDER_KEY=nvidia
-ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-super-120b-a12b
+ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-ultra-550b-a55b
 ARG CHAT_UI_URL=http://127.0.0.1:18789
 ARG NEMOCLAW_INFERENCE_BASE_URL=https://inference.local/v1
 ARG NEMOCLAW_INFERENCE_API=openai-completions
@@ -134,7 +137,8 @@ config = { \
         }, \
         'trustedProxies': ['127.0.0.1', '::1'], \
         'auth': {'token': secrets.token_hex(32)} \
-    } \
+    }, \
+    'plugins': {'entries': {'bonjour': {'enabled': False}}} \
 }; \
 path = os.path.expanduser('~/.openclaw/openclaw.json'); \
 json.dump(config, open(path, 'w'), indent=2); \

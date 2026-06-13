@@ -10,7 +10,7 @@ const noDirectCredentialEnv = require("./eslint-rules/no-direct-credential-env.j
 export default [
   // Ignore build artifacts, vendored code, and the nemoclaw sub-project (has its own config)
   {
-    ignores: ["nemoclaw/**", "node_modules/**", "dist/**", "docs/_build/**"],
+    ignores: ["nemoclaw/**", "node_modules/**", "dist/**", "docs/_build/**", "scripts/chad-smithers/**"],
   },
 
   // ── bin/ and scripts/ — CommonJS, Node.js ──────────────────────────────

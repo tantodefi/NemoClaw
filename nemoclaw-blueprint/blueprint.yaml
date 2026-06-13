@@ -37,20 +37,24 @@ components:
 
   inference:
     profiles:
+      # Hosted NVIDIA profiles default to the newest, most capable open model
+      # (Ultra 550B, 2026-06-04). No local-hardware implication — it's hosted.
       default:
         provider_type: "nvidia"
         provider_name: "nvidia-inference"
         endpoint: "https://integrate.api.nvidia.com/v1"
-        model: "nvidia/nemotron-3-super-120b-a12b"
+        model: "nvidia/nemotron-3-ultra-550b-a55b"
 
       ncp:
         provider_type: "nvidia"
         provider_name: "nvidia-ncp"
         endpoint: ""
-        model: "nvidia/nemotron-3-super-120b-a12b"
+        model: "nvidia/nemotron-3-ultra-550b-a55b"
         credential_env: "NVIDIA_API_KEY"
         dynamic_endpoint: true
 
+      # Self-hosted profiles stay on Super 120B: running Ultra 550B locally is a
+      # far larger GPU footprint, so we don't impose that as a default here.
       nim-local:
         provider_type: "openai"
         provider_name: "nim-local"

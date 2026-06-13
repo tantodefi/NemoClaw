@@ -16,5 +16,5 @@
     "types": ["node"]
   },
   "include": ["bin/**/*.ts", "scripts/**/*.ts", "src/**/*.ts", "test/**/*.ts", "nemoclaw-blueprint/scripts/**/*.ts"],
-  "exclude": ["node_modules", "nemoclaw", "scripts/gbrain-patches"]
+  "exclude": ["node_modules", "nemoclaw", "scripts/gbrain-patches", "scripts/chad-smithers"]
 }

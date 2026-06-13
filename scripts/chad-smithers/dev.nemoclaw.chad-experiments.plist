@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.nemoclaw.chad-experiments</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/r/.nemoclaw/source/scripts/chad-smithers/run-experiments.sh</string>
+  </array>
+  <!-- launchd has a minimal PATH; the workflow spawns `claude` (ClaudeCodeAgent),
+       `bun`/`node` (smithers), and `ssh` (pod note post), so make them findable. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/r/.local/bin:/Users/r/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- Nightly at 05:00 local — after webui-ingest (04:30); coexists with the
+       pod chad-experiment-cron (shadow) until parity is proven. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>5</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/r/.nemoclaw/openwebui/chad-experiments.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/r/.nemoclaw/openwebui/chad-experiments.err.log</string>
+</dict>
+</plist>

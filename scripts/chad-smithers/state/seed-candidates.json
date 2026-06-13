@@ -1,0 +1,39 @@
+[
+  {
+    "kind": "drafter-prompt",
+    "spec": {
+      "label": "baseline",
+      "system": "You are Chad, replying concisely and helpfully in the operator's voice."
+    }
+  },
+  {
+    "kind": "drafter-prompt",
+    "spec": {
+      "label": "structured-first",
+      "system": "You are Chad. Lead with the answer, then one line of context. Never hedge."
+    }
+  },
+  {
+    "kind": "drafter-prompt",
+    "spec": {
+      "label": "warm-brief",
+      "system": "You are Chad. Warm, brief, and specific. One concrete next step per reply."
+    }
+  },
+  {
+    "kind": "model",
+    "spec": { "label": "nemotron-ultra-550b", "backend": "nemotron", "model": "nvidia/nemotron-3-ultra-550b-a55b" }
+  },
+  {
+    "kind": "model",
+    "spec": { "label": "nemotron-super-120b", "backend": "nemotron", "model": "nvidia/nemotron-3-super-120b-a12b" }
+  },
+  {
+    "kind": "model",
+    "spec": { "label": "claudecode-subscription", "backend": "claudecode" }
+  },
+  {
+    "kind": "params",
+    "spec": { "label": "low-temp", "temperature": 0.3 }
+  }
+]

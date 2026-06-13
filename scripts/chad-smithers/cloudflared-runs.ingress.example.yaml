@@ -1,0 +1,25 @@
+# Example cloudflared ingress for the Smithers run board at chad.supachad.com/runs
+# NOT APPLIED — this is a reference for the edge change (do it deliberately).
+#
+# Recommendation: path-based on the EXISTING hostname so the existing Cloudflare
+# Access policy on chad.supachad.com covers it too — no new DNS record, cert, or
+# Access application. Add the /runs rule ABOVE the catch-all OpenWebUI rule
+# (cloudflared matches top-down):
+#
+ingress:
+  # Smithers run board (gateway API + UI) — must come before the OpenWebUI rule.
+  - hostname: chad.supachad.com
+    path: /runs.*
+    service: http://127.0.0.1:7331   # serve-runs.js (CHAD_RUNS_PORT)
+  # Existing OpenWebUI (catch-all for the hostname).
+  - hostname: chad.supachad.com
+    service: http://127.0.0.1:8080    # <-- your existing OpenWebUI upstream
+  - service: http_status:404
+#
+# CAVEAT: the gateway app must serve its assets under the /runs base path. If
+# assets 404 (the classic reverse-proxy-subpath problem; startServer has no
+# basePath option), fall back to a dedicated subdomain where the app lives at
+# root:
+#   - hostname: runs.supachad.com
+#     service: http://127.0.0.1:7331
+# (a subdomain needs its own DNS record + Access application).
