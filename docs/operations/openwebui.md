@@ -24,7 +24,7 @@ status: published
 
 `open-webui` is a chat UI that speaks the OpenAI API. NemoClaw bundles a
 docker compose plus a Cloudflare-Tunnel-based setup script so you can stand
-up a chat front-end backed by the same Nemotron 3 Super 120B inference Chad uses, reachable
+up a chat front-end backed by the same Nemotron 3 Ultra 550B inference Chad uses, reachable
 from any browser, gated by an email allowlist.
 
 ## Architecture at a glance
@@ -55,7 +55,7 @@ choose between them per conversation:
                                         ▼             ▼
                             ┌────────────────────┐  ┌──────────────────────┐
                             │ NVIDIA Build       │  │ host:8901            │
-                            │ /v1 (nemotron 120B,│  │ (SSH port-forward)   │
+                            │ /v1 (nemotron 550B,│  │ (SSH port-forward)   │
                             │  raw inference)    │  └──────────┬───────────┘
                             └────────────────────┘             │
                                                 ──host─────────┼────────────
@@ -273,9 +273,10 @@ list so open-webui's dropdown only shows live, current flagships.
 A model is marked dead on the **first** sweep that gets HTTP 410 Gone
 (NVIDIA's explicit EOL signal). Other failures (404s, 5xx) take three
 consecutive strikes — protects against transient outages. Network timeouts
-don't strike at all; the previous status is preserved. Cold-start large
-models that take >60 s to respond stay "unknown" and don't appear in the
-dropdown until they confirm live on a future sweep.
+don't strike at all; the previous status is preserved. The probe uses a
+300 s socket timeout so cold-start MoE flagships (which can need 60–90 s
+to serve their first token) are correctly detected as live rather than
+silently dropped to `unknown`.
 
 ### Manual sweep + tuning
 
@@ -308,18 +309,56 @@ Bump `per_provider_limit` if you want the runner-up per provider; add IDs
 to `exclude` if the heuristic picks a model you don't want (typically a
 vision-only or guardrail variant that landed as flagship).
 
-### Capability guidance — which family for what
+### Capability guidance — which model for what
 
-The auto-picker rotates specific model IDs over time, but the **provider
-families** stay stable. Rough buckets:
+The auto-picker rotates specific model IDs over time as NVIDIA updates its
+catalog, but provider families and use-case profiles are stable. The table
+below reflects the **June 2026 featured set** with measured first-token
+latency from the daily liveness probe (`max_tokens=1`, streaming,
+cold-start). Warm latency is typically 5–20× lower.
 
-| Best for | Look for |
-|---|---|
-| General reasoning / agentic flows | `nvidia/*nemotron*`, `meta/llama-3.x-*-instruct`, `openai/gpt-oss-120b` |
-| Code & tool-heavy turns | `qwen/*coder*`, `abacusai/*dracarys*`, `openai/gpt-oss-*` |
-| Multimodal (image-in) | `microsoft/phi-*multimodal*` |
-| Fast / cheap | `google/gemma-*`, `microsoft/phi-4*`, `openai/gpt-oss-20b` |
-| Non-English specialists | `sarvamai/*` (Indic), `stockmark/*` (Japanese), `upstage/solar-*` (Korean), `z-ai/glm*` and `qwen/*` (Chinese) |
+#### Current featured models (June 2026)
+
+| Model | Provider | Cold-start latency | Best for | Notes |
+|---|---|---|---|---|
+| `nemotron-3-ultra-550b-a55b` | nvidia | ~5 s warm | **Flagship agentic / deep reasoning** | 550B MoE (55B active). Chad's primary model. Best overall quality; use for complex multi-step tasks. |
+| `llama-4-maverick-17b-128e-instruct` | meta | ~60 s cold | **Frontier reasoning, long context** | 128-expert MoE. Strong reasoning at lower active-param cost; slow to cold-start. |
+| `deepseek-v4-pro` | deepseek-ai | ~60 s cold | **Code generation, math, logic** | DeepSeek's flagship; excels at structured output and algorithmic tasks. Slow first token. |
+| `qwen3.5-397b-a17b` | qwen | ~3 s | **Chinese + multilingual, long reasoning** | 397B MoE; strong at multilingual tasks and extended chain-of-thought. |
+| `kimi-k2.6` | moonshotai | ~1 s | **Fast long-context, agentic tool use** | Sub-second warm latency; good for tool-heavy workflows and long documents. |
+| `mistral-small-4-119b-2603` | mistralai | ~1 s | **Multilingual writing, instruction following** | Reliable, fast; good default for European-language content. |
+| `gemma-4-31b-it` | google | ~60 s cold | **Writing, summarisation, creative tasks** | Google's Gemma 4. High-quality prose; slow cold-start makes it poor for interactive use unless pre-warmed. |
+| `gpt-oss-120b` | openai | ~0.3 s | **Fast general-purpose** | OpenAI's open-weight 120B; sub-second latency, good across all tasks, strong default for speed-sensitive flows. |
+| `dracarys-llama-3.1-70b-instruct` | abacusai | ~0.5 s | **Code + agentic tool use** | AbacusAI fine-tune of Llama 3.1 70B; optimised for code and function calling. |
+| `phi-4-mini-instruct` | microsoft | ~60 s cold | **Lightweight reasoning on small prompts** | 3.8B; surprisingly capable for its size but cold-start is slow on NVIDIA endpoints. |
+| `minimax-m2.7` | minimaxai | ~60 s cold | **Long-context creative / narrative** | 1M-token context window; best for document-length creative writing. Slow cold-start. |
+| `seed-oss-36b-instruct` | bytedance | ~0.3 s | **Fast general-purpose** | ByteDance open-weight; balanced latency and quality. |
+| `step-3.7-flash` | stepfun-ai | ~0.9 s | **Fast general-purpose** | StepFun flash model; low latency, good instruction following. |
+| `glm-5.1` | z-ai | ~7 s | **Chinese-language tasks** | ZhipuAI GLM; best for Chinese-primary content. |
+| `sarvam-m` | sarvamai | ~0.3 s | **Indic languages** | Specialist for Hindi, Tamil, Telugu, Kannada, and other Indic scripts. |
+| `stockmark-2-100b-instruct` | stockmark | ~0.4 s | **Japanese-language tasks** | Specialist for Japanese business and general content. |
+| `solar-10.7b-instruct` | upstage | ~0.3 s | **Korean-language tasks** | Upstage Solar; specialist for Korean. |
+
+#### Quick-reference by use-case
+
+| Use-case | First choice | Fast alternative |
+|---|---|---|
+| Agentic flows / deep reasoning | `nvidia/nemotron-3-ultra-550b-a55b` | `moonshotai/kimi-k2.6` |
+| Code generation / math | `deepseek-ai/deepseek-v4-pro` | `abacusai/dracarys-llama-3.1-70b-instruct` |
+| Writing / summarisation | `google/gemma-4-31b-it` (quality) | `mistralai/mistral-small-4-119b-2603` (speed) |
+| Long-context documents | `minimaxai/minimax-m2.7` (1M ctx) | `moonshotai/kimi-k2.6` |
+| Speed-sensitive / interactive | `openai/gpt-oss-120b` (~0.3 s) | `bytedance/seed-oss-36b-instruct` |
+| Multilingual (non-CJK) | `qwen/qwen3.5-397b-a17b` | `mistralai/mistral-small-4-119b-2603` |
+| Chinese | `z-ai/glm-5.1` or `qwen/qwen3.5-397b-a17b` | — |
+| Japanese | `stockmark/stockmark-2-100b-instruct` | — |
+| Korean | `upstage/solar-10.7b-instruct` | — |
+| Indic languages | `sarvamai/sarvam-m` | — |
+
+> Latency figures are **cold-start first-token** measured by the daily liveness
+> probe. Models showing ~60 s are MoE flagships that require warm-up on first
+> request; subsequent requests in the same session are typically 3–10 s.
+> `nvidia-liveness.py` now uses a 300 s probe timeout so these correctly
+> register as `live` rather than `unknown`.
 
 Edit a row's `meta.description` in **Admin → Settings → Models** to set
 hover-tooltip use-case text. To persist it across container wipes, dump

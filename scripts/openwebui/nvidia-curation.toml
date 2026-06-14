@@ -22,7 +22,27 @@ per_provider_limit = 1
 # Never include — applied after auto-selection. Glob `*` supported.
 # Used to override the heuristic when it picks a model you don't want
 # (e.g. a vision-only or guardrail variant that landed as provider top-pick).
-exclude = []
+exclude = [
+    # Content-safety and guardrail models — narrow-purpose, not general assistants
+    "nvidia/nemotron-3.5-content-safety",
+    "nvidia/nemotron-3-content-safety",
+    "nvidia/nemotron-content-safety-reasoning-4b",
+    "nvidia/llama-3.1-nemoguard-*",
+    "nvidia/llama-3.1-nemotron-safety-guard*",
+    # Specialized / infrastructure models
+    "nvidia/gliner-pii",
+    "nvidia/riva-translate-*",
+    "nvidia/ising-calibration-*",
+    # Nano / mini tiers — not flagship
+    "nvidia/nemotron-mini-4b-instruct",
+    "nvidia/nvidia-nemotron-nano-9b-v2",
+    "nvidia/llama-3.1-nemotron-nano-8b-v1",
+    # Vision-language variants — when a text-only version exists
+    "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+    "nvidia/nemotron-nano-12b-v2-vl",
+    # Embedding models
+    "nvidia/llama-nemotron-embed-*",
+]
 
 [ranking]
 prefer_newer_major = true   # llama-3.3 beats llama-3.1

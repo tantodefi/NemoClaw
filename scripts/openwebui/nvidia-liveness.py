@@ -42,7 +42,12 @@ CURATION_FILE = Path(os.environ.get("NVIDIA_CURATION_FILE", SCRIPT_DIR / "nvidia
 WEBUI_DB = Path(os.environ.get("WEBUI_DB", HOME / ".nemoclaw/openwebui/data/webui.db"))
 UPSTREAM = os.environ.get("NVIDIA_UPSTREAM", "https://integrate.api.nvidia.com")
 DEAD_AFTER_FAILS = int(os.environ.get("DEAD_AFTER_FAILS", "3"))
-PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "60"))
+# Intentionally generous: deactivated/removed models return HTTP 4xx immediately,
+# so they're caught by status code, not timeout. This limit only fires for a model
+# that accepts the TCP connection but never sends any response — a genuinely hung
+# or infinitely-queued endpoint. 300 s covers the worst cold-start latency while
+# still bounding a truly stale session.
+PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "300"))
 
 
 def log(msg: str) -> None:
@@ -115,31 +120,58 @@ def curated_base_ids() -> set[str]:
 
 def probe(model_id: str, api_key: str) -> tuple[str, str, float, int]:
     """Returns (verdict, detail, latency_ms, http_code) where verdict is one of:
-      live      — 200 OK
+      live      — 200 OK + first streaming token received
       dead      — 410 Gone (NVIDIA's explicit EOL signal); mark dead instantly
       transient — network/timeout (HTTP 0); keep previous status, don't strike
-      fail      — anything else (404, 403, 5xx, etc.); ticks consecutive_failures"""
+      fail      — anything else (404, 403, 5xx, etc.); ticks consecutive_failures
+
+    Uses stream=True so latency_ms reflects time-to-first-token, not round-trip
+    for a complete response. We close the connection immediately after the first
+    chunk — we only care that the model is alive and generating, not the content.
+    """
     t0 = time.monotonic()
-    code, body = http_request(
-        "POST",
-        f"{UPSTREAM}/v1/chat/completions",
-        api_key,
-        body={
-            "model": model_id,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 1,
-            "stream": False,
-        },
+    data = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": True,
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    req = urllib.request.Request(
+        f"{UPSTREAM}/v1/chat/completions", data=data, method="POST", headers=headers
     )
-    latency_ms = (time.monotonic() - t0) * 1000
-    detail = json.dumps(body)[:240] if isinstance(body, dict) else str(body)[:240]
-    if code == 200:
-        return "live", "ok", latency_ms, code
-    if code == 410:
-        return "dead", f"HTTP 410 Gone: {detail}", latency_ms, code
-    if code == 0:
-        return "transient", f"HTTP 0: {detail}", latency_ms, code
-    return "fail", f"HTTP {code}: {detail}", latency_ms, code
+    try:
+        with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
+            # Read until we see the first non-empty SSE data line — that confirms
+            # the model is alive and generating. Bail immediately after.
+            code = resp.status
+            if code == 200:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("data:") and line != "data: [DONE]":
+                        break
+                latency_ms = (time.monotonic() - t0) * 1000
+                return "live", "ok", latency_ms, code
+            # Non-200 from urlopen shouldn't happen (raises HTTPError), but handle it.
+            latency_ms = (time.monotonic() - t0) * 1000
+            return "fail", f"HTTP {code}", latency_ms, code
+    except urllib.error.HTTPError as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        try:
+            payload = json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            payload = {"_raw": "<unparseable error body>"}
+        detail = json.dumps(payload)[:240]
+        if e.code == 410:
+            return "dead", f"HTTP 410 Gone: {detail}", latency_ms, e.code
+        return "fail", f"HTTP {e.code}: {detail}", latency_ms, e.code
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        latency_ms = (time.monotonic() - t0) * 1000
+        return "transient", f"HTTP 0: {e}", latency_ms, 0
 
 
 def load_curation() -> dict:
@@ -149,20 +181,38 @@ def load_curation() -> dict:
 
 
 _VERSION_DOTTED = re.compile(r"(\d+)\.(\d+)")
+# Explicit release-tag: -v1, -v1.5, -v2. Checked first to prevent base-model
+# version numbers (e.g. "llama-3.3", "gemma-3n") from outranking larger models
+# whose ids carry no such tag (e.g. nemotron-3-ultra-550b-a55b).
+_VERSION_EXPLICIT = re.compile(r"-v(\d+)(?:\.(\d+))?(?:-|$|\b)")
+# Standalone dash-separated generation number: "nemotron-3-ultra" → 3,
+# "gemma-4-31b" → 4. Catches model families that don't use dotted notation.
+_VERSION_DASH = re.compile(r"(?:^|-)(\d+)-")
 _VERSION_FAMILY = re.compile(r"[a-z](\d+)(?:-|\b)")
 _PARAMS = re.compile(r"(\d+)(?:x(\d+))?b\b", re.IGNORECASE)
 
 
 def rank_key(model_id: str) -> tuple:
     """(major_version, params_b, lexical) — higher tuple wins. Parses from id
-    because NVIDIA's `created` field is a static placeholder (1993)."""
+    because NVIDIA's `created` field is a static placeholder (1993).
+
+    Priority: explicit -vN tag > dotted N.N > standalone -N- > letter+digit.
+    """
     name = model_id.split("/", 1)[-1].lower()
-    m = _VERSION_DOTTED.search(name)
+    m = _VERSION_EXPLICIT.search(name)
     if m:
-        version = (int(m.group(1)), int(m.group(2)))
+        version = (int(m.group(1)), int(m.group(2)) if m.group(2) else 0)
     else:
-        m = _VERSION_FAMILY.search(name)
-        version = (int(m.group(1)), 0) if m else (0, 0)
+        m = _VERSION_DOTTED.search(name)
+        if m:
+            version = (int(m.group(1)), int(m.group(2)))
+        else:
+            m = _VERSION_DASH.search(name)
+            if m:
+                version = (int(m.group(1)), 0)
+            else:
+                m = _VERSION_FAMILY.search(name)
+                version = (int(m.group(1)), 0) if m else (0, 0)
     params = 0
     for pm in _PARAMS.finditer(name):
         a = int(pm.group(1))
