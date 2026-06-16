@@ -264,11 +264,12 @@ def build_config(env: dict | None = None) -> dict:
         }
 
     # idleTimeoutSeconds gates how long the agent can pause between LLM
-    # tokens before erroring. Embedded Nemotron's thinking phase regularly
-    # exceeds 60s on cron prompts, so 180s is the floor for reliability.
-    # Raised from 60s after 2026-05-11 incident where self-improve and
-    # issue-triage crons idle-timed-out despite clean wrapper exits.
-    llm_idle_timeout = int(env.get("NEMOCLAW_LLM_IDLE_TIMEOUT", "180"))
+    # tokens before erroring. 60s (2026-05-11 incident) → 180s for slow
+    # embedded Nemotron → 300s on 2026-06-16: Nemotron 3 Ultra 550B reasons
+    # deeper and can stay silent ~142s+ on a single reasoning call (observed in
+    # the mcp-health-probe). 180s risked killing a deep Ultra reasoning turn.
+    # Override via NEMOCLAW_LLM_IDLE_TIMEOUT.
+    llm_idle_timeout = int(env.get("NEMOCLAW_LLM_IDLE_TIMEOUT", "300"))
 
     config = {
         "agents": {

@@ -8,3 +8,4 @@ node_modules/
 state/population.json
 state/last-report.md
 state/posted-notes.log
+state/models.json

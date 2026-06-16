@@ -113,9 +113,13 @@ const backends = {
   // so the arena measures the quality/latency trade rather than us guessing.
   nemotron(opts = {}) {
     const p = probe();
-    const modelId = opts.cheap
-      ? (env.CHAD_NEMOTRON_MODEL || "nvidia/nemotron-3-ultra-550b-a55b")
-      : (env.CHAD_NEMOTRON_CAPABLE_MODEL || "nvidia/nemotron-3-ultra-550b-a55b");
+    // opts.model lets a workflow/experiment request ANY model in NVIDIA's
+    // OpenAI-compatible catalog (gpt-oss-120b, deepseek-v4-pro, llama-4-maverick,
+    // kimi-k2.6, nemotron-nano-omni-reasoning, …) for parallel A/B + fusion.
+    const modelId = opts.model
+      || (opts.cheap
+        ? (env.CHAD_NEMOTRON_MODEL || "nvidia/nemotron-3-ultra-550b-a55b")
+        : (env.CHAD_NEMOTRON_CAPABLE_MODEL || "nvidia/nemotron-3-ultra-550b-a55b"));
     const model = openaiCompatModel(
       p.shimUrl, modelId, env.NVIDIA_API_KEY || env.OPENAI_API_KEY, "chad-nemotron",
     );
