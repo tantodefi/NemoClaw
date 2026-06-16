@@ -1,0 +1,277 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Chad · Smithers Runs</title>
+<!-- Optional CDN polish (syntax highlighting + visual DAG). Behind Cloudflare
+     Access; gracefully degrades to a plain textarea / JSON tree if unavailable. -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  .CodeMirror { height:440px; border:1px solid var(--border); border-radius:8px; margin-top:8px; font-size:12.5px; }
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+          --green:#3fb950; --red:#f85149; --blue:#58a6ff; --yellow:#d29922; --accent:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 20px; border-bottom:1px solid var(--border); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; font-weight:600; white-space:nowrap; }
+  .tab { color:var(--muted); cursor:pointer; padding:4px 10px; border-radius:6px; }
+  .tab.active { color:var(--fg); background:#21262d; }
+  .spacer { flex:1; }
+  .meta { color:var(--muted); font-size:12px; }
+  .wrap { display:grid; grid-template-columns:minmax(340px,38%) 1fr; height:calc(100vh - 50px); }
+  .list { overflow:auto; border-right:1px solid var(--border); }
+  .detail { overflow:auto; padding:18px 22px; }
+  .pane { padding:18px 22px; overflow:auto; height:calc(100vh - 50px); }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; color:var(--muted); font-weight:500; font-size:12px; padding:8px 12px; position:sticky; top:0; background:var(--bg); }
+  td { padding:8px 12px; border-top:1px solid var(--border); vertical-align:top; }
+  tr.run { cursor:pointer; } tr.run:hover { background:#161b22; } tr.run.sel { background:#1f2630; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+  .pill.finished,.pill.approved{ background:rgba(63,185,80,.15); color:var(--green); }
+  .pill.failed,.pill.errored,.pill.denied{ background:rgba(248,81,73,.15); color:var(--red); }
+  .pill.running,.pill.in-progress,.pill.pending{ background:rgba(88,166,255,.15); color:var(--blue); }
+  .pill.running::before,.pill.in-progress::before{ content:"● "; animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+  .pill.cancelled,.pill.unknown{ background:#21262d; color:var(--muted); }
+  .stale { color:var(--yellow); font-size:12px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .muted { color:var(--muted); }
+  h2 { font-size:16px; margin:0 0 4px; } h3 { font-size:13px; color:var(--muted); margin:18px 0 6px; text-transform:uppercase; letter-spacing:.04em; }
+  pre { background:#0b0f14; border:1px solid var(--border); border-radius:8px; padding:10px 12px; overflow:auto; font-size:12px; }
+  .err { color:var(--red); white-space:pre-wrap; }
+  details { border:1px solid var(--border); border-radius:8px; margin:6px 0; padding:6px 10px; background:var(--panel); }
+  summary { cursor:pointer; font-weight:600; }
+  .empty { color:var(--muted); padding:40px; text-align:center; }
+  .logpanel { background:#0b0f14; border:1px solid var(--border); border-radius:8px; padding:8px 10px; max-height:300px; overflow:auto; font-family:ui-monospace,monospace; font-size:11.5px; line-height:1.55; }
+  .ev.t-RunStarted,.ev.t-RunFinished,.ev.t-NodeFinished { color:var(--green); }
+  .ev.t-NodeFailed,.ev.t-RunFailed { color:var(--red); }
+  .ev.t-NodeStarted { color:var(--blue); }
+  .ev .ts { color:var(--muted); }
+  button { font:inherit; cursor:pointer; border:1px solid var(--border); background:#21262d; color:var(--fg); border-radius:6px; padding:4px 12px; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); color:#04101f; border-color:var(--accent); font-weight:600; }
+  button.danger { color:var(--red); border-color:rgba(248,81,73,.4); background:transparent; }
+  input.search { background:#0b0f14; border:1px solid var(--border); color:var(--fg); border-radius:6px; padding:5px 10px; width:100%; }
+  textarea.editor { width:100%; min-height:420px; background:#0b0f14; color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; line-height:1.55; resize:vertical; tab-size:2; margin-top:8px; }
+  .row { display:flex; gap:10px; align-items:center; }
+  .card { border:1px solid var(--border); border-radius:8px; padding:12px 14px; margin:8px 0; background:var(--panel); }
+  .md h1,.md h2,.md h3 { text-transform:none; letter-spacing:0; color:var(--fg); }
+  .md table { margin:6px 0; } .md th,.md td { border:1px solid var(--border); padding:4px 8px; font-size:12px; }
+  .md code { background:#0b0f14; padding:1px 5px; border-radius:4px; font-family:ui-monospace,monospace; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Chad · Smithers</h1>
+  <span class="tab active" data-tab="runs">Runs</span>
+  <span class="tab" data-tab="workflows">Workflows</span>
+  <span class="tab" data-tab="approvals">Approvals <span id="apvBadge"></span></span>
+  <span class="tab" data-tab="experiments">Experiments</span>
+  <span class="spacer"></span>
+  <span class="meta" id="meta">loading…</span>
+</header>
+
+<div id="view-runs" class="wrap">
+  <div class="list">
+    <div style="padding:8px 12px;border-bottom:1px solid var(--border)"><input class="search" id="search" placeholder="filter runs (workflow / status / id)…"></div>
+    <table><thead><tr><th>workflow</th><th>status</th><th>started</th><th>dur</th></tr></thead><tbody id="runs"></tbody></table>
+  </div>
+  <div class="detail" id="detail"><div class="empty">Select a run to inspect. Live runs update in real time.</div></div>
+</div>
+<div id="view-workflows" class="pane" style="display:none"><div id="workflows"></div></div>
+<div id="view-approvals" class="pane" style="display:none"><div id="approvals"></div></div>
+<div id="view-experiments" class="pane" style="display:none"><div id="experiments"></div></div>
+
+<script>
+const fmtTime = (ms) => ms ? new Date(ms).toLocaleString() : "—";
+const fmtDur = (a,b) => { if(a&&b){ const ms=b-a; return ms<1000 ? ms+"ms" : (ms/1000).toFixed(1)+"s"; } return a&&!b ? "running" : "—"; };
+const TERMINAL = new Set(["finished","failed","cancelled","errored"]);
+const isLive = (r) => !TERMINAL.has(String(r.status||"").toLowerCase());
+const pill = (s) => `<span class="pill ${String(s||'unknown').toLowerCase()}">${esc(s||'unknown')}</span>`;
+const esc = (s) => String(s??"").replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+let selected=null, detailTimer=null, allRuns=[], filter="";
+const editors={};
+if(window.mermaid){ try{ mermaid.initialize({startOnLoad:false,theme:"dark",securityLevel:"loose",flowchart:{useMaxWidth:true}}); }catch{} }
+
+function keyHdr(){ const k=new URLSearchParams(location.search).get("key"); return k?{"x-smithers-key":k}:{}; }
+async function api(p){ const r=await fetch(p,{headers:keyHdr()}); if(!r.ok) throw new Error(p+" "+r.status); return r.json(); }
+async function post(p,body){ const r=await fetch(p,{method:"POST",headers:{"content-type":"application/json",...keyHdr()},body:JSON.stringify(body||{})}); const j=await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||("HTTP "+r.status)); return j; }
+
+// minimal markdown (headings, bold, code, pipe-tables) for report rendering
+function md(src){
+  const lines=String(src||"").split("\n"); let html="", i=0;
+  while(i<lines.length){
+    let l=lines[i];
+    if(/^\|.*\|/.test(l)){ const tbl=[]; while(i<lines.length&&/^\|.*\|/.test(lines[i])){ tbl.push(lines[i]); i++; }
+      const rows=tbl.filter(r=>!/^\|[\s|:-]+\|$/.test(r)).map(r=>r.split("|").slice(1,-1).map(c=>c.trim()));
+      html+="<table>"+rows.map((r,ri)=>"<tr>"+r.map(c=>`<${ri?'td':'th'}>${inl(c)}</${ri?'td':'th'}>`).join("")+"</tr>").join("")+"</table>"; continue; }
+    if(/^### /.test(l)) html+=`<h3>${inl(l.slice(4))}</h3>`;
+    else if(/^## /.test(l)) html+=`<h2>${inl(l.slice(3))}</h2>`;
+    else if(/^# /.test(l)) html+=`<h1>${inl(l.slice(2))}</h1>`;
+    else if(l.trim()==="") html+="";
+    else html+=`<div>${inl(l)}</div>`;
+    i++;
+  }
+  return html;
+  function inl(s){ return esc(s).replace(/\*\*(.+?)\*\*/g,"<b>$1</b>").replace(/`(.+?)`/g,"<code>$1</code>"); }
+}
+
+async function loadRuns(){
+  try {
+    const {runs}=await api("/api/runs"); allRuns=runs;
+    let h={dbs:[]}; try{h=await api("/api/health");}catch{}
+    const live=runs.filter(isLive).length;
+    document.getElementById("meta").textContent=`${runs.length} runs · ${h.dbs.length} db${live?` · ${live} live`:""}`;
+    renderRuns();
+    loadApprovalsBadge();
+  } catch(e){ document.getElementById("meta").textContent="API error: "+e.message; }
+}
+function renderRuns(){
+  const f=filter.toLowerCase();
+  const rows=allRuns.filter(r=>!f || `${r.workflow_name} ${r.status} ${r.run_id} ${r.db}`.toLowerCase().includes(f));
+  const tb=document.getElementById("runs");
+  tb.innerHTML=rows.map(r=>`<tr class="run ${r.run_id===selected?'sel':''}" data-id="${esc(r.run_id)}">
+    <td><div>${esc(r.workflow_name||'?')}</div><div class="muted mono" style="font-size:11px">${esc((r.run_id||'').slice(0,8))} · ${esc(r.db)}</div></td>
+    <td>${pill(r.status)}</td><td class="muted">${fmtTime(r.started_at_ms||r.created_at_ms)}</td>
+    <td class="muted">${isLive(r)?'…':fmtDur(r.started_at_ms,r.finished_at_ms)}</td></tr>`).join("")
+    || `<tr><td colspan=4 class=empty>${f?'no matches':'No runs yet.'}</td></tr>`;
+  tb.querySelectorAll("tr.run").forEach(tr=>tr.onclick=()=>selectRun(tr.dataset.id));
+}
+document.getElementById("search").oninput=(e)=>{ filter=e.target.value; renderRuns(); };
+
+function selectRun(id){ selected=id; if(detailTimer){clearInterval(detailTimer);detailTimer=null;} loadDetail(id); }
+async function loadDetail(id){
+  if(selected!==id) return;
+  document.querySelectorAll("tr.run").forEach(tr=>tr.classList.toggle("sel",tr.dataset.id===id));
+  const d=document.getElementById("detail");
+  try {
+    const [det,logs]=await Promise.all([api("/api/runs/"+encodeURIComponent(id)),api("/api/runs/"+encodeURIComponent(id)+"/logs").catch(()=>({events:[]}))]);
+    if(selected!==id) return;
+    const {run,attempts,outputs}=det, live=isLive(run);
+    const stale=live&&run.heartbeat_at_ms&&(Date.now()-run.heartbeat_at_ms>60000);
+    const cancelBtn=live?`<button class="danger" onclick="cancelRun('${esc(id)}')">Cancel</button>`:"";
+    const actions=`<button onclick="loadChat('${esc(id)}')">Chat</button><button onclick="forkRun('${esc(id)}')">Fork ⑂</button>${cancelBtn}`;
+    const att=attempts.map(a=>`<tr><td class="mono">${esc(a.node_id)} <a href="#" onclick="trace('${esc(id)}','${esc(a.node_id)}');return false" class="muted" style="font-size:11px">trace</a> <a href="#" onclick="diffNode('${esc(id)}','${esc(a.node_id)}');return false" class="muted" style="font-size:11px">diff</a></td>
+      <td>${pill(a.state)}</td><td class="muted">${String(a.state).toLowerCase()==='in-progress'?'running':fmtDur(a.started_at_ms,a.finished_at_ms)}</td>
+      <td class="err">${a.error_json?esc((()=>{try{return JSON.parse(a.error_json).message}catch{return a.error_json}})()).slice(0,160):""}</td></tr>`).join("");
+    const outs=Object.entries(outputs).map(([t,rows])=>{
+      const isReport=rows.length===1&&(rows[0].summary||rows[0].path)&&t==="report";
+      const rep=rows.map(r=>r.content||r.body||"").join("");
+      return `<details ${t==='report'?'open':''}><summary>${esc(t)} (${rows.length})</summary>${t==='report'&&rep?`<div class="md">${md(rep)}</div>`:`<pre>${esc(JSON.stringify(rows,null,2))}</pre>`}</details>`;
+    }).join("");
+    const logHtml=(logs.events||[]).map(ev=>{const ts=ev.timestampMs?new Date(ev.timestampMs).toLocaleTimeString():"";return `<div class="ev t-${esc(ev.type||'')}"><span class="ts">${ts}</span> ${esc(ev.type||ev.raw||'')}${ev.nodeId?' · '+esc(ev.nodeId):''}${ev.message?' · '+esc(ev.message):''}</div>`;}).join("");
+    d.innerHTML=`<div class="row"><h2 style="flex:1">${esc(run.workflow_name||'run')} ${pill(run.status)}${stale?' <span class="stale">⚠ stale</span>':''}</h2>${actions}</div>
+      <div class="muted mono">${esc(run.run_id)} · ${esc(run.db)}</div>
+      <div class="muted">started ${fmtTime(run.started_at_ms)} · ${live?'<b style="color:var(--blue)">running…</b>':'finished '+fmtTime(run.finished_at_ms)} · ${fmtDur(run.started_at_ms,run.finished_at_ms)}</div>
+      ${run.error_json?`<h3>error</h3><pre class="err">${esc(run.error_json)}</pre>`:""}
+      <div id="chatbox"></div>
+      <h3>tasks (${attempts.length})</h3><table><thead><tr><th>node</th><th>state</th><th>dur</th><th>error</th></tr></thead><tbody>${att||'<tr><td colspan=4 class=muted>waiting…</td></tr>'}</tbody></table>
+      <div id="tracebox"></div>
+      <h3>event log${live?' · live':''} ${logs.total?`<span class="muted">(${logs.total})</span>`:''}</h3><div class="logpanel" id="logpanel">${logHtml||'<span class=muted>no events</span>'}</div>
+      <h3>outputs</h3>${outs||'<div class="muted">no output rows</div>'}`;
+    const lp=document.getElementById("logpanel"); if(lp) lp.scrollTop=lp.scrollHeight;
+    if(live&&selected===id&&!detailTimer) detailTimer=setInterval(()=>{ if(selected===id) loadDetail(id); else {clearInterval(detailTimer);detailTimer=null;} },2500);
+    else if(!live&&detailTimer){ clearInterval(detailTimer); detailTimer=null; }
+  } catch(e){ d.innerHTML=`<div class="empty">error: ${esc(e.message)}</div>`; }
+}
+async function cancelRun(id){ if(!confirm("Cancel this run?"))return; try{ await post("/api/runs/"+encodeURIComponent(id)+"/cancel"); setTimeout(()=>{loadDetail(id);loadRuns();},1000); }catch(e){ alert("cancel failed: "+e.message); } }
+async function forkRun(id){ if(!confirm("Fork this run (time-travel from its latest snapshot)?"))return; try{ await post("/api/runs/"+encodeURIComponent(id)+"/fork"); switchTab("runs"); setTimeout(loadRuns,1500); }catch(e){ alert("fork failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Access login or ?key=)":"")); } }
+async function loadChat(id){ const box=document.getElementById("chatbox"); box.innerHTML="<h3>agent chat</h3><div class=muted>loading…</div>"; try{ const {chat,error}=await api("/api/runs/"+encodeURIComponent(id)+"/chat"); box.innerHTML="<h3>agent chat</h3><div class='logpanel' style='max-height:360px;white-space:pre-wrap'>"+esc(chat||error||"(no chat output)")+"</div>"; }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
+function colorizeDiff(d){ return esc(d).split("\n").map(l=>{ if(l.startsWith("+")&&!l.startsWith("+++"))return "<span style='color:var(--green)'>"+l+"</span>"; if(l.startsWith("-")&&!l.startsWith("---"))return "<span style='color:var(--red)'>"+l+"</span>"; if(l.startsWith("@@"))return "<span style='color:var(--blue)'>"+l+"</span>"; return l; }).join("\n"); }
+async function diffNode(id,node){ const box=document.getElementById("tracebox"); box.innerHTML="<h3>diff · "+esc(node)+"</h3><div class=muted>loading…</div>"; try{ const {diff}=await api("/api/runs/"+encodeURIComponent(id)+"/diff/"+encodeURIComponent(node)); const d=(diff||"").trim(); box.innerHTML="<h3>diff · "+esc(node)+"</h3>"+(d&&!/VcsError|No smithers/.test(d)?"<pre>"+colorizeDiff(diff)+"</pre>":"<div class=muted>no code diff for this task (only code-editing tasks produce diffs)</div>"); }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
+async function trace(id,node){ const box=document.getElementById("tracebox"); box.innerHTML="<h3>agent trace · "+esc(node)+"</h3><div class=muted>loading…</div>";
+  try{ const {lines}=await api(`/api/runs/${encodeURIComponent(id)}/trace/${encodeURIComponent(node)}`);
+    box.innerHTML="<h3>agent trace · "+esc(node)+"</h3><pre>"+esc(lines.map(l=>l.message||l.text||JSON.stringify(l)).join("\n")||"(no trace)").slice(0,8000)+"</pre>"; }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
+
+const wfBox=(name)=>"g-"+btoa(unescape(encodeURIComponent(name))).replace(/[^a-zA-Z0-9]/g,"");
+async function loadWorkflows(){
+  const el=document.getElementById("workflows");
+  try{ const {workflows}=await api("/api/workflows");
+    el.innerHTML=`<div class="row"><h2 style="flex:1">Workflows</h2><button onclick="newWorkflow()">+ New workflow</button></div>
+      <div class=muted>Edit a workflow's .jsx, validate its graph, or launch it. Launches run detached and appear live under Runs.</div>`+
+      workflows.map(w=>`<div class="card"><div class="row"><div style="flex:1"><b class="mono">${esc(w.name)}</b><div class="muted" style="font-size:12px">modified ${fmtTime(w.mtime)}</div></div>
+        <button onclick="editWorkflow('${esc(w.name)}')">Edit</button>
+        <button onclick="showGraph('${esc(w.name)}')">Graph</button>
+        <button class="primary" onclick="launch('${esc(w.name)}')">Launch ▶</button></div><div id="${wfBox(w.name)}"></div></div>`).join("");
+  }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
+}
+async function launch(name){ if(!confirm("Launch "+name+"?"))return; try{ const r=await post("/api/launch",{workflow:name}); switchTab("runs"); setTimeout(loadRuns,1500); }catch(e){ alert("launch failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Cloudflare Access login, or ?key=)":"")); } }
+async function showGraph(name){ const box=document.getElementById(wfBox(name)); box.innerHTML="<div class=muted>rendering graph…</div>";
+  try{ const {dag}=await api("/api/workflow-graph?name="+encodeURIComponent(name));
+    if(window.mermaid && dag && dag.nodes.length){
+      const nid=(id)=>"n_"+String(id).replace(/[^a-zA-Z0-9]/g,"_");
+      let g="flowchart TD\n"; dag.nodes.forEach(n=>g+=`  ${nid(n.id)}["${String(n.label).replace(/"/g,"'")}"]\n`);
+      dag.edges.forEach(e=>g+=`  ${nid(e.from)} --> ${nid(e.to)}\n`);
+      try{ const {svg}=await mermaid.render("mm"+wfBox(name)+Date.now(), g); box.innerHTML="<div class='card' style='overflow:auto'>"+svg+"</div>"; return; }catch(err){}
+    }
+    box.innerHTML="<pre style='max-height:320px'>"+esc(JSON.stringify(dag,null,2))+"</pre>";
+  }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
+async function editWorkflow(name){ const box=document.getElementById(wfBox(name)); box.innerHTML="<div class=muted>loading source…</div>";
+  try{ const f=await api("/api/workflow-file?name="+encodeURIComponent(name));
+    box.innerHTML=`<textarea class="editor" id="ed-${wfBox(name)}" spellcheck="false">${esc(f.content)}</textarea>
+      <div class="row" style="margin-top:6px"><button class="primary" onclick="saveWorkflow('${esc(name)}')">Save + validate</button>
+      <button onclick="showGraph('${esc(name)}')">Graph</button><span class="muted" id="st-${wfBox(name)}"></span></div>`;
+    const ta=document.getElementById("ed-"+wfBox(name));
+    if(window.CodeMirror){ editors[name]=CodeMirror.fromTextArea(ta,{mode:"javascript",lineNumbers:true,theme:"material-darker",tabSize:2,indentUnit:2}); }
+    else { ta.addEventListener("keydown",tabKey); }
+  }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
+}
+function tabKey(e){ if(e.key==="Tab"){ e.preventDefault(); const s=this.selectionStart,en=this.selectionEnd; this.value=this.value.slice(0,s)+"  "+this.value.slice(en); this.selectionStart=this.selectionEnd=s+2; } }
+async function saveWorkflow(name){ const st=document.getElementById("st-"+wfBox(name)); st.textContent="saving…"; st.className="muted";
+  const content=editors[name]?editors[name].getValue():document.getElementById("ed-"+wfBox(name)).value;
+  try{ const r=await post("/api/workflow-file",{name,content}); st.textContent="saved by "+r.savedBy+" · validating…";
+    try{ await api("/api/workflow-graph?name="+encodeURIComponent(name)); st.textContent="✓ saved + graph valid"; st.style.color="var(--green)"; }
+    catch(ge){ st.textContent="saved, but graph error: "+ge.message; st.style.color="var(--red)"; }
+  }catch(e){ st.textContent=""; alert("save failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Cloudflare Access login, or ?key=)":"")); } }
+async function newWorkflow(){ const name=prompt("New workflow file (e.g. workflows/my-flow.jsx):","workflows/new-flow.jsx"); if(!name)return;
+  const tmpl=`/** @jsxImportSource smithers-orchestrator */\nimport { createSmithers } from "smithers-orchestrator";\nimport { z } from "zod";\nimport { pickAgent } from "../agents.js";\n\nconst api = createSmithers({ result: z.object({ summary: z.string() }) }, { dbPath: "./new-flow.db" });\nconst { smithers, Workflow, Task, Sequence, outputs } = api;\n\nexport default smithers((ctx) => (\n  <Workflow name="new-flow">\n    <Sequence>\n      <Task id="step" output={outputs.result} agent={pickAgent("draft")}>\n        {"Reply as Chad. Return JSON { summary }."}\n      </Task>\n    </Sequence>\n  </Workflow>\n));\n`;
+  try{ await post("/api/workflow-file",{name,content:tmpl}); await loadWorkflows(); editWorkflow(name); }catch(e){ alert("create failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Cloudflare Access login, or ?key=)":"")); } }
+
+async function loadApprovalsBadge(){ try{ const {pending}=await api("/api/approvals"); const b=document.getElementById("apvBadge"); b.innerHTML=pending.length?`<span class="pill pending">${pending.length}</span>`:""; }catch{} }
+async function loadApprovals(){
+  const el=document.getElementById("approvals");
+  try{ const {pending}=await api("/api/approvals");
+    el.innerHTML="<h2>Pending approvals</h2>"+(pending.length?pending.map(p=>{
+      let req=""; try{ req=JSON.parse(p.request_json||"{}").prompt||""; }catch{}
+      return `<div class="card"><div class="muted mono">${esc(p.run_id)} · ${esc(p.node_id)} · iter ${p.iteration} · ${esc(p.db)}</div>
+        <div style="margin:6px 0">${esc(req||"(approval gate)")}</div>
+        <div class="row"><button class="primary" onclick="decide('${esc(p.run_id)}','${esc(p.node_id)}',${p.iteration},'approve')">Approve</button>
+        <button class="danger" onclick="decide('${esc(p.run_id)}','${esc(p.node_id)}',${p.iteration},'deny')">Deny</button></div></div>`;
+    }).join(""):"<div class=muted>No pending approvals. Chad's autonomy gates (e.g. email replies) show here.</div>");
+  }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
+}
+async function decide(runId,node,iteration,verb){ try{ await post(`/api/runs/${encodeURIComponent(runId)}/${verb}`,{node,iteration}); loadApprovals(); loadApprovalsBadge(); }catch(e){ alert(verb+" failed: "+e.message); } }
+
+async function loadExperiments(){
+  const el=document.getElementById("experiments");
+  try{ const {population,report}=await api("/api/experiments");
+    const cands=(population.candidates||[]).slice().sort((a,b)=>(b.rollingMean||0)-(a.rollingMean||0));
+    el.innerHTML=`<h2>Evolutionary leaderboard</h2><table><thead><tr><th></th><th>candidate</th><th>kind</th><th>rolling</th><th>trials</th><th>status</th></tr></thead><tbody>${
+      cands.map(c=>`<tr><td>${c.status==='champion'?'🏆':c.status==='retired'?'🪦':''}</td><td class="mono">${esc(c.id)}</td><td>${esc(c.kind)}</td><td>${(c.rollingMean||0).toFixed(3)}</td><td>${c.trials||0}</td><td>${esc(c.status)}</td></tr>`).join("")||'<tr><td colspan=6 class=muted>none</td></tr>'
+    }</tbody></table><h3>last report</h3><div class="md">${md(report)||'<span class=muted>(none)</span>'}</div>`;
+  }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
+}
+
+function switchTab(tab){
+  document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.tab===tab));
+  for(const v of ["runs","workflows","approvals","experiments"]) document.getElementById("view-"+v).style.display = v===tab ? (v==="runs"?"grid":"block") : "none";
+  if(tab==="workflows") loadWorkflows();
+  if(tab==="approvals") loadApprovals();
+  if(tab==="experiments") loadExperiments();
+}
+document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>switchTab(t.dataset.tab));
+
+loadRuns();
+setInterval(()=>{ if(document.getElementById("view-runs").style.display!=="none") loadRuns(); }, 5000);
+setInterval(loadApprovalsBadge, 15000);
+</script>
+</body>
+</html>

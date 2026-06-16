@@ -74,6 +74,12 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: nemoclaw-cloudflared
     restart: unless-stopped
+    # Resolve host.docker.internal so a Public Hostname route can target a
+    # service bound to the Mac host (the runs.supachad.com dashboard on :7331).
+    # Same mapping open-webui already uses; without it cloudflared NXDOMAINs the
+    # origin and returns 502. (host-gateway → the Docker Desktop host.)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # --protocol http2 forces TCP-based HTTP/2 instead of cloudflared's default
     # QUIC-over-UDP. QUIC sessions get torn down ("failed to accept QUIC stream:
     # timeout: no recent network activity") when residential routers / mobile

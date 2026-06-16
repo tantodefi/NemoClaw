@@ -9,6 +9,8 @@
         "@ai-sdk/openai-compatible": "latest",
         "@smithers-orchestrator/agents": "latest",
         "ai": "latest",
+        "react": "19",
+        "react-dom": "19",
         "smithers-orchestrator": "latest",
         "zod": "^4.4.3",
       },

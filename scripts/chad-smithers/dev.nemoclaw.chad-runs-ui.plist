@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.nemoclaw.chad-runs-ui</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/r/.bun/bin/bun</string>
+    <string>/Users/r/.nemoclaw/source/scripts/chad-smithers/serve-runs.js</string>
+  </array>
+  <!-- Bind 0.0.0.0 so the cloudflared Docker container reaches it via
+       host.docker.internal:7331 (runs.supachad.com tunnel route). -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/r/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>CHAD_RUNS_HOST</key><string>0.0.0.0</string>
+    <key>CHAD_RUNS_PORT</key><string>7331</string>
+  </dict>
+  <!-- It's a service: keep it alive, start at load. -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/r/.nemoclaw/openwebui/chad-runs-ui.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/r/.nemoclaw/openwebui/chad-runs-ui.err.log</string>
+</dict>
+</plist>

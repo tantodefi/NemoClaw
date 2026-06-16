@@ -1,25 +1,30 @@
-# Example cloudflared ingress for the Smithers run board at chad.supachad.com/runs
-# NOT APPLIED — this is a reference for the edge change (do it deliberately).
+# Routing the durable run dashboard to runs.supachad.com (subdomain — decided).
 #
-# Recommendation: path-based on the EXISTING hostname so the existing Cloudflare
-# Access policy on chad.supachad.com covers it too — no new DNS record, cert, or
-# Access application. Add the /runs rule ABOVE the catch-all OpenWebUI rule
-# (cloudflared matches top-down):
+# The dashboard (serve-runs.js, a Hono server reading the Smithers SQLite DBs)
+# runs on the Mac host, port 7331, bound 0.0.0.0 (via the launchd plist
+# dev.nemoclaw.chad-runs-ui.plist). The cloudflared tunnel is TOKEN-managed, so
+# the route below is configured in the Cloudflare Zero Trust DASHBOARD, not a
+# local file. This file just records the exact values to enter.
 #
+# Dashboard → Networks → Tunnels → <your tunnel> → Configure → Public Hostname →
+#   Add a public hostname:
+#     Subdomain: runs
+#     Domain:    supachad.com
+#     Path:      (leave empty — subdomain serves at root, no base-path issue)
+#     Service:   http://host.docker.internal:7331
+#       (cloudflared runs in Docker; host.docker.internal = the Mac host. The
+#        dashboard binds 0.0.0.0 so the container can reach it.)
+#
+# Access: a subdomain needs its own Cloudflare Access application. Add an Access
+# app for runs.supachad.com with the same SSO policy as chad.supachad.com so the
+# same people can reach it.
+#
+# Equivalent config-file form (for reference only — NOT used with a token tunnel):
 ingress:
-  # Smithers run board (gateway API + UI) — must come before the OpenWebUI rule.
-  - hostname: chad.supachad.com
-    path: /runs.*
-    service: http://127.0.0.1:7331   # serve-runs.js (CHAD_RUNS_PORT)
-  # Existing OpenWebUI (catch-all for the hostname).
-  - hostname: chad.supachad.com
-    service: http://127.0.0.1:8080    # <-- your existing OpenWebUI upstream
+  - hostname: runs.supachad.com
+    service: http://host.docker.internal:7331
   - service: http_status:404
 #
-# CAVEAT: the gateway app must serve its assets under the /runs base path. If
-# assets 404 (the classic reverse-proxy-subpath problem; startServer has no
-# basePath option), fall back to a dedicated subdomain where the app lives at
-# root:
-#   - hostname: runs.supachad.com
-#     service: http://127.0.0.1:7331
-# (a subdomain needs its own DNS record + Access application).
+# Smoke test after adding the route:
+#   curl -sS https://runs.supachad.com/api/health   # {"ok":true,"dbs":[...]}
+# Then open https://runs.supachad.com in a browser.

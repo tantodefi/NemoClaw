@@ -95,28 +95,34 @@ Egress detail: raw `python3` is L7-blocked to NVIDIA (binary-identity policy);
 
 ### Needs operator intervention (I can't do these from here)
 
-- **Expired GitHub PAT.** `GITHUB_TOKEN` in the host `credentials.json` is
-  expired/revoked (returns 401; ~40 chars). Sub-agent GHA spawns and
-  chad-backup-to-github depend on it. Regenerate a **classic** `ghp_` token
-  (fine-grained PATs can't get collaborator access to other-owner repos —
-  see the classic-vs-fine-grained note) and update host credentials.json.
-- **Wire `/runs` to the live tunnel.** The production tunnel is **token-based**
-  (`cloudflared tunnel run --token $CF_TUNNEL_TOKEN`), so ingress routes are in
-  the **Cloudflare Zero Trust dashboard**, not a local file — I can't edit them.
-  To finish (see also `scripts/chad-smithers/cloudflared-runs.ingress.example.yaml`):
-  1. Build the UI: `gateway-react` ships only source (no prebuilt UI), so bundle
-     it into a static app that talks to the gateway API, or run the gateway with
-     a served UI. (`serve-runs.js` already runs the API half, boot-verified.)
-  2. In the CF Zero Trust dashboard, add a public-hostname route for
-     `chad.supachad.com` path `/runs` → `http://<host>:7331` (same hostname keeps
-     one Access policy). Fall back to a `runs.supachad.com` subdomain if assets
-     404 under the `/runs` base path.
-  3. Start `serve-runs.js` under launchd with `SMITHERS_API_KEY` set.
-  Interim that works today: the nightly leaderboard **note** in OpenWebUI.
+- **GitHub PAT — host RESOLVED 2026-06-14; pod pending.** The host
+  `credentials.json` `GITHUB_TOKEN` was replaced with a new **classic** `ghp_`
+  (supachad) carrying `repo` + `workflow`; verified working (chad-state HTTP 200,
+  `push:true`, Actions visible). The **pod still has the OLD expired token**
+  (host sha256[:12] `8d2267c78f29` ≠ pod `08ecd2c3c925`) — refresh it on the pod
+  as part of the #16 Ultra cutover window (same supervised restart), then
+  re-verify chad-backup / GHA spawns.
+- **runs.supachad.com run dashboard — BUILT + TESTED 2026-06-14; one operator
+  step left.** Decided on a **subdomain** (gateway-react/the operator console
+  were headless/live-only; instead `serve-runs.js` is now a durable Hono server
+  that reads the Smithers SQLite DBs directly → full run HISTORY across every
+  workflow DB, auto-discovering new runs). `public/index.html` is the dashboard
+  (runs list, run detail w/ task tree + outputs, experiments leaderboard).
+  Verified end-to-end locally: 2 workflows across 2 DBs, detail + leaderboard
+  render. Deploy: `dev.nemoclaw.chad-runs-ui.plist` (binds 0.0.0.0:7331).
+  REMAINING (operator, dashboard-only): in Cloudflare Zero Trust add a
+  public-hostname route **`runs.supachad.com` → `http://host.docker.internal:7331`**
+  (cloudflared runs in Docker) + an Access app for that subdomain mirroring
+  chad.supachad.com's policy. Exact values in
+  `scripts/chad-smithers/cloudflared-runs.ingress.example.yaml`. Token tunnel =
+  dashboard-only, so I can't add it. Interim still live: the nightly leaderboard
+  **note** in OpenWebUI.
 - **Live pod Ultra cutover (#16).** Source defaults are Ultra; the live pod
   model swap + `task-profiles.json` reasoning flips need an agent restart in a
   window you can watch the gateway (bonjour-crash history). Back up config first;
-  `openclaw agent` canary after.
+  `openclaw agent` canary after. **Also in this window:** propagate the new
+  `GITHUB_TOKEN` to the pod credentials (it still has the expired one — see
+  above) via chad-deploy/chad-sync, and re-verify chad-backup + a GHA spawn.
 - **`chad-webui notes list` → HTTP 500.** Appears pre-existing (create/delete by
   id work). Blocks browsing experiment notes; worth a look. A couple of test
   notes titled "Chad experiments — 2026-06-13" may linger — delete at leisure.

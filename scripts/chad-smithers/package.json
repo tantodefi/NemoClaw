@@ -12,11 +12,13 @@
     "resume": "smithers resume"
   },
   "dependencies": {
-    "smithers-orchestrator": "latest",
+    "@ai-sdk/anthropic": "latest",
+    "@ai-sdk/openai-compatible": "latest",
     "@smithers-orchestrator/agents": "latest",
     "ai": "latest",
-    "@ai-sdk/openai-compatible": "latest",
-    "@ai-sdk/anthropic": "latest",
+    "react": "19",
+    "react-dom": "19",
+    "smithers-orchestrator": "latest",
     "zod": "^4.4.3"
   }
 }
