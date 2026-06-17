@@ -91,6 +91,106 @@ Egress detail: raw `python3` is L7-blocked to NVIDIA (binary-identity policy);
   widen. The live model swap needs an agent restart, so do it when someone can
   watch the gateway (bonjour-crash history).
 
+## GHA substrate for Smithers + the two-architecture question (2026-06-16)
+
+**Question (#24):** can Smithers runs use GitHub Actions as a substrate, the way
+`chad-spawn --substrate gha` runs sub-agents on a GH runner?
+
+**How chad-spawn-gha works** (`.github/skills/chad-orchestrator/scripts/chad-spawn-gha.sh`
++ `docs/design/spawn-as-github-run.md`): mint a task_id → push a
+`chad-spawn/<id>` branch to `tantodefi/chad-state` with the task/kind/budget →
+`gh workflow run agent-job.yml` → the runner installs the kind's binary, runs
+the agent under a budget cap, commits `result.json` back to the branch → host
+reconciles via `chad-spawn-poll` (launchd) or a gateway webhook. **The branch is
+the job record** — no DB.
+
+**Verdict: feasible and graceful, by REUSING that exact machinery — not building
+a parallel GHA system.** Two shapes:
+
+- **(A) Whole workflow on a runner** — a `smithers-job.yml` that checks out the
+  chad-smithers workspace, `bun install`, `smithers up <wf>`, then ships the
+  resulting SQLite DB back (commit to a `smithers-run/<id>` branch or upload as
+  an artifact); a host poller drops it into the dashboard's scanned dir.
+- **(B, recommended) GHA as a Smithers *task* substrate** — a `pickSpawn()` /
+  `<GhaTask>` helper that dispatches `chad-spawn-gha` for ONE heavy step and
+  reconciles its `result.json` as that task's output. Smithers stays the
+  orchestrator on the host; only heavy/isolated steps offload to a runner.
+
+(B) is the gentler add: it reuses chad-spawn-gha verbatim, keeps the live host
+dashboard for orchestration, and lets a Smithers workflow fan a heavy step
+(e.g., `npm test`, an 8-vCPU build, a big parallel eval) onto GH runners.
+
+**Caveat:** GHA runs are **batch**, not live-streamed — the dashboard shows the
+host orchestration live, but a GHA-offloaded task only updates when its
+`result.json` reconciles back (runner spin-up + `bun install` ≈ 1-2 min
+overhead). So: host for interactive/live; GHA for heavy/parallel/isolated.
+Needs `NVIDIA_API_KEY` as a GH Actions secret on `chad-state`.
+
+### Do we run both chad-spawn AND chad-Smithers? Yes — they're complementary.
+
+| | chad-spawn | chad-Smithers |
+|---|---|---|
+| Shape | imperative one-shot sub-agents (kind manifests) | declarative durable workflows (JSX) |
+| State | branch-as-record (chad-state) | SQLite + live dashboard + resume |
+| Best for | isolated one-shot agents (writer/coder/reviewer), GHA offload | multi-step pipelines, experiments, autonomy ladder, anything inspectable/resumable |
+| Substrate | in-container OR GHA | host (live) — **+ GHA via the bridge above** |
+
+**Decision: keep both, bridge them.** chad-spawn remains the GHA-isolated
+one-shot substrate; chad-Smithers is the durable workflow orchestrator that can
+*call* chad-spawn-gha to offload heavy tasks. No wholesale migration.
+
+### Revised plans
+
+- **#15 (spawn-stack → Smithers) — REVISED to "bridge + selective migration."**
+  Don't replace `chad-spawn`/`poll`/`gc`. Instead: (1) build the `<GhaTask>`
+  bridge so Smithers workflows can offload steps via chad-spawn-gha; (2) migrate
+  only the **multi-step** spawn flows (issue-triage multi-spawn, content
+  multi-spawn) to Smithers workflows that use the bridge; (3) leave one-shot
+  spawns on chad-spawn. The ~1,300-line stack stays; Smithers wraps it.
+- **#23 (port Chad features) — clarified scope.** Port the **multi-step /
+  durable / inspectable** features (self-improve, issue-triage, memory-curator)
+  to Smithers `.jsx` (they gain resume + the dashboard + approvals, and can use
+  `<GhaTask>` for heavy sub-steps). Leave **mechanical one-shot** crons
+  (backups, prune, gc, budget-audit) as deterministic wrappers — Smithers is
+  pure overhead there.
+
+### Built (2026-06-16) — #15 bridge + #23 ports
+
+Shipped under `scripts/chad-smithers/`. All workflows graph-validate
+(`smithers graph`) and the side-effecting ones are **shadow-safe by default**
+(they log what they would do unless an explicit env flag is set), mirroring the
+draft-only contract of the shell wrappers.
+
+- **`lib/spawn.js` — the bridge (keystone of #15).** `runSpawn({kind, task,
+  substrate, id, …})` offloads ONE step to the existing `chad-spawn` and
+  reconciles its `result.json` as the task's output. Never throws (always
+  resolves to a `spawnResultSchema`-shaped object). Transport resolves per call:
+  `CHAD_SPAWN_STUB=1` (shadow), `CHAD_SPAWN_SSH=<host>` (real pod spawn — task
+  streamed in / result streamed back, since scp is blocked), local `chad-spawn`
+  on PATH, else stub. Also ports `chad-route` → `route()` and
+  `chad-issue-triage`'s scoring → `scoreIssue()`. Unit-tested
+  (`lib/spawn.test.js`, 8/8). **No GHA system was rebuilt** — the bridge calls
+  `chad-spawn --substrate gha` verbatim.
+- **#15 migrated multi-spawn flows:** `workflows/issue-triage.jsx` (fetch →
+  score+route → `Parallel` spawn per top-N issue → report; verified end-to-end
+  with stub spawns against a live issue repo) and `workflows/content-pipeline.jsx`
+  (research→draft→review spawns → reviewer-gated `Approval` → shadow publish).
+- **#23 ported features:** `workflows/self-improve.jsx` (cron telemetry → one
+  capable structured proposal → safe-list/`Approval` gate → shadow apply via the
+  pod's gated `chad-proposal-apply`), `workflows/memory-curator.jsx`
+  (inactivity-gate → pre-mutation snapshot → propose consolidations → `Approval`
+  → shadow apply), and `workflows/log-digest.jsx` (cluster host service-log
+  errors → note; quiet on a clean window; verified end-to-end on the host's 29
+  service logs).
+- **Left as deterministic wrappers (correctly):** backups, prune, gc,
+  budget-audit — mechanical one-shots where Smithers is pure overhead.
+
+Remaining for full parity (not blocking): the `<GhaTask>` JSX-component sugar
+(today it's `runSpawn({substrate:"gha"})`), flipping a flow to real mode in the
+pod (`CHAD_SPAWN_SSH` + a clean shadow week per the sunset rule), and wiring the
+real publish/apply/note sinks (`chad-webui`, `chad-proposal-apply`) once each
+shadow run proves out.
+
 ## Next steps & hanging TODOs
 
 ### Needs operator intervention (I can't do these from here)
@@ -131,10 +231,11 @@ Egress detail: raw `python3` is L7-blocked to NVIDIA (binary-identity policy);
 
 ### Buildable next (no intervention needed)
 
-- **#15 spawn-stack → Smithers.** Port `chad-spawn`/`poll`/`gc`/`watchdog`
-  (~1,300 lines) to durable Smithers tasks; keep `chad-spawn-gha` dispatch as a
-  `sideEffect` with an idempotency key. Build beside the existing jsonl ledger,
-  cut over after two clean weeks of parity.
+- **#15 spawn-stack → Smithers — BRIDGE BUILT 2026-06-16** (see "Built" above).
+  The bridge (`lib/spawn.js`) + the two multi-step flows (issue-triage,
+  content-pipeline) ship. Not done by design: the ~1,300-line one-shot stack
+  (`chad-spawn`/`poll`/`gc`/`watchdog`) STAYS — Smithers wraps it rather than
+  replacing it. Real-mode cutover of a flow waits on two clean shadow weeks.
 - **opencode CLI-agent adapter.** `opencode/big-pickle` confirmed;
   `opencode run -m <model>` is the non-interactive path. Implement a Smithers
   agent adapter around it (opencode serve is not OpenAI-compatible).

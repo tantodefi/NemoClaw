@@ -824,43 +824,46 @@ The backup set also grew on this branch:
 
 ---
 
-## 10. Phase-2 (status of follow-up work)
+## 10. Capabilities & deliberate non-goals
 
-The orchestrator landed on this branch was intentionally a **minimum
-viable contract**. Several improvements were deliberately held for
-follow-up; some have since shipped. Status as of 2026-05-06:
+What this branch does today.
 
-1. ✅ **Nested-spawn isolation — shipped (gha substrate).** Sub-agents
-   can now spawn onto a per-job GitHub Actions runner instead of
-   sharing Chad's container. See [docs/design/spawn-as-github-run.md](docs/design/spawn-as-github-run.md)
-   for the design (Phases A–C all shipped 2026-05-06). The k3s-pod
-   substrate is still future work for kinds that need both L7 policy
-   enforcement *and* per-spawn isolation.
-2. ✅ **Async spawn — shipped.** `chad-spawn --async --substrate gha`
-   returns immediately; the ledger gets `substrate` + `async` fields;
-   `chad-spawn-poll` cron (every 5min) reconciles result.json back
-   into `subagents/<id>/` and transitions the ledger entry. Branch
-   retention via `chad-spawn-gc` weekly cron.
-3. **Cron DSL.** `chad-intake --from cron` takes a task file today. A
-   YAML DSL would let Chad register new crons at runtime — "every
-   Tuesday 9am, spawn a reviewer against my open PRs".
-4. **`openclaw-sandbox.yaml` split.** The single 346-line policy file
-   is at its complexity ceiling. Splitting per-domain (inference /
-   github / messaging / browsing) would make policy review tractable.
-5. **Multi-Chad scheduling.** One k3s cluster, multiple Chads, a shared
-   scheduler that routes by kind + load. Needed the moment a second
-   user shows up.
-6. **MCP hub.** Expose the six orchestrator helpers as MCP tools so a
-   non-Chad agent (Claude Code, a local editor) can drive the same
-   sub-agent contract without Chad in the middle.
-7. **Diff-checked, compressed backups.** The §9 diff-check is
-   per-file. Phase-2 consolidates into a single commit with a tree
-   sha diff — one API call per backup run instead of one per file.
-8. **Webhook-based completion.** Today `chad-spawn-poll` polls every
-   5min. A real callback receiver in Chad's gateway would replace
-   that with push semantics, freeing both the runner-to-Chad
-   reconciliation latency and the unnecessary work when no spawns
-   are in flight.
+- **Nested-spawn isolation (`gha` substrate).** Sub-agents spawn onto a
+  per-job GitHub Actions runner instead of sharing Chad's container.
+  See [docs/design/spawn-as-github-run.md](docs/design/spawn-as-github-run.md).
+- **Async spawn.** `chad-spawn --async --substrate gha` returns
+  immediately; the ledger carries `substrate` + `async`; `chad-spawn-poll`
+  (every 5min) reconciles `result.json`; `chad-spawn-gc` retires branches
+  weekly.
+- **Two orchestrators, bridged.** chad-spawn (imperative one-shot
+  sub-agents) plus chad-Smithers (durable JSX workflows) with the runs
+  IDE at `runs.supachad.com`. `scripts/chad-smithers/lib/spawn.js`'s
+  `runSpawn()` lets a workflow offload a heavy step to `chad-spawn` (no
+  parallel GHA system was built). Multi-step / durable / inspectable
+  flows run as workflows (`issue-triage`, `content-pipeline`,
+  `self-improve`, `memory-curator`, `log-digest`), each crash-resumable
+  with `Approval` gates and shadow-safe by default; mechanical one-shot
+  crons stay plain wrappers.
+- **Nemotron 3 Ultra 550B + reasoning by default** on hosted profiles
+  (self-hosted stays Super 120B); model fusion + a daily NVIDIA model
+  refresh keep the roster current.
+- **Agent backends:** nemotron / claudecode / codex / opencode
+  (`opencode/big-pickle`, via Smithers' built-in adapter) / anthropic /
+  local, auto-routed by `pickAgent(role)`.
+
+Deliberate non-goals (permanent by design, not gaps):
+
+- **`github_pr_merge: auto`** stays blocked — a merge is irreversible and
+  synthesizes CI signal a human should gate.
+- **`chad_self_modify_identity: auto`** stays operator-only — `SOUL.md`,
+  `IDENTITY.md`, `USER.md` are operator-owned; Chad proposes, the
+  operator applies.
+- **Chad-as-a-product / multi-tenant.** Single-operator agent against a
+  private state repo, by design.
+
+Engineering items parked with real blockers (operator infra / security
+review / no second user) are tracked in the operator's task list, not
+advertised here.
 
 ---
 

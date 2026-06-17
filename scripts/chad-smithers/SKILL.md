@@ -107,6 +107,54 @@ agent-task prompt is a **string child** (not a thunk); read upstream outputs via
 `ctx.outputs.<schema>` in render scope (not the `deps` arg); each workflow needs
 its **own** `dbPath` (different schemas can't share one DB).
 
+## Workflow catalog
+
+Launchable workflows (all auto-discovered by the runs IDE and `chad-runs
+workflows`). Side-effecting ones are **shadow-safe by default** — they log what
+they would do unless an explicit env flag is set.
+
+| Workflow | What it does | Make it real |
+|---|---|---|
+| `experiments.jsx` | Evolutionary drafter-prompt arena (start wide → score → keep) | runs live nightly |
+| `fusion.jsx` | One prompt across N models in parallel → fuse best | `CHAD_FUSION_MODELS`, `--input '{"prompt":"…"}'` |
+| `mcp-health-probe.jsx` | Probe gbrain/webui MCP surfaces, escalate on failure | runs as-is |
+| `fail-only-report.jsx` | Quiet on green; report only on failure | runs as-is |
+| `email-ladder.jsx` | Autonomy ladder: triage→draft→moderate→Approval→send | `CHAD_EMAIL_SEND=1` + admin allowlist |
+| `issue-triage.jsx` | Fetch issues → score → Parallel spawn fixes → report | `CHAD_SPAWN_SSH=openshell-chad` |
+| `content-pipeline.jsx` | research→draft→review (spawns) → Approval → publish | `CHAD_CONTENT_PUBLISH=1` |
+| `self-improve.jsx` | Cron telemetry → propose tunings → gate → apply | `CHAD_SELFIMPROVE_APPLY=1` + `CHAD_SIGNAL_SSH` |
+| `memory-curator.jsx` | Inactivity-gate → snapshot → propose consolidations → Approval | `CHAD_CURATOR_APPLY=1` + `CHAD_MEM_SSH` |
+| `log-digest.jsx` | Cluster host service-log errors → note (quiet if clean) | `CHAD_LOGDIGEST_POST=1` |
+
+## chad-spawn bridge (lib/spawn.js)
+
+The decision (#24) was **keep both orchestrators and bridge them**, not rebuild
+chad-spawn's GHA machinery. `lib/spawn.js` is that bridge — a Smithers workflow
+offloads ONE step to the existing chad-spawn substrate and reconciles its
+`result.json` as that task's output:
+
+```jsx
+import { runSpawn, route, scoreIssue, spawnResultSchema } from "../lib/spawn.js";
+
+<Task id="fix" output={outputs.spawn} sideEffect idempotencyKey={`spawn-${n}`}>
+  {() => runSpawn({ kind: "researcher", substrate: "gha", id: `iss-${n}`, task: "…" })}
+</Task>
+```
+
+`runSpawn` never throws — it always resolves to a `result.json`-shaped object
+(`spawnResultSchema`). Transport resolves per call:
+
+- `CHAD_SPAWN_STUB=1` → shadow result, no real spawn (host dry run / tests).
+- `CHAD_SPAWN_SSH=<host>` → ssh into the pod and run the real `chad-spawn` there
+  (keeps L7 policy + budget + manifest; task streamed in, result streamed back,
+  since scp is blocked in the sandbox).
+- `chad-spawn` on PATH → exec locally (Smithers running inside the pod).
+- none of the above → stub (safe host default; never a hard failure).
+
+`route(body, {default})` is chad-route ported to JS (deterministic keyword
+router); `scoreIssue(issue)` is chad-issue-triage's signal score. Both are
+unit-tested in `lib/spawn.test.js` (`bun test lib/spawn.test.js`).
+
 ## Smithers docs (for agents)
 
 - `smithers docs` → prints the concise `llms.txt` for the installed version.

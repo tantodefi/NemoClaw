@@ -16,7 +16,10 @@ resume guarantees to hold.
 | `agents.js` | Model router. The only place a backend is chosen. `pickAgent(role)` auto-detects what's available and routes by tier. |
 | `lib/population.js` | Evolutionary selection engine (pure, unit-tested): start wide → score → rank → retire losers. |
 | `lib/population.test.js` | `node --test lib/population.test.js` — 6 tests, all green. |
+| `lib/spawn.js` | The chad-spawn ⇄ Smithers bridge: `runSpawn()` (offload a step to chad-spawn, reconcile its `result.json`), `route()` (chad-route ported), `scoreIssue()`. Never throws. |
+| `lib/spawn.test.js` | `bun test lib/spawn.test.js` — 8 tests, all green. |
 | `experiments.jsx` | The nightly evolutionary workflow (Smithers). |
+| `workflows/*.jsx` | Ported chad-spawn / cron features (issue-triage, content-pipeline, self-improve, memory-curator, log-digest) + email-ladder, fusion, mcp-health-probe, fail-only-report. All graph-validate; side-effecting ones are shadow-safe by default. |
 | `state/seed-candidates.json` | Tracked. Initial variant pool to seed the arena wide. |
 | `state/fixtures.json` | Tracked. Evaluation fixtures the judge scores against. |
 | `state/population.json` | **Runtime** (gitignored). The evolving population + scores. |

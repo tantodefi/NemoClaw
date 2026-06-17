@@ -58,11 +58,11 @@ import { existsSync } from "node:fs";
 import { execSync } from "node:child_process";
 
 // ── Optional imports (don't hard-fail if a package/CLI isn't present) ────────
-let ToolLoopAgent, createOpenAICompatible, createAnthropic, ClaudeCodeAgent, CodexAgent;
+let ToolLoopAgent, createOpenAICompatible, createAnthropic, ClaudeCodeAgent, CodexAgent, OpenCodeAgent;
 try { ({ ToolLoopAgent } = await import("ai")); } catch { /* offline / not installed */ }
 try { ({ createOpenAICompatible } = await import("@ai-sdk/openai-compatible")); } catch { /* */ }
 try { ({ createAnthropic } = await import("@ai-sdk/anthropic")); } catch { /* */ }
-try { ({ ClaudeCodeAgent, CodexAgent } = await import("@smithers-orchestrator/agents")); } catch { /* */ }
+try { ({ ClaudeCodeAgent, CodexAgent, OpenCodeAgent } = await import("@smithers-orchestrator/agents")); } catch { /* */ }
 
 const env = process.env;
 
@@ -83,7 +83,7 @@ export function probe() {
     sdk: Boolean(ToolLoopAgent && createOpenAICompatible),
     claudeCli: binOnPath("claude") && Boolean(ClaudeCodeAgent),
     codexCli: binOnPath("codex") && Boolean(CodexAgent),
-    opencodeCli: binOnPath("opencode"),
+    opencodeCli: binOnPath("opencode") && Boolean(OpenCodeAgent),
     // Anthropic API returns 402 (no credits) as of 2026-06; set
     // CHAD_ANTHROPIC_CREDITS_OK=1 once restored to let the fallback engage.
     anthropicApi402: env.CHAD_ANTHROPIC_CREDITS_OK !== "1",
@@ -197,23 +197,20 @@ const backends = {
     });
   },
 
-  // opencode CLI — DEFERRED, but the unknowns are now resolved (2026-06-13):
-  //   • Model id confirmed: `opencode/big-pickle` (also opencode/nemotron-3-ultra-free,
-  //     deepseek-v4-flash-free, mimo-v2.5-free, north-mini-code-free) — `opencode models`.
-  //   • `opencode serve` is NOT OpenAI-compatible: it's opencode's own session API
-  //     (openapi "opencode api", /v1/* serves the web UI), so createOpenAICompatible
-  //     can't target it.
-  //   • Non-interactive path exists: `opencode run -m opencode/big-pickle "<prompt>"`.
-  // So wiring needs a thin CLI-harness adapter implementing the Smithers agent
-  // contract around `opencode run` (like ClaudeCodeAgent/CodexAgent) — its own task,
-  // not a drop-in. CHAD_OPENCODE_MODEL defaults to the confirmed id when built.
-  opencode() {
-    throw new Error(
-      "agents.js: opencode backend deferred — model id is opencode/big-pickle and " +
-      "`opencode run -m <model>` is the non-interactive path, but opencode serve is " +
-      "not OpenAI-compatible, so this needs a CLI-harness agent adapter (see " +
-      "docs/design/smithers-moshi-integration.md §agent backends).",
-    );
+  // opencode CLI via Smithers' built-in OpenCodeAgent (wraps `opencode run`,
+  // which IS the non-interactive path — no custom harness needed; the earlier
+  // "needs a CLI adapter" note was stale, @smithers-orchestrator/agents ships one).
+  // Default model is opencode/big-pickle (the free "big pickle" 500k-context model);
+  // other free ids: opencode/nemotron-3-ultra-free, deepseek-v4-flash-free,
+  // mimo-v2.5-free, north-mini-code-free (`opencode models`). Override with
+  // CHAD_OPENCODE_MODEL.
+  opencode(opts = {}) {
+    if (!OpenCodeAgent) throw new Error("agents.js: OpenCodeAgent not available — run `bun install`");
+    return new OpenCodeAgent({
+      model: env.CHAD_OPENCODE_MODEL || "opencode/big-pickle",
+      timeoutMs: opts.timeoutMs ?? 900_000,
+      ...opts.agent,
+    });
   },
 };
 
