@@ -53,6 +53,24 @@ IDENTITY_DIR = os.environ.get(
 )
 IDENTITY_MAX_BYTES = int(os.environ.get("CHAD_SHIM_IDENTITY_MAX_BYTES", "8000"))
 
+# Operator allowlist — when set (comma-separated emails), ONLY these reach the
+# full Chad agent; every other authenticated user gets a polite refusal. This
+# protects the shared agent/gbrain even if a non-operator selects the `chad`
+# model in the UI (a server-side guarantee independent of OpenWebUI model ACLs).
+# UNSET/empty = allow everyone (backward-compatible; the gate is opt-in).
+# Anonymous callers (no email header — e.g. direct API/health tooling) are
+# always allowed. Keep both operator emails here.
+OPERATOR_ALLOWLIST = {
+    e.strip().lower()
+    for e in os.environ.get("CHAD_OPERATOR_ALLOWLIST", "").split(",")
+    if e.strip()
+}
+DENY_MESSAGE = os.environ.get(
+    "CHAD_SHIM_DENY_MESSAGE",
+    "This assistant isn't available on your account. Please use the **Chad Lite** "
+    "model for general help, or contact the operator if you need full access.",
+)
+
 # Cache identity file contents keyed by (path, mtime) so we don't re-read on
 # every turn but DO pick up edits without restarting the shim.
 _identity_cache: dict[str, tuple[float, str]] = {}
@@ -203,6 +221,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_assistant_text(self, body: dict, text: str) -> None:
+        """Send `text` as an OpenAI chat-completion reply (stream or not),
+        mirroring the main success path. Used for the allowlist refusal so a
+        denied user sees a clean assistant message instead of an error."""
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        now = int(time.time())
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": now, "model": MODEL_ID,
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            done = {"id": cid, "object": "chat.completion.chunk", "created": now, "model": MODEL_ID,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            self.close_connection = True
+            return
+        self._send_json(200, {
+            "id": cid, "object": "chat.completion", "created": now, "model": MODEL_ID,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
     def _operator_context(self) -> dict:
         """Pull operator identity from forwarded OpenWebUI headers.
 
@@ -320,6 +366,14 @@ class Handler(BaseHTTPRequestHandler):
         if not message:
             _emit_trace(status="error", reply_chars=0, error="no user message")
             self._send_json(400, {"error": {"message": "no user message in body"}})
+            return
+
+        # Operator allowlist gate (opt-in via CHAD_OPERATOR_ALLOWLIST). A
+        # non-operator who selects the `chad` model never reaches the agent;
+        # they get DENY_MESSAGE. Unset allowlist or anonymous caller = allowed.
+        if OPERATOR_ALLOWLIST and op["email"] and op["email"] not in OPERATOR_ALLOWLIST:
+            _emit_trace(status="denied", reply_chars=len(DENY_MESSAGE))
+            self._send_assistant_text(body, DENY_MESSAGE)
             return
 
         prefix = self._format_operator_prefix(op)
