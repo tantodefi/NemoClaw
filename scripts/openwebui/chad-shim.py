@@ -53,18 +53,33 @@ IDENTITY_DIR = os.environ.get(
 )
 IDENTITY_MAX_BYTES = int(os.environ.get("CHAD_SHIM_IDENTITY_MAX_BYTES", "8000"))
 
-# Operator allowlist — when set (comma-separated emails), ONLY these reach the
-# full Chad agent; every other authenticated user gets a polite refusal. This
-# protects the shared agent/gbrain even if a non-operator selects the `chad`
-# model in the UI (a server-side guarantee independent of OpenWebUI model ACLs).
-# UNSET/empty = allow everyone (backward-compatible; the gate is opt-in).
-# Anonymous callers (no email header — e.g. direct API/health tooling) are
-# always allowed. Keep both operator emails here.
-OPERATOR_ALLOWLIST = {
-    e.strip().lower()
-    for e in os.environ.get("CHAD_OPERATOR_ALLOWLIST", "").split(",")
-    if e.strip()
-}
+# Operator allowlist — when set, ONLY these emails reach the full Chad agent;
+# every other authenticated user gets a polite refusal. This protects the shared
+# agent/gbrain even if a non-operator selects the `chad` model in the UI (a
+# server-side guarantee, independent of OpenWebUI model ACLs — so Chad Lite users
+# can keep seeing every NVIDIA model in the dropdown; only `chad` is gated).
+#
+# Resolution order (so it PERSISTS across shim restarts without launch-script
+# edits, and operator emails stay OUT of the committed repo):
+#   1. CHAD_OPERATOR_ALLOWLIST env (comma-separated), else
+#   2. "CHAD_OPERATOR_ALLOWLIST" in credentials.json (string OR JSON list).
+# UNSET/empty in both = allow everyone (backward-compatible; the gate is opt-in).
+# Anonymous callers (no email header — direct API/health tooling) are always
+# allowed.
+def _load_operator_allowlist() -> set:
+    raw = os.environ.get("CHAD_OPERATOR_ALLOWLIST", "")
+    if not raw:
+        creds_path = os.environ.get("CHAD_CREDENTIALS", "/sandbox/.nemoclaw/credentials.json")
+        try:
+            with open(creds_path) as fh:
+                raw = json.load(fh).get("CHAD_OPERATOR_ALLOWLIST", "") or ""
+        except (OSError, json.JSONDecodeError, ValueError):
+            raw = ""
+    items = raw if isinstance(raw, list) else str(raw).split(",")
+    return {str(e).strip().lower() for e in items if str(e).strip()}
+
+
+OPERATOR_ALLOWLIST = _load_operator_allowlist()
 DENY_MESSAGE = os.environ.get(
     "CHAD_SHIM_DENY_MESSAGE",
     "This assistant isn't available on your account. Please use the **Chad Lite** "

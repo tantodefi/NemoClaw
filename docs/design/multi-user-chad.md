@@ -171,6 +171,33 @@ Operator-manual steps (no API; in the checklist the script prints):
 Result: new users get Nemotron Ultra + web search + their own memory, with **no**
 access to Chad's agent, gbrain, or anyone else's data — and **zero** new pod load.
 
+### Gating the premium `chad` model (2026-06-17)
+
+Goal: Chad Lite users keep the full NVIDIA model dropdown but **cannot use the
+premium `chad` agent** (which fronts the shared agent + gbrain).
+
+Why not OpenWebUI model ACLs: the stack runs `BYPASS_MODEL_ACCESS_CONTROL=True`
+so the NVIDIA base models show to everyone. Flipping it off to hide `chad` would
+*also* hide every NVIDIA base model from regular users — the opposite of what we
+want. `chad` and the NVIDIA models are all connection/base models, so OpenWebUI's
+single global flag can't separate them.
+
+So the gate is **server-side in the shim**, independent of model visibility:
+`chad-shim.py` reads `CHAD_OPERATOR_ALLOWLIST` (env → `credentials.json` fallback;
+comma-string or JSON list). When set, only those emails reach the agent; any
+other authenticated user who selects `chad` gets a polite "use Chad Lite"
+refusal (`DENY_MESSAGE`) and never touches the agent/gbrain. Unset/empty =
+allow-all (opt-in, backward-compatible); anonymous callers (direct API/health)
+allowed. The list lives in `credentials.json` (pod-local, uncommitted, in the
+backup set) so it persists across restarts with no launch-script edits and no
+operator emails in the repo.
+
+Net: `BYPASS_MODEL_ACCESS_CONTROL` **stays `True`** (NVIDIA models visible to
+all); `chad` is visible-but-refused to non-operators. The protection is the
+guarantee; the dropdown name is cosmetic. (Truly hiding only `chad` from the
+dropdown while keeping NVIDIA models would require a custom workspace-model per
+NVIDIA model + `BYPASS=False` — not worth it.)
+
 ## How new accounts work (auth flow)
 
 This deployment runs **trusted-header SSO**, verified on the live container:
