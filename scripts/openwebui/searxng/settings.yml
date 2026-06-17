@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal SearXNG config for OpenWebUI web search (Tier-0 "Chad Lite").
+# Mounted at /etc/searxng/settings.yml. The image entrypoint injects the
+# SEARXNG_SECRET env into secret_key on start.
+#
+# Two settings are load-bearing for OpenWebUI:
+#   - search.formats must include `json` — OpenWebUI calls ?format=json.
+#   - server.limiter must be false — OpenWebUI hits the API server-side; the
+#     bot limiter would 429 those requests.
+
+use_default_settings: true
+
+general:
+  instance_name: "chad-search"
+  # No public instance; donation/contact links off.
+  donation_url: false
+  contact_url: false
+
+server:
+  # The image entrypoint replaces the literal `ultrasecretkey` with the
+  # SEARXNG_SECRET env on start — leave this sentinel exactly as-is.
+  secret_key: "ultrasecretkey"
+  limiter: false
+  image_proxy: true
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+# Keep the engine set lean and reliable for an LLM-RAG use case.
+engines:
+  - name: wikipedia
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false

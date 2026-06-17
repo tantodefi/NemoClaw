@@ -63,10 +63,44 @@ services:
       # Lets chad-shim route per operator (tantodefi vs tjcooke) for identity
       # context, gbrain scoping, and admin-allowlisted actions.
       ENABLE_FORWARD_USER_INFO_HEADERS: "True"
+      # Web search for the Tier-0 "Chad Lite" model (and anyone who toggles it).
+      # Routed to the in-stack SearXNG (private, keyless, no rate limits).
+      # IMPORTANT: these are OpenWebUI PersistentConfig — they seed the DB on the
+      # FIRST boot only. On an existing webui.db they are ignored; set them in
+      # admin → Settings → Web Search instead (engine = searxng, query URL =
+      # http://searxng:8080/search?q=<query>&format=json). See
+      # docs/design/multi-user-chad.md.
+      ENABLE_WEB_SEARCH: "${ENABLE_WEB_SEARCH:-True}"
+      WEB_SEARCH_ENGINE: "${WEB_SEARCH_ENGINE:-searxng}"
+      SEARXNG_QUERY_URL: "${SEARXNG_QUERY_URL:-http://searxng:8080/search?q=<query>&format=json}"
+      WEB_SEARCH_RESULT_COUNT: "${WEB_SEARCH_RESULT_COUNT:-4}"
+    depends_on:
+      - searxng
     networks:
       - openwebui-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # SearXNG — private, keyless metasearch powering OpenWebUI web search (Tier 0).
+  # Reached by open-webui at http://searxng:8080 on the shared network; never
+  # exposed to the host or internet. Small (~150-300 MB). The json format +
+  # limiter:false in searxng/settings.yml are REQUIRED for OpenWebUI's
+  # server-side API calls. See docs/design/multi-user-chad.md.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: nemoclaw-searxng
+    restart: unless-stopped
+    environment:
+      # Injected into settings.yml by the image entrypoint. Generate with:
+      #   openssl rand -hex 32
+      SEARXNG_SECRET: "${SEARXNG_SECRET:?SEARXNG_SECRET is required — generate with: openssl rand -hex 32}"
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    expose:
+      - "8080"
+    networks:
+      - openwebui-net
 
   # Tunnel mode: domain-backed managed tunnel + Cloudflare Access in front.
   cloudflared-tunnel:

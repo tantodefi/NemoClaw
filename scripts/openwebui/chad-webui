@@ -616,19 +616,24 @@ def cmd_knowledge_file_add(args):
 
 
 def cmd_models_create(args):
+    # access_control: None (default) = public (every user sees the model).
+    # Pass --access-control with an OpenWebUI ACL JSON
+    #   {"read":{"group_ids":[...],"user_ids":[...]},"write":{...}}
+    # to scope a model to specific users/groups (e.g. keep the powerful `chad`
+    # model to operators while a Tier-0 model is public). See multi-user design.
     body = {
         "id": args.id,
         "base_model_id": args.base_model_id,
         "name": args.name,
         "params": json.loads(args.params) if args.params else {},
         "meta": json.loads(args.meta) if args.meta else {},
-        "access_control": None,
+        "access_control": json.loads(args.access_control) if args.access_control else None,
     }
     _print(_http("POST", "/models/create", body=body))
 
 
 def cmd_models_update(args):
-    """Patch params/meta/name on a model row. id is required to identify."""
+    """Patch params/meta/name/access on a model row. id is required to identify."""
     body = {"id": args.id}
     if args.name is not None:
         body["name"] = args.name
@@ -636,6 +641,8 @@ def cmd_models_update(args):
         body["params"] = json.loads(args.params)
     if args.meta is not None:
         body["meta"] = json.loads(args.meta)
+    if args.access_control is not None:
+        body["access_control"] = json.loads(args.access_control) if args.access_control else None
     _print(_http("POST", "/models/model/update", body=body, params={"id": args.id}))
 
 
@@ -855,8 +862,8 @@ def build_parser() -> argparse.ArgumentParser:
     # models
     models = sub.add_parser("models", help="Model registry (admin role for write ops)").add_subparsers(dest="cmd", required=True)
     c = models.add_parser("list"); c.set_defaults(func=cmd_models_list)
-    c = models.add_parser("create"); c.add_argument("--id", required=True); c.add_argument("--base-model-id", required=True); c.add_argument("--name", required=True); c.add_argument("--params", help="JSON object"); c.add_argument("--meta", help="JSON object"); c.set_defaults(func=cmd_models_create)
-    c = models.add_parser("update"); c.add_argument("--id", required=True); c.add_argument("--name"); c.add_argument("--params", help="JSON object"); c.add_argument("--meta", help="JSON object"); c.set_defaults(func=cmd_models_update)
+    c = models.add_parser("create"); c.add_argument("--id", required=True); c.add_argument("--base-model-id", required=True); c.add_argument("--name", required=True); c.add_argument("--params", help="JSON object"); c.add_argument("--meta", help="JSON object"); c.add_argument("--access-control", help='ACL JSON {"read":{"group_ids":[],"user_ids":[]},"write":{...}}; omit for public'); c.set_defaults(func=cmd_models_create)
+    c = models.add_parser("update"); c.add_argument("--id", required=True); c.add_argument("--name"); c.add_argument("--params", help="JSON object"); c.add_argument("--meta", help="JSON object"); c.add_argument("--access-control", help='ACL JSON, or empty string to reset to public'); c.set_defaults(func=cmd_models_update)
     c = models.add_parser("toggle"); c.add_argument("--id", required=True, help="Model id to enable/disable"); c.set_defaults(func=cmd_models_toggle)
 
     # knowledge
