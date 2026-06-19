@@ -238,7 +238,7 @@ async function loadWorkflows(){
 }
 // Launch opens a settings drawer (input + reasoning/timeout/max-tokens/backend/
 // dry-run/fusion-panel/raw-env). Re-run on a finished run reuses the same drawer.
-let _mlim=null, _lxWarned=false;
+let _mlim=null, _lxWarned=false, _fmodels=null; const _fsel=new Set();
 function launch(name){ openLaunch(name); }
 function closeLaunch(){ const m=document.getElementById("launchModal"); m.style.display="none"; m.innerHTML=""; }
 function openLaunch(name, pre={}){
@@ -258,10 +258,15 @@ function openLaunch(name, pre={}){
       <label class="fld">Max output tokens · cheap<input id="lx-maxcheap" type="number" min="1" placeholder="2048"></label>
       <label class="fld">Backend · capable<select id="lx-bcap"><option value="">auto</option><option>claudecode</option><option>codex</option><option>nemotron</option><option>opencode</option><option>local</option></select></label>
       <label class="fld">Backend · cheap<select id="lx-bcheap"><option value="">auto</option><option>nemotron</option><option>claudecode</option><option>local</option></select></label>
-      ${isFusion?`<label class="fld">Fusion models (csv)<input id="lx-fmodels" placeholder="nvidia/…, openai/…"></label>
-      <label class="fld">Fusion panel max<input id="lx-fmax" type="number" min="1" placeholder="6"></label>`:''}
     </div>
     <div class="muted" id="lx-maxhint" style="font-size:11px;margin-top:6px">checking model limits…</div>
+    ${isFusion?`<div id="lx-fusion" style="margin-top:12px">
+      <h3 style="margin:0 0 4px">fusion panel <span class="muted" style="text-transform:none">— pick live models (featured pre-selected)</span></h3>
+      <div class="row"><input id="lx-mfilter" class="search" placeholder="filter models…" oninput="lxRenderModels()" style="flex:1">
+        <label class="fld" style="width:130px">panel max<input id="lx-fmax" type="number" min="1" placeholder="6"></label></div>
+      <div id="lx-modellist" style="max-height:190px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px 10px;margin-top:6px">loading models…</div>
+      <div class="muted" id="lx-mcount" style="font-size:11px;margin-top:4px"></div>
+    </div>`:''}
     <details style="margin-top:10px"><summary class="muted">Advanced env (CHAD_* only; allowlisted server-side)</summary>
       <div id="lx-env" style="margin-top:6px"></div><button onclick="addEnvRow()" style="margin-top:4px">+ add key/value</button></details>
     <div class="row" style="margin-top:12px"><span class="muted" id="lx-status" style="flex:1"></span><button onclick="closeLaunch()">Cancel</button><button class="primary" onclick="submitLaunch('${esc(name)}')">Launch ▶</button></div>
@@ -269,7 +274,30 @@ function openLaunch(name, pre={}){
   m.style.display="flex";
   m.onclick=()=>closeLaunch(); // click backdrop closes (modal stops propagation)
   _lxWarned=false; lxLimits(name);
+  if(/fusion/.test(name)) lxModels();
 }
+// Fusion model picker — live roster (catalog ∩ liveness probe) from /api/models.
+function lxMCount(){ const mc=document.getElementById("lx-mcount"); if(mc&&_fmodels) mc.textContent=`${_fsel.size} selected · ${_fmodels.total} live · swept ${_fmodels.lastSweep?new Date(_fmodels.lastSweep*1000).toLocaleString():"?"}`; }
+async function lxModels(){
+  const box=document.getElementById("lx-modellist"); if(!box)return;
+  try{ _fmodels=_fmodels||await api("/api/models");
+    _fsel.clear(); (_fmodels.featured||[]).forEach(id=>_fsel.add(id)); // default = featured
+    lxRenderModels(); lxMCount();
+  }catch(e){ box.innerHTML="<div class=muted>could not load models: "+esc(e.message)+"</div>"; }
+}
+function lxRenderModels(){
+  const box=document.getElementById("lx-modellist"); if(!box||!_fmodels)return;
+  const f=(document.getElementById("lx-mfilter")?.value||"").toLowerCase();
+  const rows=_fmodels.models.filter(m=>!f||m.id.toLowerCase().includes(f));
+  box.innerHTML=rows.map(m=>`<label style="display:flex;align-items:center;gap:8px;padding:2px 0;cursor:pointer">
+    <input type="checkbox" ${_fsel.has(m.id)?"checked":""} onchange="lxToggle('${esc(m.id)}',this.checked)">
+    <span class="mono" style="font-size:12px">${esc(m.id)}</span>
+    ${m.featured?'<span class="pill" style="background:rgba(88,166,255,.15);color:var(--blue);font-size:10px">featured</span>':''}
+    ${m.new?'<span class="pill" style="background:rgba(63,185,80,.15);color:var(--green);font-size:10px">new</span>':''}
+    ${m.latencyMs?`<span class="muted" style="font-size:10px;margin-left:auto">${Math.round(m.latencyMs)}ms</span>`:''}
+  </label>`).join("")||'<div class=muted>no matches</div>';
+}
+function lxToggle(id,on){ if(on)_fsel.add(id); else _fsel.delete(id); lxMCount(); }
 async function lxLimits(name){
   const hint=document.getElementById("lx-maxhint"); if(!hint)return;
   try{ _mlim=_mlim||await api("/api/model-limits");
@@ -293,7 +321,7 @@ async function submitLaunch(name){
   setNum("lx-tcap","CHAD_TASK_TIMEOUT_MS",1000); setNum("lx-tcheap","CHAD_TASK_TIMEOUT_MS_CHEAP",1000);
   setNum("lx-maxcap","CHAD_MAX_OUTPUT_TOKENS"); setNum("lx-maxcheap","CHAD_MAX_OUTPUT_TOKENS_CHEAP");
   setSel("lx-bcap","CHAD_CAPABLE_BACKEND"); setSel("lx-bcheap","CHAD_CHEAP_BACKEND");
-  if(val("lx-fmodels")) env.CHAD_FUSION_MODELS=val("lx-fmodels");
+  if(_fsel.size) env.CHAD_FUSION_MODELS=[..._fsel].join(",");
   setNum("lx-fmax","CHAD_FUSION_MAX");
   document.querySelectorAll("#lx-env .row").forEach(r=>{ const ins=r.querySelectorAll("input"); const k=ins[0].value.trim(); if(k) env[k]=ins[1].value; });
   let input; const raw=val("lx-input");
@@ -355,13 +383,32 @@ async function loadApprovals(){
 }
 async function decide(runId,node,iteration,verb){ try{ await post(`/api/runs/${encodeURIComponent(runId)}/${verb}`,{node,iteration}); loadApprovals(); loadApprovalsBadge(); }catch(e){ alert(verb+" failed: "+e.message); } }
 
+const spark=(scores)=>{ const b="▁▂▃▄▅▆▇█"; return (scores||[]).map(s=>b[Math.min(7,Math.max(0,Math.round((Number(s)||0)*7)))]).join("")||"—"; };
 async function loadExperiments(){
   const el=document.getElementById("experiments");
-  try{ const {population,report}=await api("/api/experiments");
+  try{
+    const [exp,rr]=await Promise.all([api("/api/experiments"),api("/api/runs").catch(()=>({runs:[]}))]);
+    const {population,report}=exp;
+    const nights=(rr.runs||[]).filter(r=>r.workflow_name==="chad-experiments");
     const cands=(population.candidates||[]).slice().sort((a,b)=>(b.rollingMean||0)-(a.rollingMean||0));
-    el.innerHTML=`<h2>Evolutionary leaderboard</h2><table><thead><tr><th></th><th>candidate</th><th>kind</th><th>rolling</th><th>trials</th><th>status</th></tr></thead><tbody>${
-      cands.map(c=>`<tr><td>${c.status==='champion'?'🏆':c.status==='retired'?'🪦':''}</td><td class="mono">${esc(c.id)}</td><td>${esc(c.kind)}</td><td>${(c.rollingMean||0).toFixed(3)}</td><td>${c.trials||0}</td><td>${esc(c.status)}</td></tr>`).join("")||'<tr><td colspan=6 class=muted>none</td></tr>'
-    }</tbody></table><h3>last report</h3><div class="md">${md(report)||'<span class=muted>(none)</span>'}</div>`;
+    const by={champion:0,active:0,retired:0}; cands.forEach(c=>{ by[c.status]=(by[c.status]||0)+1; });
+    el.innerHTML=`<div class="row"><h2 style="flex:1">Experiments — evolutionary arena</h2>
+        <span class="meta">🏆 ${by.champion} champions · ${by.active} active · 🪦 ${by.retired} retired</span></div>
+      <h3>nightly runs (${nights.length})</h3>
+      ${nights.length?`<table><thead><tr><th>night</th><th>status</th><th>dur</th><th>run</th></tr></thead><tbody>${
+        nights.map(r=>`<tr class="run" style="cursor:pointer" onclick="switchTab('runs');selectRun('${esc(r.run_id)}')">
+          <td>${fmtTime(r.started_at_ms||r.created_at_ms)}</td><td>${pill(r.status)}</td>
+          <td class="muted">${isLive(r)?'…':fmtDur(r.started_at_ms,r.finished_at_ms)}</td>
+          <td class="muted mono" style="font-size:11px">${esc((r.run_id||'').slice(0,8))} ↗</td></tr>`).join("")
+      }</tbody></table>`:'<div class="muted">no nightly runs recorded yet.</div>'}
+      <h3>leaderboard — score trend</h3>
+      <table><thead><tr><th></th><th>candidate</th><th>kind</th><th>trend</th><th>rolling</th><th>trials</th><th>status</th></tr></thead><tbody>${
+        cands.map(c=>`<tr><td>${c.status==='champion'?'🏆':c.status==='retired'?'🪦':''}</td>
+          <td class="mono" style="font-size:12px" title="${esc(c.id)}">${esc(c.spec?.label||c.id)}</td><td>${esc(c.kind)}</td>
+          <td class="mono" style="color:var(--blue);letter-spacing:1px" title="scores: ${esc((c.scores||[]).map(s=>(+s).toFixed(2)).join(' '))}">${spark(c.scores)}</td>
+          <td>${(c.rollingMean||0).toFixed(3)}</td><td>${c.trials||0}</td><td>${esc(c.status)}</td></tr>`).join("")||'<tr><td colspan=7 class=muted>none</td></tr>'
+      }</tbody></table>
+      <details style="margin-top:12px"><summary class="muted">latest report</summary><div class="md">${md(report)||'<span class=muted>(none)</span>'}</div></details>`;
   }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
 }
 

@@ -51,6 +51,9 @@ function execLogDir(runId) {
   return null;
 }
 const HOST_CREDS = process.env.CHAD_HOST_CREDS || "/Users/r/.nemoclaw/credentials.json";
+// Per-model liveness probe written by nvidia-liveness.py (1-token probe per model,
+// daily). Used to show only currently-live models in the launch drawer.
+const LIVENESS_FILE = process.env.CHAD_LIVENESS_FILE || join(dirname(HOST_CREDS), "openwebui/liveness.json");
 // Machine auth for Chad: SMITHERS_API_KEY env, else SMITHERS_RUNS_API_KEY from
 // host credentials.json. Gates writes (alongside Cloudflare Access email). Empty
 // = writes require the Cf-Access email only (browser).
@@ -217,6 +220,25 @@ function experiments() {
   const pop = existsSync(POP_PATH) ? JSON.parse(readFileSync(POP_PATH, "utf8")) : { candidates: [] };
   const report = existsSync(REPORT_PATH) ? readFileSync(REPORT_PATH, "utf8") : "";
   return { population: pop, report };
+}
+
+// Live model roster for the launch drawer: the daily catalog (state/models.json)
+// annotated with the per-model liveness probe (openwebui/liveness.json). Dead
+// models (status:dead or >= dead_after_fails) are dropped; unknown/new stay
+// visible (the liveness script's lenient policy). Featured first.
+function liveModels() {
+  let cat = { featured: [], chat: [], new: [], generatedAt: null };
+  try { cat = { ...cat, ...JSON.parse(readFileSync(join(HERE, "state/models.json"), "utf8")) }; } catch { /* */ }
+  let live = {}, lastSweep = null;
+  try { const lj = JSON.parse(readFileSync(LIVENESS_FILE, "utf8")); live = lj.models || {}; lastSweep = lj.last_sweep || null; } catch { /* */ }
+  const isDead = (id) => { const e = live[id]; return !!e && (e.status === "dead" || (e.consecutive_failures || 0) >= 3); };
+  const featured = new Set(cat.featured || []);
+  const fresh = new Set(cat.new || []);
+  const models = (cat.chat || [])
+    .filter((id) => !isDead(id))
+    .map((id) => ({ id, featured: featured.has(id), new: fresh.has(id), latencyMs: live[id]?.latency_ms ?? null, probed: id in live }))
+    .sort((a, b) => (Number(b.featured) - Number(a.featured)) || a.id.localeCompare(b.id));
+  return { models, featured: cat.featured || [], generatedAt: cat.generatedAt || null, lastSweep, total: models.length };
 }
 
 // ── IDE actions (launch / cancel / approve) ──────────────────────────────────
@@ -418,6 +440,8 @@ app.get("/api/runs/:runId/trace/:node", (c) => {
 
 // Read: per-model limits (registry) for the launch drawer's ceiling hints.
 app.get("/api/model-limits", (c) => c.json(listLimits()));
+// Read: live model roster (catalog ∩ liveness) for the drawer's model picker.
+app.get("/api/models", (c) => c.json(liveModels()));
 // Read: preflight a prospective launch's settings (advisory; no side effects).
 app.post("/api/preflight", async (c) => {
   const body = await c.req.json().catch(() => ({}));

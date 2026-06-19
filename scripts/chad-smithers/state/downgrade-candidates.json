@@ -1,0 +1,14 @@
+[
+  {
+    "task": "drafter",
+    "fixture": "Draft a concise, warm reply telling a client their squat depth looks good but to brace harder before the descent.",
+    "current": "nvidia/nemotron-3-ultra-550b-a55b",
+    "cheaper": "nvidia/nemotron-3-super-120b-a12b"
+  },
+  {
+    "task": "log-cluster",
+    "fixture": "Cluster these service-log lines into distinct issues, one next-step action each:\ngateway: ECONNREFUSED 127.0.0.1:8901 (x12)\nshim: 200 OK /v1/models\ntunnel: client closed 1000 (x3)\ngbrain: get-health 0% coverage",
+    "current": "nvidia/nemotron-3-ultra-550b-a55b",
+    "cheaper": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+  }
+]
