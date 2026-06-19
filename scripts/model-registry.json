@@ -2,6 +2,7 @@
   "$schema": "./model-registry.schema.json",
   "_comment": "Single source of truth for per-model limits. Consumed by generate-openclaw-config.py, Dockerfile defaults, and (future) routing layer. Update here, regenerate downstream artifacts.",
   "_last_verified": "2026-04-30",
+  "_roster_comment": "Fusion-roster models flagged _estimated:true (added 2026-06-19) carry CONSERVATIVE context/output estimates: NVIDIA's /v1/models API exposes no limits (only id/object/created/owned_by), so preflight/clamp treat them as a SAFE-LOW ceiling that can't over-request. Verify against each model card and clear _estimated when confirmed.",
   "models": {
     "moonshotai/kimi-k2.5": {
       "displayName": "Kimi K2.5 (DEPRECATED 2026-04-29)",
@@ -84,11 +85,51 @@
       "modality": ["text", "vision"],
       "requiresAuthContext": true,
       "_note": "Used by chad-premium-client --probe for cheap connectivity check."
+    },
+
+    "openai/gpt-oss-120b": {
+      "displayName": "GPT-OSS 120B", "contextWindow": 131072, "maxOutputTokens": 32768,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "deepseek-ai/deepseek-v4-pro": {
+      "displayName": "DeepSeek V4 Pro", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "deepseek-ai/deepseek-v4-flash": {
+      "displayName": "DeepSeek V4 Flash", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "balanced", "modality": ["text"], "_estimated": true
+    },
+    "meta/llama-4-maverick-17b-128e-instruct": {
+      "displayName": "Llama 4 Maverick 17B-128E", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": false, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true,
+      "_note": "Llama 4 supports a very large context upstream (≫131072); conservative serve-side estimate used until verified."
+    },
+    "moonshotai/kimi-k2.6": {
+      "displayName": "Kimi K2.6", "contextWindow": 262144, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true,
+      "_note": "Successor to the deprecated K2.5. Assumed reasoningSafe under Smithers' own tool loop (NOT the openclaw harness that K2.5 broke); verify before any openclaw-side use."
+    },
+    "qwen/qwen3.5-397b-a17b": {
+      "displayName": "Qwen 3.5 397B-A17B", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "z-ai/glm-5.1": {
+      "displayName": "GLM 5.1", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "minimaxai/minimax-m3": {
+      "displayName": "MiniMax M3", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+      "displayName": "Nemotron 3 Nano Omni 30B-A3B (reasoning)", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "balanced", "modality": ["text"], "_estimated": true
     }
   },
   "defaults": {
     "primary": "nvidia/nemotron-3-super-120b-a12b",
     "fallback": "google/gemma-3-4b",
-    "outsource": "claude-opus-4-7"
+    "outsource": "claude-opus-4-7",
+    "unknownModel": { "contextWindow": 131072, "maxOutputTokens": 8192, "_note": "Conservative fallback for any model not explicitly listed — preflight/clamp use this so an unknown id is still bounded." }
   }
 }

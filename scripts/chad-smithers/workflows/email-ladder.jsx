@@ -18,7 +18,7 @@
 
 import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
-import { pickAgent } from "../agents.js";
+import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_EMAIL_DB || "./email-ladder.db";
 const SEND = process.env.CHAD_EMAIL_SEND === "1";
@@ -51,18 +51,18 @@ export const workflow = smithers((ctx) => {
   return (
     <Workflow name="chad-email-ladder">
       <Sequence>
-        <Task id="triage" output={outputs.triage} agent={pickAgent("classify")} retries={1}>
+        <Task id="triage" output={outputs.triage} agent={pickAgent("classify")} fallbackAgent={pickFallback("classify")} {...taskOpts("classify")}>
           {`Triage this inbound message. Return JSON {operator, category, urgency, summary}.\n\n${JSON.stringify(inbound).slice(0, 4000)}`}
         </Task>
 
         {/* Only draft for actual replies. */}
         <Branch if={triage?.category === "reply"}>
-          <Task id="draft" output={outputs.draft} agent={pickAgent("draft")} retries={1}>
+          <Task id="draft" output={outputs.draft} agent={pickAgent("draft")} fallbackAgent={pickFallback("draft")} {...taskOpts("draft")}>
             {`Draft a reply in the operator's voice. Return JSON {subject, body, confidence}.\n\nContext: ${triage?.summary ?? ""}\nOriginal: ${JSON.stringify(inbound).slice(0, 4000)}`}
           </Task>
 
           {/* Trust & safety gate on outbound (the layer the ladder lacked). */}
-          <Task id="moderation" output={outputs.moderation} agent={pickAgent("judge")} retries={1}>
+          <Task id="moderation" output={outputs.moderation} agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
             {`Screen this draft for anything that should NOT be auto-sent (PII leak, commitments, tone, hallucinated facts). Return JSON {safe, issues}.\n\n${draft?.body ?? ""}`}
           </Task>
 

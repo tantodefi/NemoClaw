@@ -191,6 +191,43 @@ pod (`CHAD_SPAWN_SSH` + a clean shadow week per the sunset rule), and wiring the
 real publish/apply/note sinks (`chad-webui`, `chad-proposal-apply`) once each
 shadow run proves out.
 
+## Fusion audit + resilience hardening (2026-06-18)
+
+Audited our `workflows/fusion.jsx` against upstream **`github.com/smithersai/smithers-fusions`** and the core `smithersai/smithers` `examples/`, then hardened the workspace. Findings drove a batch of changes (this entry is the rationale; the code is under `scripts/chad-smithers/`).
+
+### Ours vs upstream — same engine, two authoring modes
+
+| | Ours (`workflows/fusion.jsx`) | Upstream (`smithers-fusions`) |
+|---|---|---|
+| Package | `smithers-orchestrator` v0.23.0 (the public **JSX facade**) | `smithers` engine + `incur` (CLI/MCP) |
+| Authoring | declarative **JSX** (`<Workflow><Parallel><Task>`) | imperative **TS** (`runFusion()`, `engine.start/.advance`, `h(Task,…)` hyperscript) |
+| Fuse stages | **2** (panel → one combined fuse task) | **3** (panel → structured judge → synthesizer) |
+| Resilience | `retries={1}` only | `continueOnFail`, retries=2, 600s timeout, `schemaFailFastAgent` coercion |
+| Driver | `smithers up` + `serve-runs.js` dashboard | per-step CLI w/ approval gates (plan→implement→review→fix, ≤16 rounds) |
+
+**Why ours is `.jsx`, theirs `.ts`:** the difference is authoring style on the *same* durable engine, not capability. Ours is a zero-build host-side bun script set — JSX gives a graph `smithers graph` can validate without running and the dashboard renders as a task tree; plain JSX + JSDoc avoids a tsconfig/compile step, and our flows are graph-shaped (fan-out→fuse; seed→eval→select→report). Theirs is a *published library + CLI for others* (compile-time types matter) whose headline flow is a *dynamic agent-driven loop* ("one command per step," human edits between phases) — awkward as a static JSX graph, natural as imperative `engine.advance()` calls.
+
+### The "too-short responses" question — answered
+
+The run responses on `runs.supachad.com` are **real model output, not placeholders**, but look short/empty for four structural reasons:
+1. **Schema-capped.** Agent tasks return tiny structured JSON (`rationale` = "one sentence"); that *is* the whole answer by design.
+2. **Compute nodes have NULL `response_text`.** `select`/`report` are thunks returning JS objects, not agent text → blank dashboard rows.
+3. **Trace drops the reasoning.** The `ToolLoopAgent` (Nemotron) family is unrecognized → `captureMode:cli-text`, `traceCompleteness:final-only`, with `assistant.thinking.delta`/`assistant.text.delta` in `unsupportedEventKinds`. One eval generated **496 output tokens** but only ~60 (the final JSON) are captured/shown.
+4. **5 of 6 workflow DBs are empty.** Only `experiments.db` had real runs; `fusion`/`email-ladder`/`fail-only`/`mcp-health`/`self-improve` had **zero** — those workflows were scaffolds never given a real `smithers up`, so their dashboard rows genuinely *were* empty.
+
+### Decision: harden hand-rolled, don't migrate to the built-in `<Panel>`
+
+v0.23.0 ships composite components (`Panel`, `GatherAndSynthesize`, `ReviewLoop`, `ContentPipeline`, `ClassifyAndRoute`, `Saga`, `TryCatchFinally`) and every `TaskProps` exposes `continueOnFail`, `timeoutMs`, `heartbeatTimeoutMs`, `fallbackAgent`. **But `<Panel>` is a thin 2-stage composition** (`Sequence > Parallel[panelist Tasks] > moderator Task`) that sets *no* `continueOnFail`/`timeout`/`retries` and whose "consensus" strategy is just an appended prompt sentence — migrating to it would *lose* resilience and the 3-stage judge. So we keep our tested hand-rolled workflows and add the verified resilience props directly. Our upgraded `fusion.jsx` (3-stage + `continueOnFail` + `fallbackAgent` + timeouts) is strictly better than `<Panel>` and matches upstream's structured judge.
+
+### Changes shipped this pass
+
+- **`agents.js`** — `timeoutMs` + `heartbeatTimeoutMs` defaults on the nemotron/local backends (were unset; a hung NVIDIA call had no task deadline). Env: `CHAD_TASK_TIMEOUT_MS`, `CHAD_TASK_HEARTBEAT_MS`.
+- **`lib/coerce.js`** (+ test) — extract JSON from prose/code-fences and validate against a zod schema; returns `null` on permanently-bad output so callers drop the row instead of burning retries (the `schemaFailFastAgent` idea).
+- **`fusion.jsx`** — 3-stage (panel → structured **judge** {consensus, contradictions, uniqueInsights, blindSpots, confidence} → **synthesize**); `continueOnFail` + `fallbackAgent` + `timeoutMs` on every panelist; reads the experiments leaderboard so the **arena selects the default panel**.
+- **`experiments.jsx`** + the 8 other workflows — `continueOnFail`/`timeoutMs`/`fallbackAgent` on agent tasks; eval output run through `coerce.js`.
+- **`serve-runs.js` + `public/index.html`** — per-run/-node **token usage**, a **"reasoning hidden (final-only capture)"** indicator so short outputs read as intentional, **compute-node JSON outputs** rendered (not blank), and a **workflow catalog** that lists zero-run/scaffold workflows with a Launch button.
+- **Smoke passes** — real `smithers up` for the previously-empty scaffolds so their DBs carry data and the dashboard changes verify against reality.
+
 ## Next steps & hanging TODOs
 
 ### Needs operator intervention (I can't do these from here)

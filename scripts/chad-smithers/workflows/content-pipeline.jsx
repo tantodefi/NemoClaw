@@ -24,6 +24,8 @@ import { runSpawn, spawnResultSchema } from "../lib/spawn.js";
 
 const DB = process.env.CHAD_CONTENT_DB || "./content-pipeline.db";
 const PUBLISH = process.env.CHAD_CONTENT_PUBLISH === "1"; // shadow unless set
+// Cap a wedged spawn (runSpawn has no internal ssh timeout); don't auto-retry.
+const SPAWN_TIMEOUT = Number(process.env.CHAD_SPAWN_TIMEOUT_MS || 1_800_000); // 30 min
 
 const schemas = {
   research: spawnResultSchema,
@@ -52,18 +54,18 @@ export const workflow = smithers((ctx) => {
   return (
     <Workflow name="chad-content-pipeline">
       <Sequence>
-        <Task id="research" output={outputs.research} sideEffect idempotencyKey={`content-research-${topic.slice(0, 40)}`}>
+        <Task id="research" output={outputs.research} sideEffect retries={0} timeoutMs={SPAWN_TIMEOUT} idempotencyKey={`content-research-${topic.slice(0, 40)}`}>
           {() => runSpawn({ kind: "researcher", substrate: "local", id: "content-research",
             task: `Research for this content task (brain-first; gh/web if needed). Produce notes + sources.\n\n${topic}` })}
         </Task>
 
-        <Task id="draft" output={outputs.draft} sideEffect idempotencyKey={`content-draft-${topic.slice(0, 40)}`}>
+        <Task id="draft" output={outputs.draft} sideEffect retries={0} timeoutMs={SPAWN_TIMEOUT} idempotencyKey={`content-draft-${topic.slice(0, 40)}`}>
           {() => runSpawn({ kind: "writer", substrate: "local", id: "content-draft",
             task: `Write the content using these research notes. Never publish — draft to the workdir.\n\n` +
               `Topic: ${topic}\n\nResearch summary: ${research?.summary || "(none)"}` })}
         </Task>
 
-        <Task id="review" output={outputs.review} sideEffect idempotencyKey={`content-review-${topic.slice(0, 40)}`}>
+        <Task id="review" output={outputs.review} sideEffect retries={0} timeoutMs={SPAWN_TIMEOUT} idempotencyKey={`content-review-${topic.slice(0, 40)}`}>
           {() => runSpawn({ kind: "reviewer", substrate: "local", id: "content-review",
             task: `Review this draft for accuracy, tone, and anything that should NOT ship. ` +
               `End your summary with "ship" if it's good to publish, or list blockers.\n\n` +

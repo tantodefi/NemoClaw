@@ -21,7 +21,7 @@ import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
-import { pickAgent } from "../agents.js";
+import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 import { postNote } from "../lib/note.js";
 
 const DB = process.env.CHAD_LOGDIGEST_DB || "./log-digest.db";
@@ -68,7 +68,7 @@ export const workflow = smithers((ctx) => {
 
         {/* 2) Cluster + summarize — one frugal cheap-tier call. Only if there's signal. */}
         <Branch if={hasSignal}>
-          <Task id="cluster" output={outputs.digest} agent={pickAgent("summarize")} retries={1}>
+          <Task id="cluster" output={outputs.digest} agent={pickAgent("summarize")} fallbackAgent={pickFallback("summarize")} {...taskOpts("summarize")}>
             {[
               "Cluster these host service-log error lines into distinct issues. Collapse repeats into one signature with a count.",
               `Log lines (${collected?.errorLines ?? 0} from ${collected?.files ?? 0} files):\n${collected?.sample || ""}`,

@@ -56,6 +56,7 @@
 
 import { existsSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { clampOutput } from "./lib/model-limits.js";
 
 // ── Optional imports (don't hard-fail if a package/CLI isn't present) ────────
 let ToolLoopAgent, createOpenAICompatible, createAnthropic, ClaudeCodeAgent, CodexAgent, OpenCodeAgent;
@@ -65,6 +66,21 @@ try { ({ createAnthropic } = await import("@ai-sdk/anthropic")); } catch { /* */
 try { ({ ClaudeCodeAgent, CodexAgent, OpenCodeAgent } = await import("@smithers-orchestrator/agents")); } catch { /* */ }
 
 const env = process.env;
+
+// ── Task resilience defaults (timeouts / heartbeat) ──────────────────────────
+// A hung NVIDIA call previously had no task deadline. Task-level `timeoutMs`
+// (see taskOpts) is the authoritative cap — Smithers aborts the task; the
+// agent-level `timeout` set on each ToolLoopAgent below also aborts the AI-SDK
+// call so the HTTP connection is released instead of orphaned. Cheap single-turn
+// work gets a short deadline; capable tool-loop work gets the 10-min cap that
+// matches upstream smithers-fusions. Override via env.
+const CHEAP_TIMEOUT_MS = Number(env.CHAD_TASK_TIMEOUT_MS_CHEAP || env.CHAD_TASK_TIMEOUT_MS || 120_000);
+const CAPABLE_TIMEOUT_MS = Number(env.CHAD_TASK_TIMEOUT_MS || 600_000);
+// Heartbeat timeout is opt-in (0 = unset): the cli-text capture path emits no
+// streaming deltas, so an aggressive heartbeat could false-kill a long, healthy
+// reasoning generation. Set CHAD_TASK_HEARTBEAT_MS only if you know the agent
+// reports liveness.
+const HEARTBEAT_MS = env.CHAD_TASK_HEARTBEAT_MS ? Number(env.CHAD_TASK_HEARTBEAT_MS) : 0;
 
 // ── Capability probe (cached) ────────────────────────────────────────────────
 function binOnPath(bin) {
@@ -100,6 +116,15 @@ function openaiCompatModel(baseURL, modelId, apiKey, name) {
   return provider(modelId);
 }
 
+// Response-length cap, env-overridable per tier (CHAD_MAX_OUTPUT_TOKENS[_CHEAP]).
+// Defaults preserve each backend's prior hardcoded ceiling, so an unset env is a
+// no-op; set it (e.g. from the runs IDE launch drawer) to lengthen/shorten output.
+function maxOut(cheap, capDefault, cheapDefault) {
+  return cheap
+    ? Number(env.CHAD_MAX_OUTPUT_TOKENS_CHEAP || cheapDefault)
+    : Number(env.CHAD_MAX_OUTPUT_TOKENS || capDefault);
+}
+
 // ── Backend constructors ─────────────────────────────────────────────────────
 // Each returns a Smithers-compatible agent instance. `cheap` controls token
 // ceilings so single-turn work stays frugal.
@@ -128,8 +153,12 @@ const backends = {
       model,
       // "detailed thinking on" = Nemotron reasoning; prepended to any task system.
       ...(reasoning ? { instructions: "detailed thinking on", allowSystemInMessages: true } : {}),
-      maxOutputTokens: opts.cheap ? 2048 : 16384, // generous for max-logic reasoning
+      // Frugal tier budget (env-overridable), CLAMPED to the model's registry
+      // ceiling so a launch/override can never request more than the model supports.
+      maxOutputTokens: clampOutput(modelId, maxOut(opts.cheap, 16384, 2048)),
       maxSteps: opts.cheap ? (reasoning ? 2 : 1) : (opts.maxSteps ?? 12),
+      // Abort the AI-SDK call if the hosted model hangs (connection released).
+      timeout: { totalMs: opts.cheap ? CHEAP_TIMEOUT_MS : CAPABLE_TIMEOUT_MS },
       ...opts.agent,
     });
   },
@@ -143,8 +172,9 @@ const backends = {
     const provider = createAnthropic({ apiKey: env.ANTHROPIC_API_KEY });
     return new ToolLoopAgent({
       model: provider(env.CHAD_ANTHROPIC_MODEL || "claude-sonnet-4-6"),
-      maxOutputTokens: opts.cheap ? 1024 : 8192,
+      maxOutputTokens: clampOutput(env.CHAD_ANTHROPIC_MODEL || "claude-sonnet-4-6", maxOut(opts.cheap, 8192, 1024)),
       maxSteps: opts.cheap ? 1 : (opts.maxSteps ?? 8),
+      timeout: { totalMs: opts.cheap ? CHEAP_TIMEOUT_MS : CAPABLE_TIMEOUT_MS },
       ...opts.agent,
     });
   },
@@ -160,8 +190,9 @@ const backends = {
     );
     return new ToolLoopAgent({
       model,
-      maxOutputTokens: opts.cheap ? 1024 : 4096,
+      maxOutputTokens: clampOutput(env.CHAD_LOCAL_MODEL || "google/gemma-3-4b", maxOut(opts.cheap, 4096, 1024)),
       maxSteps: 1, // gemma-4b can't drive tool loops
+      timeout: { totalMs: CAPABLE_TIMEOUT_MS }, // local can be slow; generous cap
       ...opts.agent,
     });
   },
@@ -257,6 +288,56 @@ export function pickAgent(role, opts = {}) {
   const ctor = backends[backend];
   if (!ctor) throw new Error(`agents.js: unknown backend "${backend}"`);
   return ctor({ cheap: tier === "cheap", ...opts });
+}
+
+// ── Backend availability (for safe fallback selection) ───────────────────────
+// Mirrors the autoCapable/autoCheap probes so pickFallback never constructs a
+// backend that would throw (missing key/CLI).
+function backendAvailable(b) {
+  const p = probe();
+  switch (b) {
+    case "nemotron": return p.sdk && p.nvidiaKey;
+    case "claudecode": return p.claudeCli;
+    case "codex": return p.codexCli;
+    case "opencode": return p.opencodeCli;
+    case "anthropic": return p.anthropicKey && !p.anthropicApi402;
+    case "local": return true; // offline last resort; assumed reachable
+    default: return false;
+  }
+}
+
+/**
+ * pickFallback(role, opts) — a constructed agent on a DIFFERENT available backend
+ * than the primary, for a Task `fallbackAgent` (tried on retry). Returns
+ * undefined when no distinct backend is available (caller just omits it).
+ * Use on REQUIRED single tasks (judge/synthesize/report) — NOT on fan-out
+ * panelists, where you want that specific model or nothing (use continueOnFail).
+ */
+export function pickFallback(role, opts = {}) {
+  const tier = opts.tier || ROLE_TIER[role] || "cheap";
+  const primary = opts.backend || (tier === "capable" ? autoCapable() : autoCheap());
+  const order = tier === "capable"
+    ? ["claudecode", "nemotron", "codex", "opencode", "local"]
+    : ["nemotron", "claudecode", "local"];
+  const fb = order.find((b) => b !== primary && backendAvailable(b));
+  return fb ? backends[fb]({ cheap: tier === "cheap", ...opts, backend: fb }) : undefined;
+}
+
+/**
+ * taskOpts(role, opts) — resilience props to spread on a <Task>:
+ *   { timeoutMs, retries, [heartbeatTimeoutMs], [continueOnFail] }
+ * Tier-aware timeout (cheap 2min / capable 10min, env-overridable). Pass
+ * { continueOnFail: true } for fan-out members so one dead task can't sink the
+ * Parallel; pass { retries } to override the default of 1, { timeoutMs } to pin.
+ */
+export function taskOpts(role, opts = {}) {
+  const tier = opts.tier || ROLE_TIER[role] || "cheap";
+  const timeoutMs = opts.timeoutMs ?? (tier === "capable" ? CAPABLE_TIMEOUT_MS : CHEAP_TIMEOUT_MS);
+  const out = { timeoutMs, retries: opts.retries ?? 1 };
+  const hb = opts.heartbeatTimeoutMs ?? (HEARTBEAT_MS || undefined);
+  if (hb) out.heartbeatTimeoutMs = hb;
+  if (opts.continueOnFail) out.continueOnFail = true;
+  return out;
 }
 
 export { backends };

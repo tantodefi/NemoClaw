@@ -13,11 +13,15 @@ resume guarantees to hold.
 
 | File | Role |
 |---|---|
-| `agents.js` | Model router. The only place a backend is chosen. `pickAgent(role)` auto-detects what's available and routes by tier. |
+| `agents.js` | Model router + resilience helpers. `pickAgent(role)` auto-detects a backend by tier; `pickFallback(role)` gives a different-backend fallback; `taskOpts(role,{continueOnFail})` returns tier-aware `{timeoutMs,retries}` to spread on a `<Task>`. |
 | `lib/population.js` | Evolutionary selection engine (pure, unit-tested): start wide → score → rank → retire losers. |
 | `lib/population.test.js` | `node --test lib/population.test.js` — 6 tests, all green. |
 | `lib/spawn.js` | The chad-spawn ⇄ Smithers bridge: `runSpawn()` (offload a step to chad-spawn, reconcile its `result.json`), `route()` (chad-route ported), `scoreIssue()`. Never throws. |
 | `lib/spawn.test.js` | `bun test lib/spawn.test.js` — 8 tests, all green. |
+| `lib/coerce.js` | Tolerant JSON extraction: `coerceJson(text,schema)` strips fences/prose, validates a zod schema, returns null on bad output (the schemaFailFast idea). |
+| `lib/coerce.test.js` | `node --test lib/coerce.test.js` — 8 tests, all green. |
+| `lib/model-limits.js` | Per-model ceilings (context / maxOutputTokens) from `../model-registry.json`: `limitsFor()` / `clampOutput()` / `preflight()`. The NVIDIA API exposes no limits, so the registry is the curated record (+ conservative `unknownModel` fallback). |
+| `lib/model-limits.test.js` | `node --test lib/model-limits.test.js` — 8 tests, all green. |
 | `experiments.jsx` | The nightly evolutionary workflow (Smithers). |
 | `workflows/*.jsx` | Ported chad-spawn / cron features (issue-triage, content-pipeline, self-improve, memory-curator, log-digest) + email-ladder, fusion, mcp-health-probe, fail-only-report. All graph-validate; side-effecting ones are shadow-safe by default. |
 | `state/seed-candidates.json` | Tracked. Initial variant pool to seed the arena wide. |
@@ -150,6 +154,27 @@ smithers resume                        # after any crash/stall
   scores flow correctly (recorded trial, promoted champion, leaderboard written),
   state persisted to `experiments.db` + `state/population.json`. Ready for Phase-4
   cron wiring via `run-experiments.sh`.
+- `fusion.jsx` — **3-stage (panel → judge → synthesize), live smoke pass GREEN
+  (2026-06-19)**: a 2-model panel + structured judge + synthesizer ran end-to-end
+  against the NVIDIA API; `fusion.db` carries the run (panel responses, judgment,
+  fused answer). Panelists are `continueOnFail` + timed-out; the panel is
+  auto-selected from arena champions (`state/population.json`) + the featured list.
+- **Resilience pass (2026-06-19):** every agent task across the 10 workflows now
+  carries a tier-aware `timeoutMs` + `retries`, and (where it's a required step) a
+  `fallbackAgent`; fan-out members (panelists/evals) are `continueOnFail`. Added
+  `lib/coerce.js` (8/8 tests). The runs dashboard now shows per-node token counts,
+  a "reasoning hidden" badge, inline fused/report output, and the full workflow
+  catalog incl. zero-run scaffolds.
+- **Token-ceiling pass (2026-06-19):** `../model-registry.json` extended with the
+  fusion roster (context + maxOutputTokens; estimates flagged `_estimated` — the
+  NVIDIA `/v1/models` API exposes no limits). `agents.js` clamps every request to
+  the model's ceiling; `serve-runs` preflights a launch (`/api/preflight`, gates
+  `/api/launch`) and blocks output > context window, surfacing clamp/estimate
+  warnings in the drawer (which shows ceilings via `/api/model-limits`). NOTE: the
+  cheap 2048 / capable 16384 tier caps are deliberate **frugality budgets** (tuned
+  in `../task-profiles.json` vs measured p95, watched by `chad-budget-audit`), NOT
+  model limits — raise them per-run in the drawer (up to the model ceiling) for
+  long experiments via `CHAD_MAX_OUTPUT_TOKENS[_CHEAP]`.
 
 ### Gotchas learned during bring-up (don't regress these)
 
@@ -159,3 +184,13 @@ smithers resume                        # after any crash/stall
 - **Read upstream outputs via `ctx.outputs.<schemaName>`** in render scope (the
   fan-in pattern), not the `deps` arg — `deps` is keyed by task id, so it's empty
   for dynamic `eval-*` fan-out.
+- **`continueOnFail` is NOT the default.** A failed panelist sinks the whole
+  `Parallel` unless you set it (the built-in `<Panel>` doesn't set it either, which
+  is why we kept the hand-rolled fusion). Fan-out tasks must opt in via
+  `{...taskOpts(role,{continueOnFail:true})}`.
+- **Workflow-subdir runs log under `workflows/.smithers/executions/`,** NOT the
+  root `.smithers/executions/`. `serve-runs.js` scans BOTH (`LOG_DIRS`) — without
+  that, the dashboard shows no event log / tokens / agent-trace for `workflows/*.jsx`.
+- **ToolLoopAgent tasks have no task deadline by default** — set `timeoutMs`
+  (agents.js `taskOpts` does this; the nemotron/local backends also pass an AI-SDK
+  `timeout` so a hung NVIDIA call releases its connection).

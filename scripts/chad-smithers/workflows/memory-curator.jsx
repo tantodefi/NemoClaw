@@ -25,7 +25,7 @@
 import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
 import { execFile } from "node:child_process";
-import { pickAgent } from "../agents.js";
+import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_CURATOR_DB || "./memory-curator.db";
 const APPLY = process.env.CHAD_CURATOR_APPLY === "1";
@@ -96,7 +96,7 @@ export const workflow = smithers((ctx) => {
           </Task>
 
           {/* Propose consolidations — one capable, structured call. */}
-          <Task id="propose" output={outputs.proposals} agent={pickAgent("judge")} retries={1}>
+          <Task id="propose" output={outputs.proposals} agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
             {[
               "You are Chad's memory curator. From the brain stats below, propose at most 5 DRAFT-ONLY memory consolidations.",
               "Actions: consolidate (merge near-duplicate atoms), lift (promote an important fact into workspace MEMORY.md), archive (retire stale entries).",

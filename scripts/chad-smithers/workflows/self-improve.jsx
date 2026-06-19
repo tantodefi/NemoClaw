@@ -27,7 +27,7 @@
 import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
 import { execFile } from "node:child_process";
-import { pickAgent } from "../agents.js";
+import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_SELFIMPROVE_DB || "./self-improve.db";
 const APPLY = process.env.CHAD_SELFIMPROVE_APPLY === "1";
@@ -83,7 +83,7 @@ export const workflow = smithers((ctx) => {
         </Task>
 
         {/* 2) Propose improvements — ONE capable, structured call (not a tool loop). */}
-        <Task id="propose" output={outputs.proposals} agent={pickAgent("judge")} retries={1}>
+        <Task id="propose" output={outputs.proposals} agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
           {[
             "You are Chad's self-improvement analyst. From the cron telemetry below, propose at most 5 NARROW, concrete improvements.",
             "Allowed kinds: cron_timeout, cron_max_tokens, cron_edit (auto-appliable), or 'behavioral'/'doc' (operator review).",

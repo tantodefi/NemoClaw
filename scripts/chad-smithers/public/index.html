@@ -66,6 +66,12 @@
   .md table { margin:6px 0; } .md th,.md td { border:1px solid var(--border); padding:4px 8px; font-size:12px; }
   .md code { background:#0b0f14; padding:1px 5px; border-radius:4px; font-family:ui-monospace,monospace; }
   a { color:var(--accent); }
+  .modal-bg{ position:fixed; inset:0; background:rgba(1,4,9,.6); display:flex; align-items:flex-start; justify-content:center; z-index:50; padding:38px 16px; overflow:auto; }
+  .modal{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px 18px; width:min(680px,96vw); box-shadow:0 16px 48px rgba(0,0,0,.55); }
+  .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; margin-top:8px; }
+  .fld{ display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
+  .fld input,.fld select,.fld textarea{ background:#0b0f14; border:1px solid var(--border); color:var(--fg); border-radius:6px; padding:5px 8px; font:inherit; font-size:13px; }
+  @media(max-width:560px){ .grid2{ grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -89,6 +95,7 @@
 <div id="view-workflows" class="pane" style="display:none"><div id="workflows"></div></div>
 <div id="view-approvals" class="pane" style="display:none"><div id="approvals"></div></div>
 <div id="view-experiments" class="pane" style="display:none"><div id="experiments"></div></div>
+<div id="launchModal" class="modal-bg" style="display:none"></div>
 
 <script>
 const fmtTime = (ms) => ms ? new Date(ms).toLocaleString() : "—";
@@ -155,25 +162,47 @@ async function loadDetail(id){
   try {
     const [det,logs]=await Promise.all([api("/api/runs/"+encodeURIComponent(id)),api("/api/runs/"+encodeURIComponent(id)+"/logs").catch(()=>({events:[]}))]);
     if(selected!==id) return;
-    const {run,attempts,outputs}=det, live=isLive(run);
+    const {run,attempts,outputs,telemetry={tokens:{byNode:{}},traces:{}}}=det, live=isLive(run);
+    const tok=telemetry.tokens?.byNode||{}, trc=telemetry.traces||{};
+    // Per-node token + capture badge. "reasoning hidden" explains why a final
+    // answer can be short: the model generated many more tokens than are stored.
+    const nodeTokens=(n)=>{ const t=tok[n], c=trc[n]; if(!t&&!c) return '';
+      const out=t?(t.outputTokens||0)+(t.reasoningTokens||0):0, inp=t?t.inputTokens||0:0;
+      const hid=c&&c.reasoningHidden?` <span class="pill" title="final-only capture — the model generated ~${out} output tokens incl. reasoning, but only the final answer is stored, so a short row is expected (not a placeholder)" style="background:rgba(210,153,34,.18);color:var(--yellow)">🧠 reasoning hidden</span>`:'';
+      return `${t?`<span class="muted mono" style="font-size:11px" title="input ↓ / output ↑ tokens">${inp}↓ ${out}↑</span>`:''}${hid}`; };
     const stale=live&&run.heartbeat_at_ms&&(Date.now()-run.heartbeat_at_ms>60000);
     const cancelBtn=live?`<button class="danger" onclick="cancelRun('${esc(id)}')">Cancel</button>`:"";
-    const actions=`<button onclick="loadChat('${esc(id)}')">Chat</button><button onclick="forkRun('${esc(id)}')">Fork ⑂</button>${cancelBtn}`;
+    const wfFile=run.workflow_path?(run.workflow_path.includes('/workflows/')?'workflows/'+run.workflow_path.split('/').pop():run.workflow_path.split('/').pop()):null;
+    const rerunBtn=wfFile?`<button onclick="openLaunch('${esc(wfFile)}')" title="Launch this workflow again with adjustable settings">Re-run ⟳</button>`:"";
+    const actions=`<button onclick="loadChat('${esc(id)}')">Chat</button>${rerunBtn}<button onclick="forkRun('${esc(id)}')">Fork ⑂</button>${cancelBtn}`;
     const att=attempts.map(a=>`<tr><td class="mono">${esc(a.node_id)} <a href="#" onclick="trace('${esc(id)}','${esc(a.node_id)}');return false" class="muted" style="font-size:11px">trace</a> <a href="#" onclick="diffNode('${esc(id)}','${esc(a.node_id)}');return false" class="muted" style="font-size:11px">diff</a></td>
       <td>${pill(a.state)}</td><td class="muted">${String(a.state).toLowerCase()==='in-progress'?'running':fmtDur(a.started_at_ms,a.finished_at_ms)}</td>
+      <td>${nodeTokens(a.node_id)}</td>
       <td class="err">${a.error_json?esc((()=>{try{return JSON.parse(a.error_json).message}catch{return a.error_json}})()).slice(0,160):""}</td></tr>`).join("");
+    // Render each output table; if a row has a substantial text field (fused
+    // answer, report summary, etc.) show it readably and tuck the structured
+    // fields behind a sub-disclosure — so compute-node outputs (select/report/
+    // fusion) are legible instead of a raw JSON blob or a blank row.
+    const TEXTKEYS=["fused","summary","text","note","body","content","detail","rationale"];
     const outs=Object.entries(outputs).map(([t,rows])=>{
-      const isReport=rows.length===1&&(rows[0].summary||rows[0].path)&&t==="report";
-      const rep=rows.map(r=>r.content||r.body||"").join("");
-      return `<details ${t==='report'?'open':''}><summary>${esc(t)} (${rows.length})</summary>${t==='report'&&rep?`<div class="md">${md(rep)}</div>`:`<pre>${esc(JSON.stringify(rows,null,2))}</pre>`}</details>`;
+      const open=["report","fusion","synthesize","judgment"].includes(t);
+      const body=rows.map(r=>{
+        const big=TEXTKEYS.map(k=>r[k]).find(v=>typeof v==="string"&&v.length>40);
+        const meta=Object.fromEntries(Object.entries(r).filter(([k])=>!["run_id","node_id","iteration"].includes(k)));
+        return big
+          ? `<div class="md">${md(big)}</div><details><summary class="muted" style="font-weight:400">fields</summary><pre>${esc(JSON.stringify(meta,null,2))}</pre></details>`
+          : `<pre>${esc(JSON.stringify(meta,null,2))}</pre>`;
+      }).join("");
+      return `<details ${open?'open':''}><summary>${esc(t)} (${rows.length})</summary>${body}</details>`;
     }).join("");
     const logHtml=(logs.events||[]).map(ev=>{const ts=ev.timestampMs?new Date(ev.timestampMs).toLocaleTimeString():"";return `<div class="ev t-${esc(ev.type||'')}"><span class="ts">${ts}</span> ${esc(ev.type||ev.raw||'')}${ev.nodeId?' · '+esc(ev.nodeId):''}${ev.message?' · '+esc(ev.message):''}</div>`;}).join("");
     d.innerHTML=`<div class="row"><h2 style="flex:1">${esc(run.workflow_name||'run')} ${pill(run.status)}${stale?' <span class="stale">⚠ stale</span>':''}</h2>${actions}</div>
       <div class="muted mono">${esc(run.run_id)} · ${esc(run.db)}</div>
       <div class="muted">started ${fmtTime(run.started_at_ms)} · ${live?'<b style="color:var(--blue)">running…</b>':'finished '+fmtTime(run.finished_at_ms)} · ${fmtDur(run.started_at_ms,run.finished_at_ms)}</div>
+      ${telemetry.tokens&&telemetry.tokens.totalTokens?`<div class="muted">tokens · ${telemetry.tokens.inputTokens}↓ in · ${telemetry.tokens.outputTokens}↑ out${telemetry.tokens.reasoningTokens?` · ${telemetry.tokens.reasoningTokens} reasoning`:''} · ${telemetry.tokens.totalTokens} total</div>`:''}
       ${run.error_json?`<h3>error</h3><pre class="err">${esc(run.error_json)}</pre>`:""}
       <div id="chatbox"></div>
-      <h3>tasks (${attempts.length})</h3><table><thead><tr><th>node</th><th>state</th><th>dur</th><th>error</th></tr></thead><tbody>${att||'<tr><td colspan=4 class=muted>waiting…</td></tr>'}</tbody></table>
+      <h3>tasks (${attempts.length})</h3><table><thead><tr><th>node</th><th>state</th><th>dur</th><th>tokens</th><th>error</th></tr></thead><tbody>${att||'<tr><td colspan=5 class=muted>waiting…</td></tr>'}</tbody></table>
       <div id="tracebox"></div>
       <h3>event log${live?' · live':''} ${logs.total?`<span class="muted">(${logs.total})</span>`:''}</h3><div class="logpanel" id="logpanel">${logHtml||'<span class=muted>no events</span>'}</div>
       <h3>outputs</h3>${outs||'<div class="muted">no output rows</div>'}`;
@@ -194,16 +223,92 @@ async function trace(id,node){ const box=document.getElementById("tracebox"); bo
 const wfBox=(name)=>"g-"+btoa(unescape(encodeURIComponent(name))).replace(/[^a-zA-Z0-9]/g,"");
 async function loadWorkflows(){
   const el=document.getElementById("workflows");
-  try{ const {workflows}=await api("/api/workflows");
+  try{
+    // /api/catalog adds run counts; fall back to /api/workflows if the running
+    // server predates it (version skew during a deploy) so the tab still works.
+    let data; try{ data=await api("/api/catalog"); }catch{ data=await api("/api/workflows"); }
+    const {workflows}=data;
     el.innerHTML=`<div class="row"><h2 style="flex:1">Workflows</h2><button onclick="newWorkflow()">+ New workflow</button></div>
-      <div class=muted>Edit a workflow's .jsx, validate its graph, or launch it. Launches run detached and appear live under Runs.</div>`+
-      workflows.map(w=>`<div class="card"><div class="row"><div style="flex:1"><b class="mono">${esc(w.name)}</b><div class="muted" style="font-size:12px">modified ${fmtTime(w.mtime)}</div></div>
+      <div class=muted>Edit a workflow's .jsx, validate its graph, or launch it. Launches run detached and appear live under Runs. Scaffolds (no runs yet) are launchable too.</div>`+
+      workflows.map(w=>`<div class="card"><div class="row"><div style="flex:1"><b class="mono">${esc(w.name)}</b><div class="muted" style="font-size:12px">${w.runs?`${w.runs} run${w.runs>1?'s':''}`:'<span style="color:var(--yellow)">scaffold · no runs yet</span>'} · modified ${fmtTime(w.mtime)}</div></div>
         <button onclick="editWorkflow('${esc(w.name)}')">Edit</button>
         <button onclick="showGraph('${esc(w.name)}')">Graph</button>
         <button class="primary" onclick="launch('${esc(w.name)}')">Launch ▶</button></div><div id="${wfBox(w.name)}"></div></div>`).join("");
   }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
 }
-async function launch(name){ if(!confirm("Launch "+name+"?"))return; try{ const r=await post("/api/launch",{workflow:name}); switchTab("runs"); setTimeout(loadRuns,1500); }catch(e){ alert("launch failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Cloudflare Access login, or ?key=)":"")); } }
+// Launch opens a settings drawer (input + reasoning/timeout/max-tokens/backend/
+// dry-run/fusion-panel/raw-env). Re-run on a finished run reuses the same drawer.
+let _mlim=null, _lxWarned=false;
+function launch(name){ openLaunch(name); }
+function closeLaunch(){ const m=document.getElementById("launchModal"); m.style.display="none"; m.innerHTML=""; }
+function openLaunch(name, pre={}){
+  const isFusion=/fusion/.test(name);
+  const m=document.getElementById("launchModal");
+  m.innerHTML=`<div class="modal" onclick="event.stopPropagation()">
+    <div class="row"><h2 style="flex:1">Launch · <span class="mono">${esc(name)}</span></h2><button onclick="closeLaunch()">✕</button></div>
+    <label class="fld" style="margin-top:8px">Input (JSON) <span class="muted">— data the workflow reads via ctx.input${isFusion?` (fusion uses {"prompt":"…"})`:''}</span>
+      <textarea id="lx-input" spellcheck="false" style="min-height:64px;font-family:ui-monospace,monospace;font-size:12.5px" placeholder='${isFusion?'{"prompt":"…"}':'{}'}'>${esc(pre.input||"")}</textarea></label>
+    <h3 style="margin:12px 0 2px">run settings <span class="muted" style="text-transform:none">— blank = workspace default</span></h3>
+    <div class="grid2">
+      <label class="fld">Reasoning<select id="lx-reasoning"><option value="">default</option><option value="on">on</option><option value="off">off</option></select></label>
+      <label class="fld">Dry run (no side effects)<select id="lx-dry"><option value="">no</option><option value="1">yes</option></select></label>
+      <label class="fld">Timeout · capable (s)<input id="lx-tcap" type="number" min="1" placeholder="600"></label>
+      <label class="fld">Timeout · cheap (s)<input id="lx-tcheap" type="number" min="1" placeholder="120"></label>
+      <label class="fld">Max output tokens · capable<input id="lx-maxcap" type="number" min="1" placeholder="16384"></label>
+      <label class="fld">Max output tokens · cheap<input id="lx-maxcheap" type="number" min="1" placeholder="2048"></label>
+      <label class="fld">Backend · capable<select id="lx-bcap"><option value="">auto</option><option>claudecode</option><option>codex</option><option>nemotron</option><option>opencode</option><option>local</option></select></label>
+      <label class="fld">Backend · cheap<select id="lx-bcheap"><option value="">auto</option><option>nemotron</option><option>claudecode</option><option>local</option></select></label>
+      ${isFusion?`<label class="fld">Fusion models (csv)<input id="lx-fmodels" placeholder="nvidia/…, openai/…"></label>
+      <label class="fld">Fusion panel max<input id="lx-fmax" type="number" min="1" placeholder="6"></label>`:''}
+    </div>
+    <div class="muted" id="lx-maxhint" style="font-size:11px;margin-top:6px">checking model limits…</div>
+    <details style="margin-top:10px"><summary class="muted">Advanced env (CHAD_* only; allowlisted server-side)</summary>
+      <div id="lx-env" style="margin-top:6px"></div><button onclick="addEnvRow()" style="margin-top:4px">+ add key/value</button></details>
+    <div class="row" style="margin-top:12px"><span class="muted" id="lx-status" style="flex:1"></span><button onclick="closeLaunch()">Cancel</button><button class="primary" onclick="submitLaunch('${esc(name)}')">Launch ▶</button></div>
+  </div>`;
+  m.style.display="flex";
+  m.onclick=()=>closeLaunch(); // click backdrop closes (modal stops propagation)
+  _lxWarned=false; lxLimits(name);
+}
+async function lxLimits(name){
+  const hint=document.getElementById("lx-maxhint"); if(!hint)return;
+  try{ _mlim=_mlim||await api("/api/model-limits");
+    const cap=_mlim["nvidia/nemotron-3-ultra-550b-a55b"]||_mlim._default||{};
+    const ceil=Number(cap.maxOutputTokens)||0, ctx=cap.contextWindow||"?";
+    hint.innerHTML=`Capable model ceiling: <b>${ceil||"?"}</b> max output · ${ctx} context · <a href="#" onclick="var e=document.getElementById('lx-maxcap');if(e)e.value=${ceil};return false">set max</a>`
+      +(/fusion/.test(name)?` <span class="muted">— fusion panelists may be lower; preflight checks each model</span>`:"");
+  }catch{ hint.textContent=""; }
+}
+function addEnvRow(k="",v=""){ const box=document.getElementById("lx-env"); if(!box)return;
+  const d=document.createElement("div"); d.className="row"; d.style.margin="4px 0";
+  const s="flex:1;background:#0b0f14;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:4px 8px";
+  d.innerHTML=`<input placeholder="CHAD_…" value="${esc(k)}" style="${s}"><input placeholder="value" value="${esc(v)}" style="${s}"><button onclick="this.parentNode.remove()">✕</button>`;
+  box.appendChild(d); }
+async function submitLaunch(name){
+  const st=document.getElementById("lx-status"); st.style.color="var(--muted)"; st.textContent="";
+  const env={}, val=(id)=>{ const e=document.getElementById(id); return e?String(e.value).trim():""; };
+  const setSel=(id,key)=>{ const v=val(id); if(v) env[key]=v; };
+  const setNum=(id,key,mult=1)=>{ const v=val(id); if(v&&!isNaN(Number(v))) env[key]=String(Math.round(Number(v)*mult)); };
+  setSel("lx-reasoning","CHAD_REASONING"); setSel("lx-dry","DRY_RUN");
+  setNum("lx-tcap","CHAD_TASK_TIMEOUT_MS",1000); setNum("lx-tcheap","CHAD_TASK_TIMEOUT_MS_CHEAP",1000);
+  setNum("lx-maxcap","CHAD_MAX_OUTPUT_TOKENS"); setNum("lx-maxcheap","CHAD_MAX_OUTPUT_TOKENS_CHEAP");
+  setSel("lx-bcap","CHAD_CAPABLE_BACKEND"); setSel("lx-bcheap","CHAD_CHEAP_BACKEND");
+  if(val("lx-fmodels")) env.CHAD_FUSION_MODELS=val("lx-fmodels");
+  setNum("lx-fmax","CHAD_FUSION_MAX");
+  document.querySelectorAll("#lx-env .row").forEach(r=>{ const ins=r.querySelectorAll("input"); const k=ins[0].value.trim(); if(k) env[k]=ins[1].value; });
+  let input; const raw=val("lx-input");
+  if(raw){ try{ input=JSON.parse(raw); }catch{ st.style.color="var(--red)"; st.textContent="input must be valid JSON"; return; } }
+  // Preflight against per-model limits (the launch endpoint re-checks server-side).
+  st.style.color="var(--muted)"; st.textContent="preflight…";
+  try{ const pf=await post("/api/preflight",{workflow:name,env});
+    if(!pf.ok){ st.style.color="var(--red)"; st.innerHTML="✕ "+pf.errors.map(esc).join("<br>✕ "); return; }
+    if(pf.warnings&&pf.warnings.length&&!_lxWarned){ _lxWarned=true; st.style.color="var(--yellow)"; st.innerHTML="⚠ "+pf.warnings.map(esc).join("<br>⚠ ")+"<br><span class='muted'>click Launch again to proceed</span>"; return; }
+  }catch{ /* preflight is advisory; the launch endpoint re-validates and blocks hard errors */ }
+  st.style.color="var(--muted)"; st.textContent="launching…";
+  try{ await post("/api/launch",{workflow:name,...(input?{input}:{}),env});
+    closeLaunch(); switchTab("runs"); setTimeout(loadRuns,1200);
+  }catch(e){ st.style.color="var(--red)"; st.textContent="launch failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":""); }
+}
 async function showGraph(name){ const box=document.getElementById(wfBox(name)); box.innerHTML="<div class=muted>rendering graph…</div>";
   try{ const {dag}=await api("/api/workflow-graph?name="+encodeURIComponent(name));
     if(window.mermaid && dag && dag.nodes.length){

@@ -31,6 +31,7 @@ import { join, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn, execFileSync } from "node:child_process";
+import { preflight, listLimits } from "./lib/model-limits.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.CHAD_RUNS_PORT || 7331);
@@ -38,7 +39,17 @@ const HOST = process.env.CHAD_RUNS_HOST || "0.0.0.0";
 const DB_DIR = process.env.CHAD_RUNS_DB_DIR || HERE;
 const POP_PATH = process.env.CHAD_POPULATION || join(HERE, "state/population.json");
 const REPORT_PATH = process.env.CHAD_EXPERIMENT_REPORT || join(HERE, "state/last-report.md");
-const LOG_DIR = process.env.CHAD_RUNS_LOG_DIR || join(HERE, ".smithers/executions");
+// A run's logs/trace live under whichever .smithers/executions dir the workflow
+// ran from: the workspace root (experiments.jsx) OR workflows/ (workflows/*.jsx).
+// Scan both so event logs, token telemetry, and agent traces show for EVERY
+// workflow, not just the root ones.
+const LOG_DIRS = process.env.CHAD_RUNS_LOG_DIR
+  ? [process.env.CHAD_RUNS_LOG_DIR]
+  : [join(HERE, ".smithers/executions"), join(HERE, "workflows/.smithers/executions")];
+function execLogDir(runId) {
+  for (const d of LOG_DIRS) { const p = join(d, runId); if (existsSync(p)) return p; }
+  return null;
+}
 const HOST_CREDS = process.env.CHAD_HOST_CREDS || "/Users/r/.nemoclaw/credentials.json";
 // Machine auth for Chad: SMITHERS_API_KEY env, else SMITHERS_RUNS_API_KEY from
 // host credentials.json. Gates writes (alongside Cloudflare Access email). Empty
@@ -49,12 +60,65 @@ const API_KEY = process.env.SMITHERS_API_KEY
 // Per-run event stream (live as the run executes). Tails the last N events from
 // .smithers/executions/<runId>/logs/stream.ndjson written by `smithers up`.
 function runLogs(runId, limit = 800) {
-  const path = join(LOG_DIR, runId, "logs", "stream.ndjson");
-  if (!existsSync(path)) return { events: [], path: null };
+  const base = execLogDir(runId);
+  const path = base && join(base, "logs", "stream.ndjson");
+  if (!path || !existsSync(path)) return { events: [], path: null };
   const lines = readFileSync(path, "utf8").trim().split("\n").filter(Boolean);
   const tail = lines.slice(-limit);
   const events = tail.map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
   return { events, total: lines.length, path: basename(path) };
+}
+
+// Token usage + agent-trace capture summaries for a run, parsed from the
+// execution stream (the DB carries no per-node token counts). This is what lets
+// the UI show "496 tokens generated, reasoning hidden" so a terse final answer
+// reads as intentional, not a broken/placeholder run.
+function runTelemetry(runId) {
+  const base = execLogDir(runId);
+  const path = base && join(base, "logs", "stream.ndjson");
+  const tokens = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, totalTokens: 0, byNode: {} };
+  const traces = {};
+  if (!path || !existsSync(path)) return { tokens, traces };
+  for (const l of readFileSync(path, "utf8").split("\n")) {
+    if (!l) continue;
+    let e; try { e = JSON.parse(l); } catch { continue; }
+    if (e.type === "TokenUsageReported") {
+      const it = e.inputTokens || 0, ot = e.outputTokens || 0, rt = e.reasoningTokens || 0, cr = e.cacheReadTokens || 0;
+      tokens.inputTokens += it; tokens.outputTokens += ot; tokens.reasoningTokens += rt; tokens.cacheReadTokens += cr;
+      tokens.totalTokens += it + ot;
+      const n = (tokens.byNode[e.nodeId] ||= { inputTokens: 0, outputTokens: 0, reasoningTokens: 0 });
+      n.inputTokens += it; n.outputTokens += ot; n.reasoningTokens += rt; n.model = e.model; n.agent = e.agent;
+    } else if (e.type === "AgentTraceSummary" && e.summary) {
+      const s = e.summary;
+      const unsupported = s.unsupportedEventKinds || [];
+      traces[e.nodeId] = {
+        captureMode: s.captureMode,
+        traceCompleteness: s.traceCompleteness,
+        agentFamily: s.agentFamily,
+        agentId: s.agentId,
+        // The dashboard's "reasoning hidden" badge: a final-only capture that
+        // dropped thinking/text deltas means the visible text is the tip of a
+        // larger generation (see byNode token counts), not a placeholder.
+        reasoningHidden: s.traceCompleteness === "final-only"
+          && unsupported.some((k) => /thinking|text\.delta/.test(k)),
+        durationMs: (s.traceFinishedAtMs || 0) - (s.traceStartedAtMs || 0),
+      };
+    }
+  }
+  return { tokens, traces };
+}
+
+// Run counts per workflow DB — so the catalog can show scaffolds with 0 runs.
+function workflowRunCounts() {
+  const counts = {};
+  for (const path of listDbs()) {
+    try {
+      withDb(path, (db) => {
+        if (tableExists(db, "_smithers_runs")) counts[basename(path)] = db.query("SELECT count(*) n FROM _smithers_runs").get().n;
+      });
+    } catch { /* skip */ }
+  }
+  return counts;
 }
 
 const listDbs = () =>
@@ -197,6 +261,43 @@ function nvidiaEnv() {
   };
 }
 
+// Allowlist for client-supplied launch settings → child env. DENY BY DEFAULT:
+// only CHAD_* / DRY_RUN tuning knobs, and explicitly NOT anything that could
+// redirect execution, hit a different endpoint, or leak data — binaries (_BIN),
+// endpoints (_URL/BASE_URL), ssh targets (_SSH), creds (_KEY/_TOKEN/_CREDS/
+// _SECRET/API_KEY), trust boundaries (_ALLOWLIST/_OPERATOR), or process internals
+// (PATH/HOME/NODE_/LD_). Note _TOKEN(_|$) deliberately does NOT match _TOKENS, so
+// CHAD_MAX_OUTPUT_TOKENS is allowed.
+const ENV_DENY = /(^|_)(SSH|BIN|CREDS?|SECRET|PASSWORD|COOKIE|PATH|HOME|NODE|LD)(_|$)|_KEY(_|$)|_TOKEN(_|$)|_URL(_|$)|BASE_URL|ALLOWLIST|OPERATOR|API_?KEY/;
+function isAllowedEnvKey(k) {
+  return /^(CHAD_[A-Z0-9_]+|DRY_RUN)$/.test(k) && !ENV_DENY.test(k);
+}
+function pickLaunchEnv(obj) {
+  const out = {};
+  if (obj && typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      if (isAllowedEnvKey(k) && ["string", "number", "boolean"].includes(typeof v)) out[k] = String(v);
+    }
+  }
+  return out;
+}
+
+// Validate a launch's requested settings against per-model limits (model-limits.js).
+// Candidate models = explicit CHAD_FUSION_MODELS, else fusion's featured roster,
+// plus the nemotron tier default that nearly every task uses. Checks the largest
+// requested max-output (capable or cheap) against each model's ceiling/context.
+function preflightLaunch(body) {
+  const env = (body && body.env) || {};
+  const models = [];
+  if (env.CHAD_FUSION_MODELS) models.push(...String(env.CHAD_FUSION_MODELS).split(",").map((s) => s.trim()).filter(Boolean));
+  else if (/fusion/.test(body?.workflow || "")) {
+    try { models.push(...(JSON.parse(readFileSync(join(HERE, "state/models.json"), "utf8")).featured || [])); } catch { /* */ }
+  }
+  models.push(env.CHAD_NEMOTRON_CAPABLE_MODEL || "nvidia/nemotron-3-ultra-550b-a55b");
+  const reqOut = Math.max(Number(env.CHAD_MAX_OUTPUT_TOKENS) || 0, Number(env.CHAD_MAX_OUTPUT_TOKENS_CHEAP) || 0) || null;
+  return preflight({ models: [...new Set(models)], maxOutputTokens: reqOut, reasoning: env.CHAD_REASONING });
+}
+
 // Write-auth: cloudflared injects Cf-Access-Authenticated-User-Email after SSO,
 // so only Access-authed operators can mutate. LAN-direct requests lack it. The
 // SMITHERS_API_KEY (?key=/header) is the override for local/testing.
@@ -226,7 +327,8 @@ app.get("/api/health", (c) => c.json({ ok: true, dbs: listDbs().map((p) => basen
 app.get("/api/runs", (c) => c.json({ runs: allRuns() }));
 app.get("/api/runs/:runId", (c) => {
   const d = runDetail(c.req.param("runId"));
-  return d ? c.json(d) : c.json({ error: "run not found" }, 404);
+  if (!d) return c.json({ error: "run not found" }, 404);
+  return c.json({ ...d, telemetry: runTelemetry(c.req.param("runId")) });
 });
 app.get("/api/runs/:runId/logs", (c) =>
   c.json(runLogs(c.req.param("runId"), Number(c.req.query("limit")) || 800)));
@@ -234,6 +336,18 @@ app.get("/api/experiments", (c) => c.json(experiments()));
 
 // Read: launchable workflows + a workflow's structure graph (no execution).
 app.get("/api/workflows", (c) => c.json({ workflows: listWorkflows() }));
+// Catalog = every launchable workflow file + its matched DB + run count, so the
+// UI lists scaffolds that have never run (0 runs) instead of hiding them.
+app.get("/api/catalog", (c) => {
+  const counts = workflowRunCounts();
+  const dbs = Object.keys(counts);
+  const workflows = listWorkflows().map((w) => {
+    const stem = basename(w.name).replace(/\.(jsx|tsx)$/, "");
+    const db = dbs.find((b) => { const ds = b.replace(/\.db$/, ""); return stem === ds || stem.startsWith(ds + "-"); });
+    return { ...w, db: db || null, runs: db ? counts[db] : 0 };
+  });
+  return c.json({ workflows });
+});
 // Parse a `smithers graph --format json` xml tree into a task DAG (sequence =
 // chain, parallel/branch = fan) for visual rendering (mermaid).
 function graphToDag(xml) {
@@ -288,8 +402,9 @@ app.post("/api/workflow-file", async (c) => {
 
 // Read: per-node agent trace (the reasoning/tool log for one task).
 app.get("/api/runs/:runId/trace/:node", (c) => {
-  const dir = join(LOG_DIR, c.req.param("runId"), "logs", "agent-trace");
-  if (!existsSync(dir)) return c.json({ lines: [] });
+  const base = execLogDir(c.req.param("runId"));
+  const dir = base && join(base, "logs", "agent-trace");
+  if (!dir || !existsSync(dir)) return c.json({ lines: [] });
   const node = c.req.param("node");
   const files = readdirSync(dir).filter((f) => f.startsWith(node));
   const lines = [];
@@ -301,6 +416,14 @@ app.get("/api/runs/:runId/trace/:node", (c) => {
   return c.json({ lines });
 });
 
+// Read: per-model limits (registry) for the launch drawer's ceiling hints.
+app.get("/api/model-limits", (c) => c.json(listLimits()));
+// Read: preflight a prospective launch's settings (advisory; no side effects).
+app.post("/api/preflight", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(preflightLaunch(body));
+});
+
 // Write (Access-gated): launch a known workflow, cancel a run, approve/deny a gate.
 app.post("/api/launch", async (c) => {
   const op = operator(c);
@@ -308,15 +431,19 @@ app.post("/api/launch", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const wf = resolveWorkflow(body.workflow || "");
   if (!wf) return c.json({ error: "unknown workflow" }, 400);
+  // Preflight: block launches with hard-unsafe settings (e.g. output > context).
+  const pf = preflightLaunch(body);
+  if (!pf.ok) return c.json({ error: "preflight failed — unsafe settings", preflight: pf }, 400);
   // Detached: the run executes in the background and shows up live in the list.
   const args = ["up", wf];
   if (body.input) args.push("--input", JSON.stringify(body.input)); // data, not code
+  const extra = pickLaunchEnv(body.env); // allowlisted run-setting knobs only
   const child = spawn(SMITHERS_BIN, args, {
-    cwd: HERE, env: nvidiaEnv(), detached: true, stdio: "ignore",
+    cwd: HERE, env: { ...nvidiaEnv(), ...extra }, detached: true, stdio: "ignore",
   });
   child.unref();
-  console.error(`launch: ${basename(wf)} by ${op} (pid ${child.pid})`);
-  return c.json({ ok: true, workflow: body.workflow, launchedBy: op });
+  console.error(`launch: ${basename(wf)} by ${op} (pid ${child.pid})${Object.keys(extra).length ? ` env[${Object.keys(extra).join(",")}]` : ""}`);
+  return c.json({ ok: true, workflow: body.workflow, launchedBy: op, env: Object.keys(extra), preflight: pf });
 });
 function cliAction(c, verb, extraArgs = []) {
   const op = operator(c);

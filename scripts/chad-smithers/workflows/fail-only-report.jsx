@@ -15,7 +15,7 @@
 import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
 import { execSync } from "node:child_process";
-import { pickAgent } from "../agents.js";
+import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_FAILREPORT_DB || "./fail-only.db";
 const POD = process.env.CHAD_POD_SSH || "openshell-chad";
@@ -59,7 +59,7 @@ export const workflow = smithers((ctx) => {
 
         {/* Only invoke the agent when there's something red — green stays silent. */}
         <Branch if={(runs?.notableCount ?? 0) > 0}>
-          <Task id="report" output={outputs.report} agent={pickAgent("summarize")} retries={1}>
+          <Task id="report" output={outputs.report} agent={pickAgent("summarize")} fallbackAgent={pickFallback("summarize")} {...taskOpts("summarize")}>
             {[
               "Chad health check found notable results. Give a one-paragraph root-cause summary and the single next command to run.",
               `Notable results (JSON): ${JSON.stringify(notable)}`,

@@ -34,6 +34,7 @@
 // bridge only passes through the few per-spawn overrides chad-spawn accepts.
 
 import { z } from "zod";
+import { coerceJson } from "./coerce.js";
 import { execFile, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -189,7 +190,9 @@ export async function runSpawn(opts = {}) {
     // 3) read the result back.
     const back = await execFileP("ssh", ["-n", host, `cat ${rresult} 2>/dev/null || true`]);
     if (back.stdout.trim()) {
-      try { return spawnResultSchema.parse(JSON.parse(back.stdout)); } catch { /* fall through */ }
+      // Tolerant of ssh banner noise / accidental fences around the result.json.
+      const parsed = coerceJson(back.stdout, spawnResultSchema);
+      if (parsed) return parsed;
     }
     return spawnResultSchema.parse({ status: "failed", kind, exit_code: r.code, substrate: substrate || "gha", summary: `remote chad-spawn produced no parseable result (rc=${r.code}): ${r.stderr.slice(0, 400)}` });
   } finally {

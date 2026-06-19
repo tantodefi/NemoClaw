@@ -16,8 +16,17 @@ fork a run, or check the evolutionary leaderboard.
 ## The two surfaces
 
 - **Web IDE** (operators): `https://runs.supachad.com` behind Cloudflare Access.
-  Tabs: Runs (live + history, task tree, event log, agent trace, diff), Workflows
-  (edit `.jsx` w/ syntax highlighting, visual DAG, launch), Approvals, Experiments.
+  Tabs: Runs (live + history, task tree with **per-node token counts** + a
+  **"reasoning hidden" badge** so a terse final answer reads as intentional not
+  broken, event log, agent trace, diff, fused/report output rendered inline),
+  Workflows (**full catalog incl. scaffolds with run counts**; edit `.jsx` w/
+  syntax highlighting, visual DAG, **Launch settings drawer**: input JSON +
+  reasoning / timeouts / max-output-tokens / backend / dry-run / fusion-panel,
+  plus **Re-run ⟳** on a finished run), Approvals, Experiments. Per-launch settings
+  post to `/api/launch` as an **allowlisted** env map (CHAD_*/DRY_RUN only); the
+  drawer shows each model's output/context ceiling (`/api/model-limits`) and
+  **preflights** settings (`/api/preflight` blocks output > context window, warns +
+  clamps over a model's max-output).
 - **CLI** (Chad / scripts / cron): `chad-runs` — full API access. Outputs JSON.
 
 ## chad-runs — how Chad drives it
@@ -83,6 +92,18 @@ auto-detects and routes by tier:
 Override per call: `pickAgent(role, { backend, model, reasoning })`. Force tiers
 with `CHAD_CAPABLE_BACKEND` / `CHAD_CHEAP_BACKEND` / `CHAD_REASONING=off`.
 
+**Resilience props** (agents.js): spread `{...taskOpts(role, { continueOnFail })}`
+on a `<Task>` for a tier-aware `timeoutMs` + `retries`; add
+`fallbackAgent={pickFallback(role)}` so a required task retries on a *different*
+backend; use `continueOnFail` on fan-out members (panelists/evals) so one dead
+model can't sink the run. Timeouts: `CHAD_TASK_TIMEOUT_MS` (capable, default
+10min), `CHAD_TASK_TIMEOUT_MS_CHEAP` (2min). Response length:
+`CHAD_MAX_OUTPUT_TOKENS[_CHEAP]` (frugal tier defaults, clamped to the model's
+`model-registry.json` ceiling — those defaults are budgets, not model limits).
+Parse loose model/tool JSON with
+`coerceJson(text, schema)` from `../lib/coerce.js` (strips fences/prose, validates
+a zod schema, returns null on bad output — drop the row instead of burning retries).
+
 ## Writing a workflow (the shape)
 
 ```jsx
@@ -116,7 +137,7 @@ they would do unless an explicit env flag is set.
 | Workflow | What it does | Make it real |
 |---|---|---|
 | `experiments.jsx` | Evolutionary drafter-prompt arena (start wide → score → keep) | runs live nightly |
-| `fusion.jsx` | One prompt across N models in parallel → fuse best | `CHAD_FUSION_MODELS`, `--input '{"prompt":"…"}'` |
+| `fusion.jsx` | One prompt across N models in parallel → structured **judge** (consensus/contradictions/blind-spots/confidence) → **synthesize**. Panel auto-selected from arena champions + featured list; panelists are `continueOnFail`. | `CHAD_FUSION_MODELS`, `CHAD_FUSION_MAX`, `--input '{"prompt":"…"}'` |
 | `mcp-health-probe.jsx` | Probe gbrain/webui MCP surfaces, escalate on failure | runs as-is |
 | `fail-only-report.jsx` | Quiet on green; report only on failure | runs as-is |
 | `email-ladder.jsx` | Autonomy ladder: triage→draft→moderate→Approval→send | `CHAD_EMAIL_SEND=1` + admin allowlist |

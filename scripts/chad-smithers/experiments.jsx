@@ -34,7 +34,7 @@ import { createSmithers } from "smithers-orchestrator";
 // agents package's toJSONSchema misreads ("optional non-representable"). Pin v4.
 import { z } from "zod";
 import { readFileSync, existsSync } from "node:fs";
-import { pickAgent } from "./agents.js";
+import { pickAgent, pickFallback, taskOpts } from "./agents.js";
 import {
   loadPopulation, savePopulation, activeCandidates, recordScore,
   select, needsExpansion, addCandidate, leaderboard, POLICY,
@@ -109,7 +109,8 @@ export const workflow = smithers((ctx) => {
       id={`eval-${c.id}`}
       output={outputs.evaluation}
       agent={pickAgent("judge")}
-      retries={1}
+      fallbackAgent={pickFallback("judge")}
+      {...taskOpts("judge", { continueOnFail: true })}
     >
       {judgePrompt(c, fixtures)}
     </Task>
@@ -122,7 +123,13 @@ export const workflow = smithers((ctx) => {
 
         <Task id="select" output={outputs.selection}>
           {() => {
-            for (const e of priorEvals) recordScore(pop, e.candidateId, e.scorePct / 100);
+            for (const e of priorEvals) {
+              // Drop any eval row missing a usable score: continueOnFail can leave
+              // a failed candidate out, and a malformed judge row must not poison
+              // the rolling mean (the schemaFailFast discipline at the fan-in).
+              if (!e || typeof e.scorePct !== "number" || Number.isNaN(e.scorePct)) continue;
+              recordScore(pop, e.candidateId, e.scorePct / 100);
+            }
             const { champions, retired } = select(pop, POLICY);
             if (!DRY_RUN) savePopulation(POP_PATH, pop);
             return { champions, retired, activeCount: activeCandidates(pop).length };

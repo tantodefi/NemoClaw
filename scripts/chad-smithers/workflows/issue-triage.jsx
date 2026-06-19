@@ -34,6 +34,9 @@ const TOP = Number(process.env.CHAD_TRIAGE_TOP || 2);
 const LABEL = process.env.CHAD_TRIAGE_LABEL || ""; // optional filter
 const SUBSTRATE = process.env.CHAD_TRIAGE_SUBSTRATE || "gha"; // heavy/isolated → GH runner
 const POST = process.env.CHAD_TRIAGE_POST === "1"; // post the report as an OpenWebUI note
+// Cap a wedged spawn: runSpawn has no internal ssh timeout, and the chad tunnel
+// has a half-open history — so bound each spawn task and don't auto-retry it.
+const SPAWN_TIMEOUT = Number(process.env.CHAD_SPAWN_TIMEOUT_MS || 1_800_000); // 30 min
 
 const schemas = {
   issues: z.object({ fetched: z.number(), selected: z.array(z.object({
@@ -85,7 +88,8 @@ export const workflow = smithers((ctx) => {
         <Parallel>
           {selected.map((iss) => (
             <Task key={`iss-${iss.number}`} id={`spawn-${iss.number}`} output={outputs.spawn}
-              sideEffect idempotencyKey={`spawn-iss-${iss.number}`}>
+              sideEffect idempotencyKey={`spawn-iss-${iss.number}`}
+              continueOnFail retries={0} timeoutMs={SPAWN_TIMEOUT}>
               {() => runSpawn({
                 kind: iss.kind,
                 substrate: SUBSTRATE,

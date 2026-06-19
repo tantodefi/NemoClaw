@@ -24,7 +24,7 @@ import { z } from "zod";
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { pickAgent } from "../agents.js";
+import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_HEALTH_DB || "./mcp-health.db";
 const SNAPSHOT = process.env.CHAD_HEALTH_SNAPSHOT || "./state/mcp-health-last.json";
@@ -87,7 +87,7 @@ export const workflow = smithers((ctx) => {
         </Task>
 
         {/* Cheap agent decides "material change vs last snapshot" — fail-only. */}
-        <Task id="check" output={outputs.check} agent={pickAgent("classify")} retries={1}>
+        <Task id="check" output={outputs.check} agent={pickAgent("classify")} fallbackAgent={pickFallback("classify")} {...taskOpts("classify")}>
           {[
             "You are the change detector for Chad's MCP/inference health probe.",
             `Current signals (JSON): ${JSON.stringify((ctx.outputs.probe ?? [])[0]?.signals ?? "[]")}`,
