@@ -20,13 +20,15 @@
 
 import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
 import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_TOKENOPT_DB || "./token-optimize.db";
 const CAND_PATH = process.env.CHAD_TOKENOPT_CANDIDATES || new URL("../state/downgrade-candidates.json", import.meta.url).pathname;
 const BAR = Number(process.env.CHAD_TOKENOPT_BAR || 75);          // min cheaper score to consider a downgrade
 const TOLERANCE = Number(process.env.CHAD_TOKENOPT_TOLERANCE || 6); // cheaper may be at most this far below current
+const APPLY = process.env.CHAD_TOKENOPT_APPLY === "1";            // shadow unless set
+const TASK_PROFILES = new URL("../../task-profiles.json", import.meta.url).pathname; // scripts/task-profiles.json
 
 const DEFAULT_CANDIDATES = [
   {
@@ -44,6 +46,16 @@ function loadCandidates() {
 const CANDIDATES = loadCandidates();
 const safe = (s) => String(s).replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40);
 
+// Set a dot-path value inside a parsed object (e.g. "profiles.email-check.drafter.model").
+function setPath(obj, path, value) {
+  const keys = String(path).split(".");
+  let o = obj;
+  for (let i = 0; i < keys.length - 1; i++) { if (o == null || typeof o !== "object") return false; o = o[keys[i]]; }
+  if (o == null || typeof o !== "object") return false;
+  o[keys[keys.length - 1]] = value;
+  return true;
+}
+
 const schemas = {
   result: z.object({ candidate: z.string(), tier: z.enum(["current", "cheaper"]), model: z.string(), text: z.string() }),
   scores: z.object({
@@ -53,10 +65,11 @@ const schemas = {
     })),
   }),
   decision: z.object({
-    downgrades: z.array(z.object({ task: z.string(), from: z.string(), to: z.string(), currentScore: z.number(), cheaperScore: z.number() })),
+    downgrades: z.array(z.object({ task: z.string(), from: z.string(), to: z.string(), currentScore: z.number(), cheaperScore: z.number(), applyTo: z.string().nullable().optional() })),
     held: z.array(z.string()),
     summary: z.string(),
   }),
+  apply: z.object({ status: z.enum(["applied", "shadow-logged", "blocked"]), applied: z.number(), detail: z.string() }),
   report: z.object({ proposed: z.number(), summary: z.string(), applied: z.boolean() }),
 };
 
@@ -116,7 +129,7 @@ export default smithers((ctx) => {
             for (const c of CANDIDATES) {
               const cur = byCand[c.task]?.current, ch = byCand[c.task]?.cheaper;
               if (cur == null || ch == null) { held.push(`${c.task} (incomplete scores)`); continue; }
-              if (ch >= BAR && ch >= cur - TOLERANCE) downgrades.push({ task: c.task, from: c.current, to: c.cheaper, currentScore: cur, cheaperScore: ch });
+              if (ch >= BAR && ch >= cur - TOLERANCE) downgrades.push({ task: c.task, from: c.current, to: c.cheaper, currentScore: cur, cheaperScore: ch, applyTo: c.applyTo || null });
               else held.push(`${c.task} (cheaper ${ch} vs current ${cur}; bar ${BAR})`);
             }
             return { downgrades, held, summary: `${downgrades.length} downgrade(s) proposed, ${held.length} held` };
@@ -129,12 +142,32 @@ export default smithers((ctx) => {
             prompt={`Approve ${proposeCount} model downgrade(s)? ${(lastDecision?.downgrades || []).map((d) => `${d.task}: ${d.from.split("/").pop()}→${d.to.split("/").pop()} (${d.cheaperScore} vs ${d.currentScore})`).join("; ")}`} />
         </Branch>
 
-        {/* Report — shadow only. Real apply (editing task-profiles.json model +
-            thinking for the approved tasks) is intentionally deferred. */}
+        {/* Apply — reached only AFTER the approval gate passes (it precedes this
+            in the Sequence). Shadow unless CHAD_TOKENOPT_APPLY=1; snapshots
+            task-profiles.json first; writes only downgrades that carry an applyTo
+            dot-path (advisory-only candidates are logged, never auto-applied). */}
+        <Task id="apply" output={outputs.apply} sideEffect idempotencyKey={`tokenopt-apply-${new Date().toISOString().slice(0, 10)}`}>
+          {() => {
+            const d = decisions[decisions.length - 1] ?? { downgrades: [] };
+            const appliable = (d.downgrades || []).filter((x) => x.applyTo);
+            if (!appliable.length) return { status: "shadow-logged", applied: 0, detail: `no downgrades with an applyTo path (${(d.downgrades || []).length} proposed)` };
+            if (!APPLY) return { status: "shadow-logged", applied: 0, detail: `SHADOW: would set ${appliable.map((x) => `${x.applyTo}=${x.to.split("/").pop()}`).join("; ")} (set CHAD_TOKENOPT_APPLY=1 to write)` };
+            try {
+              const tp = JSON.parse(readFileSync(TASK_PROFILES, "utf8"));
+              copyFileSync(TASK_PROFILES, `${TASK_PROFILES}.bak.${Date.now()}`); // snapshot before mutate
+              let n = 0;
+              for (const x of appliable) { if (setPath(tp, x.applyTo, x.to)) n++; }
+              writeFileSync(TASK_PROFILES, JSON.stringify(tp, null, 2) + "\n");
+              return { status: "applied", applied: n, detail: `set ${appliable.map((x) => `${x.applyTo}→${x.to.split("/").pop()}`).join("; ")} (snapshot saved alongside)` };
+            } catch (e) { return { status: "blocked", applied: 0, detail: `apply failed: ${String(e.message || e).slice(0, 200)}` }; }
+          }}
+        </Task>
+
         <Task id="report" output={outputs.report}>
           {() => {
             const d = decisions[decisions.length - 1] ?? { downgrades: [], summary: "no decision" };
-            return { proposed: d.downgrades?.length ?? 0, summary: d.summary, applied: false };
+            const ap = (ctx.outputs.apply ?? []).slice(-1)[0];
+            return { proposed: d.downgrades?.length ?? 0, summary: `${d.summary} · apply: ${ap?.status || "n/a"} (${ap?.applied || 0})`, applied: ap?.status === "applied" };
           }}
         </Task>
       </Sequence>

@@ -175,6 +175,15 @@ smithers resume                        # after any crash/stall
   in `../task-profiles.json` vs measured p95, watched by `chad-budget-audit`), NOT
   model limits — raise them per-run in the drawer (up to the model ceiling) for
   long experiments via `CHAD_MAX_OUTPUT_TOKENS[_CHEAP]`.
+- **Insight + tokenmaxxing pass (2026-06-19):** `workflows/token-optimize.jsx`
+  proposes Approval-gated model downgrades and, on approval with
+  `CHAD_TOKENOPT_APPLY=1`, writes the cheaper model into `../task-profiles.json`
+  (snapshot-first, dot-path set preserving siblings/comments). It runs nightly
+  (folded into `run-experiments.sh`, shadow) and feeds the runs-IDE **Experiments
+  dashboard** via `/api/model-matrix` — a model × task-kind heatmap surfacing the
+  best model per task-kind. The launch drawer gained per-tier model pickers
+  (capable/cheap → `CHAD_NEMOTRON_*_MODEL`, all workflows) and a liveness-filtered
+  fusion model multi-select (`/api/models`).
 
 ### Gotchas learned during bring-up (don't regress these)
 

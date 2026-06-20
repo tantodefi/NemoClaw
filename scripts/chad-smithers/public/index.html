@@ -258,6 +258,8 @@ function openLaunch(name, pre={}){
       <label class="fld">Max output tokens · cheap<input id="lx-maxcheap" type="number" min="1" placeholder="2048"></label>
       <label class="fld">Backend · capable<select id="lx-bcap"><option value="">auto</option><option>claudecode</option><option>codex</option><option>nemotron</option><option>opencode</option><option>local</option></select></label>
       <label class="fld">Backend · cheap<select id="lx-bcheap"><option value="">auto</option><option>nemotron</option><option>claudecode</option><option>local</option></select></label>
+      <label class="fld">Model · capable<select id="lx-mcapmodel"><option value="">tier default</option></select></label>
+      <label class="fld">Model · cheap<select id="lx-mcheapmodel"><option value="">tier default</option></select></label>
     </div>
     <div class="muted" id="lx-maxhint" style="font-size:11px;margin-top:6px">checking model limits…</div>
     ${isFusion?`<div id="lx-fusion" style="margin-top:12px">
@@ -273,17 +275,19 @@ function openLaunch(name, pre={}){
   </div>`;
   m.style.display="flex";
   m.onclick=()=>closeLaunch(); // click backdrop closes (modal stops propagation)
-  _lxWarned=false; lxLimits(name);
-  if(/fusion/.test(name)) lxModels();
+  _lxWarned=false; lxLimits(name); lxModels();
 }
-// Fusion model picker — live roster (catalog ∩ liveness probe) from /api/models.
+// Live model roster (catalog ∩ liveness probe) from /api/models. Feeds the
+// per-tier model selects (all workflows) AND the fusion multi-select (fusion only).
 function lxMCount(){ const mc=document.getElementById("lx-mcount"); if(mc&&_fmodels) mc.textContent=`${_fsel.size} selected · ${_fmodels.total} live · swept ${_fmodels.lastSweep?new Date(_fmodels.lastSweep*1000).toLocaleString():"?"}`; }
+function lxFillModelSelect(id){ const sel=document.getElementById(id); if(!sel||!_fmodels)return; const cur=sel.value;
+  sel.innerHTML='<option value="">tier default</option>'+_fmodels.models.map(m=>`<option value="${esc(m.id)}">${esc(m.id)}${m.featured?" ★":""}</option>`).join(""); sel.value=cur; }
 async function lxModels(){
-  const box=document.getElementById("lx-modellist"); if(!box)return;
-  try{ _fmodels=_fmodels||await api("/api/models");
-    _fsel.clear(); (_fmodels.featured||[]).forEach(id=>_fsel.add(id)); // default = featured
-    lxRenderModels(); lxMCount();
-  }catch(e){ box.innerHTML="<div class=muted>could not load models: "+esc(e.message)+"</div>"; }
+  try{ _fmodels=_fmodels||await api("/api/models"); }
+  catch(e){ const b=document.getElementById("lx-modellist"); if(b) b.innerHTML="<div class=muted>could not load models: "+esc(e.message)+"</div>"; return; }
+  lxFillModelSelect("lx-mcapmodel"); lxFillModelSelect("lx-mcheapmodel");
+  const box=document.getElementById("lx-modellist");
+  if(box){ _fsel.clear(); (_fmodels.featured||[]).forEach(id=>_fsel.add(id)); lxRenderModels(); lxMCount(); }
 }
 function lxRenderModels(){
   const box=document.getElementById("lx-modellist"); if(!box||!_fmodels)return;
@@ -321,6 +325,7 @@ async function submitLaunch(name){
   setNum("lx-tcap","CHAD_TASK_TIMEOUT_MS",1000); setNum("lx-tcheap","CHAD_TASK_TIMEOUT_MS_CHEAP",1000);
   setNum("lx-maxcap","CHAD_MAX_OUTPUT_TOKENS"); setNum("lx-maxcheap","CHAD_MAX_OUTPUT_TOKENS_CHEAP");
   setSel("lx-bcap","CHAD_CAPABLE_BACKEND"); setSel("lx-bcheap","CHAD_CHEAP_BACKEND");
+  setSel("lx-mcapmodel","CHAD_NEMOTRON_CAPABLE_MODEL"); setSel("lx-mcheapmodel","CHAD_NEMOTRON_MODEL");
   if(_fsel.size) env.CHAD_FUSION_MODELS=[..._fsel].join(",");
   setNum("lx-fmax","CHAD_FUSION_MAX");
   document.querySelectorAll("#lx-env .row").forEach(r=>{ const ins=r.querySelectorAll("input"); const k=ins[0].value.trim(); if(k) env[k]=ins[1].value; });
@@ -387,13 +392,24 @@ const spark=(scores)=>{ const b="▁▂▃▄▅▆▇█"; return (scores||[]).
 async function loadExperiments(){
   const el=document.getElementById("experiments");
   try{
-    const [exp,rr]=await Promise.all([api("/api/experiments"),api("/api/runs").catch(()=>({runs:[]}))]);
+    const [exp,rr,mm]=await Promise.all([api("/api/experiments"),api("/api/runs").catch(()=>({runs:[]})),api("/api/model-matrix").catch(()=>null)]);
     const {population,report}=exp;
     const nights=(rr.runs||[]).filter(r=>r.workflow_name==="chad-experiments");
     const cands=(population.candidates||[]).slice().sort((a,b)=>(b.rollingMean||0)-(a.rollingMean||0));
     const by={champion:0,active:0,retired:0}; cands.forEach(c=>{ by[c.status]=(by[c.status]||0)+1; });
+    const short=(m)=>String(m).split("/").pop();
+    const cellBg=(v)=>v==null?"transparent":`hsl(${Math.round((Number(v)||0)*1.2)} 55% 20%)`;
+    const matrixHtml = mm && mm.tasks && mm.tasks.length ? `
+      <h3>model × task — best model per task ⭐</h3>
+      <div style="overflow:auto"><table><thead><tr><th>task ↓ / model →</th>${mm.models.map(m=>`<th title="${esc(m)}">${esc(short(m))}</th>`).join("")}</tr></thead><tbody>
+        ${mm.tasks.map(t=>`<tr><td class="mono" style="font-size:12px">${esc(t)}</td>${mm.models.map(m=>{const c=mm.matrix[t][m];const isb=mm.best[t]===m;return `<td style="text-align:center;background:${cellBg(c&&c.mean)}${isb?';outline:1px solid var(--green)':''}">${c?`${c.mean}${isb?' ⭐':''}<div class="muted" style="font-size:9px">n=${c.n}</div>`:'<span class=muted>·</span>'}</td>`;}).join("")}</tr>`).join("")}
+        <tr><td class="muted">avg</td>${mm.models.map(m=>`<td style="text-align:center" class="muted">${mm.modelAvg[m]==null?'·':mm.modelAvg[m]}</td>`).join("")}</tr>
+      </tbody></table></div>
+      <div class="muted" style="font-size:11px">From token-optimize benchmark runs — each task's fixture scored 0-100 by the judge. Runs nightly; widen state/downgrade-candidates.json for more coverage.</div>`
+      : `<h3>model × task</h3><div class="muted">No benchmark data yet — run <span class="mono">token-optimize.jsx</span> (or wait for the nightly) to populate the matrix.</div>`;
     el.innerHTML=`<div class="row"><h2 style="flex:1">Experiments — evolutionary arena</h2>
         <span class="meta">🏆 ${by.champion} champions · ${by.active} active · 🪦 ${by.retired} retired</span></div>
+      ${matrixHtml}
       <h3>nightly runs (${nights.length})</h3>
       ${nights.length?`<table><thead><tr><th>night</th><th>status</th><th>dur</th><th>run</th></tr></thead><tbody>${
         nights.map(r=>`<tr class="run" style="cursor:pointer" onclick="switchTab('runs');selectRun('${esc(r.run_id)}')">

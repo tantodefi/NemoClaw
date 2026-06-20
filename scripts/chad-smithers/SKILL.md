@@ -146,7 +146,7 @@ they would do unless an explicit env flag is set.
 | `self-improve.jsx` | Cron telemetry → propose tunings → gate → apply | `CHAD_SELFIMPROVE_APPLY=1` + `CHAD_SIGNAL_SSH` |
 | `memory-curator.jsx` | Inactivity-gate → snapshot → propose consolidations → Approval | `CHAD_CURATOR_APPLY=1` + `CHAD_MEM_SSH` |
 | `log-digest.jsx` | Cluster host service-log errors → note (quiet if clean) | `CHAD_LOGDIGEST_POST=1` |
-| `token-optimize.jsx` | "Tokenmaxxing": probe whether a cheaper model matches a task's quality → Approval-gated downgrade proposal (shadow, draft-only) | `state/downgrade-candidates.json`, `CHAD_TOKENOPT_BAR`, `CHAD_TOKENOPT_TOLERANCE` |
+| `token-optimize.jsx` | "Tokenmaxxing": probe whether a cheaper model matches a task's quality → Approval-gated downgrade; on approval+`APPLY=1` writes the cheaper model into `../task-profiles.json` (snapshot-first, dot-path). Runs nightly (shadow); feeds the Experiments **model × task** matrix. | `state/downgrade-candidates.json`, `CHAD_TOKENOPT_BAR/TOLERANCE`, `CHAD_TOKENOPT_APPLY=1` |
 
 ## chad-spawn bridge (lib/spawn.js)
 

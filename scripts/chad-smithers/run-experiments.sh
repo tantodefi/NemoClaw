@@ -56,6 +56,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 if [ "$DRY" = "--dry-run" ]; then
   DRY_RUN=1 "$SMITHERS" up experiments.jsx
+  DRY_RUN=1 "$SMITHERS" up workflows/token-optimize.jsx
   echo "run-experiments: dry run complete (no state written, no artifact posted)"
   exit 0
 fi
@@ -87,5 +88,13 @@ if [ -f "$REPORT" ]; then
 else
   echo "run-experiments: no report at $REPORT to post" >&2
 fi
+
+# Model benchmark (tokenmaxxing): produces the per-(task-kind, model) scores that
+# feed the runs-IDE "Model × Task" matrix. SHADOW — never applies here
+# (CHAD_TOKENOPT_APPLY stays unset); any downgrade it proposes waits for operator
+# approval in the dashboard. Best-effort: a failure must not mask the run's rc.
+echo "run-experiments: running model benchmark (token-optimize, shadow)…" >&2
+CHAD_TOKENOPT_APPLY= "$SMITHERS" up workflows/token-optimize.jsx >/dev/null 2>&1 \
+  || echo "run-experiments: token-optimize benchmark non-fatal failure" >&2
 
 exit "$rc"

@@ -241,6 +241,45 @@ function liveModels() {
   return { models, featured: cat.featured || [], generatedAt: cat.generatedAt || null, lastSweep, total: models.length };
 }
 
+// Model x task-kind performance matrix — the "best model for which tasks" view.
+// Flattens token-optimize's judge scores (table `scores`, a JSON array per run)
+// across every run into (task-kind, model) -> {mean, n}, with the best model per
+// task. This is the data the Experiments dashboard heatmap renders.
+function modelMatrix() {
+  const cell = {}; const tasks = new Set(), models = new Set();
+  for (const path of listDbs()) {
+    try {
+      withDb(path, (db) => {
+        if (!tableExists(db, "scores")) return;
+        for (const row of db.query("SELECT scores FROM scores").all()) {
+          let arr; try { arr = JSON.parse(row.scores); } catch { continue; }
+          if (!Array.isArray(arr)) continue;
+          for (const s of arr) {
+            if (!s || typeof s.scorePct !== "number" || !s.candidate || !s.model) continue;
+            tasks.add(s.candidate); models.add(s.model);
+            const k = `${s.candidate} ${s.model}`;
+            (cell[k] ??= { sum: 0, n: 0 }); cell[k].sum += s.scorePct; cell[k].n += 1;
+          }
+        }
+      });
+    } catch { /* skip */ }
+  }
+  const taskList = [...tasks].sort(), modelList = [...models].sort();
+  const matrix = {}, best = {}, modelAvg = {};
+  for (const t of taskList) {
+    matrix[t] = {}; let bm = null, bs = -1;
+    for (const m of modelList) {
+      const c = cell[`${t} ${m}`];
+      const mean = c ? Math.round(c.sum / c.n) : null;
+      matrix[t][m] = c ? { mean, n: c.n } : null;
+      if (mean != null && mean > bs) { bs = mean; bm = m; }
+    }
+    best[t] = bm;
+  }
+  for (const m of modelList) { let sum = 0, n = 0; for (const t of taskList) { const c = matrix[t][m]; if (c) { sum += c.mean; n++; } } modelAvg[m] = n ? Math.round(sum / n) : null; }
+  return { tasks: taskList, models: modelList, matrix, best, modelAvg };
+}
+
 // ── IDE actions (launch / cancel / approve) ──────────────────────────────────
 const SMITHERS_BIN = process.env.SMITHERS_BIN || join(HERE, "node_modules/.bin/smithers");
 const WF_DIRS = [HERE, join(HERE, "workflows")];
@@ -442,6 +481,8 @@ app.get("/api/runs/:runId/trace/:node", (c) => {
 app.get("/api/model-limits", (c) => c.json(listLimits()));
 // Read: live model roster (catalog ∩ liveness) for the drawer's model picker.
 app.get("/api/models", (c) => c.json(liveModels()));
+// Read: model x task-kind performance matrix (best model per task) for the dashboard.
+app.get("/api/model-matrix", (c) => c.json(modelMatrix()));
 // Read: preflight a prospective launch's settings (advisory; no side effects).
 app.post("/api/preflight", async (c) => {
   const body = await c.req.json().catch(() => ({}));
