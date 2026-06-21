@@ -72,13 +72,9 @@ export const workflow = smithers((ctx) => {
               `Draft summary: ${draft?.summary || "(none)"}` })}
         </Task>
 
-        {/* Operator gate unless the reviewer explicitly cleared it. */}
-        <Branch if={!reviewerSaysShip(review)}>
-          <Approval id="publish-approval"
-            prompt={`Publish "${topic.slice(0, 60)}"? reviewer=${review?.status} note=${(review?.summary || "").slice(0, 120)}`} />
-        </Branch>
-
-        <Task id="publish" output={outputs.publish} sideEffect idempotencyKey={`content-publish-${topic.slice(0, 40)}`}>
+        {/* Publish — gated by needsApproval unless the reviewer explicitly cleared
+            it (human sign-off, pauses as waiting-approval). Shadow unless CHAD_CONTENT_PUBLISH=1. */}
+        <Task id="publish" output={outputs.publish} needsApproval={!reviewerSaysShip(review)} sideEffect idempotencyKey={`content-publish-${topic.slice(0, 40)}`}>
           {() => {
             if (!PUBLISH) return { status: "shadow-logged", detail: `SHADOW: would publish "${topic.slice(0, 60)}" (draft from writer spawn)` };
             // Real publish wiring (chad-webui note / gh / mail) is intentionally

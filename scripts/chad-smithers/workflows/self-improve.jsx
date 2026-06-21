@@ -92,14 +92,10 @@ export const workflow = smithers((ctx) => {
           ].join("\n\n")}
         </Task>
 
-        {/* 3) Gate: skip the operator only when every proposal is safe-listed + low-risk. */}
-        <Branch if={!allSafe}>
-          <Approval id="apply-approval"
-            prompt={`Apply ${proposals.length} self-improvement proposals? ${proposed?.summary?.slice(0, 140) || ""}`} />
-        </Branch>
-
-        {/* 4) Apply — shadow by default; real apply routes through the gated pod path. */}
-        <Task id="apply" output={outputs.apply} sideEffect idempotencyKey={`selfimprove-apply-${new Date().toISOString().slice(0, 10)}`}>
+        {/* 3+4) Apply — gated by needsApproval unless every proposal is safe-listed +
+            low-risk (human sign-off; pauses as waiting-approval). Shadow by default;
+            real apply routes through the gated pod path. */}
+        <Task id="apply" output={outputs.apply} needsApproval={!allSafe} sideEffect idempotencyKey={`selfimprove-apply-${new Date().toISOString().slice(0, 10)}`}>
           {async () => {
             const safe = proposals.filter((p) => p.risk === "low" && SAFE_KINDS.has(p.kind));
             if (signal?.runs === 0) return { status: "shadow-logged", applied: 0, detail: "no signal; nothing to apply" };

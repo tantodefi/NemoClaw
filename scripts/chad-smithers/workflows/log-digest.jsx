@@ -47,7 +47,9 @@ function sh(cmd, args, opts = {}) {
 export const workflow = smithers((ctx) => {
   const collected = (ctx.outputs.collected ?? [])[0];
   const digest = (ctx.outputs.digest ?? [])[0];
-  const hasSignal = (collected?.errorLines ?? 0) > 0;
+  // Smithers reads multi-word compute-output columns back as snake_case; accept either.
+  const errLines = collected?.errorLines ?? collected?.error_lines ?? 0;
+  const hasSignal = errLines > 0;
 
   return (
     <Workflow name="chad-log-digest">
@@ -66,16 +68,15 @@ export const workflow = smithers((ctx) => {
           }}
         </Task>
 
-        {/* 2) Cluster + summarize — one frugal cheap-tier call. Only if there's signal. */}
-        <Branch if={hasSignal}>
-          <Task id="cluster" output={outputs.digest} agent={pickAgent("summarize")} fallbackAgent={pickFallback("summarize")} {...taskOpts("summarize")}>
+        {/* 2) Cluster + summarize — one frugal cheap-tier call, skipped when clean
+            (per-task skipIf; a `<Branch if={upstreamOutput}>` doesn't reopen). */}
+        <Task id="cluster" skipIf={!hasSignal} output={outputs.digest} agent={pickAgent("summarize")} fallbackAgent={pickFallback("summarize")} {...taskOpts("summarize")}>
             {[
               "Cluster these host service-log error lines into distinct issues. Collapse repeats into one signature with a count.",
-              `Log lines (${collected?.errorLines ?? 0} from ${collected?.files ?? 0} files):\n${collected?.sample || ""}`,
+              `Log lines (${errLines} from ${collected?.files ?? 0} files):\n${collected?.sample || ""}`,
               'Return JSON {clusters:[{signature,count,severity,action}], summary}. severity ∈ info|warn|error. action = the one next step.',
             ].join("\n\n")}
           </Task>
-        </Branch>
 
         {/* 3) Note — quiet on a clean run (fail-only ethos). Posts a real
             OpenWebUI note when CHAD_LOGDIGEST_POST=1 (reversible artifact);

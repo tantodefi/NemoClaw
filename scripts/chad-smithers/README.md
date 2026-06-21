@@ -140,7 +140,8 @@ smithers graph experiments.jsx         # validate the workflow WITHOUT calling a
 DRY_RUN=1 smithers up experiments.jsx  # full render, no state writes
 smithers up experiments.jsx            # real run (calls the routed model)
 smithers ps                            # watch run state
-smithers resume                        # after any crash/stall
+smithers up experiments.jsx --resume <runId> --force   # resume a crashed/stalled/
+                                       # approved run (there is no bare `smithers resume`)
 ```
 
 `run-experiments.sh` wraps the real run + the OpenWebUI artifact post for cron.

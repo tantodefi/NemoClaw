@@ -57,16 +57,15 @@ export const workflow = smithers((ctx) => {
           }}
         </Task>
 
-        {/* Only invoke the agent when there's something red — green stays silent. */}
-        <Branch if={(runs?.notableCount ?? 0) > 0}>
-          <Task id="report" output={outputs.report} agent={pickAgent("summarize")} fallbackAgent={pickFallback("summarize")} {...taskOpts("summarize")}>
+        {/* Only invoke the agent when there's something red — green stays silent
+            (per-task skipIf; a `<Branch if={upstreamOutput}>` doesn't reopen). */}
+        <Task id="report" skipIf={notable.length === 0} output={outputs.report} agent={pickAgent("summarize")} fallbackAgent={pickFallback("summarize")} {...taskOpts("summarize")}>
             {[
               "Chad health check found notable results. Give a one-paragraph root-cause summary and the single next command to run.",
               `Notable results (JSON): ${JSON.stringify(notable)}`,
               "Return JSON { reported: true, summary: string }.",
             ].join("\n\n")}
           </Task>
-        </Branch>
       </Sequence>
     </Workflow>
   );

@@ -76,9 +76,10 @@ export const workflow = smithers((ctx) => {
           }}
         </Task>
 
-        <Branch if={proceed}>
-          {/* Pre-mutation snapshot — rollback insurance even for a draft-only run. */}
-          <Task id="snapshot" output={outputs.snapshot} sideEffect idempotencyKey={`curator-snapshot-${new Date().toISOString().slice(0, 10)}`}>
+        {/* proceed-gating is per-task skipIf — a `<Branch if={upstreamOutput}>`
+            does not reopen once inactivity-gate completes (verified). */}
+        {/* Pre-mutation snapshot — rollback insurance even for a draft-only run. */}
+        <Task id="snapshot" skipIf={!proceed} output={outputs.snapshot} sideEffect idempotencyKey={`curator-snapshot-${new Date().toISOString().slice(0, 10)}`}>
             {async () => {
               if (!MEM_SSH) return { status: "shadow", detail: "no CHAD_MEM_SSH; snapshot skipped (host dry run)" };
               await sh("ssh", ["-n", MEM_SSH, "chad-memory-snapshot 2>/dev/null || true"]);
@@ -87,7 +88,7 @@ export const workflow = smithers((ctx) => {
           </Task>
 
           {/* Gather brain stats to ground the proposals. */}
-          <Task id="gather" output={outputs.stats} sideEffect idempotencyKey={`curator-stats-${new Date().toISOString().slice(0, 10)}`}>
+          <Task id="gather" skipIf={!proceed} output={outputs.stats} sideEffect idempotencyKey={`curator-stats-${new Date().toISOString().slice(0, 10)}`}>
             {async () => {
               let s = "";
               if (MEM_SSH) s = await sh("ssh", ["-n", MEM_SSH, "gbrain stats 2>/dev/null | head -c 4000 || true"]);
@@ -96,7 +97,7 @@ export const workflow = smithers((ctx) => {
           </Task>
 
           {/* Propose consolidations — one capable, structured call. */}
-          <Task id="propose" output={outputs.proposals} agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
+          <Task id="propose" skipIf={!proceed} output={outputs.proposals} agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
             {[
               "You are Chad's memory curator. From the brain stats below, propose at most 5 DRAFT-ONLY memory consolidations.",
               "Actions: consolidate (merge near-duplicate atoms), lift (promote an important fact into workspace MEMORY.md), archive (retire stale entries).",
@@ -105,18 +106,15 @@ export const workflow = smithers((ctx) => {
             ].join("\n\n")}
           </Task>
 
-          {/* Operator approves before any apply (always, for memory ops). */}
-          <Approval id="curator-approval"
-            prompt={`Apply ${proposed?.proposals?.length ?? 0} memory consolidations? ${proposed?.summary?.slice(0, 140) || ""}`} />
-
-          <Task id="apply" output={outputs.apply} sideEffect idempotencyKey={`curator-apply-${new Date().toISOString().slice(0, 10)}`}>
+          {/* Apply — gated by needsApproval whenever a curator pass proceeds
+              (always, for memory ops); pauses as waiting-approval. Shadow by default. */}
+          <Task id="apply" skipIf={!proceed} needsApproval={proceed} output={outputs.apply} sideEffect idempotencyKey={`curator-apply-${new Date().toISOString().slice(0, 10)}`}>
             {() => {
               if (!APPLY) return { status: "shadow-logged", detail: `SHADOW: would apply ${proposed?.proposals?.length ?? 0} consolidations` };
               if (!MEM_SSH) return { status: "blocked", detail: "CHAD_CURATOR_APPLY=1 but no CHAD_MEM_SSH to reach the gated apply path" };
               return { status: "blocked", detail: "live memory apply intentionally deferred to a future chad-memory-apply (draft-only v1)" };
             }}
           </Task>
-        </Branch>
       </Sequence>
     </Workflow>
   );

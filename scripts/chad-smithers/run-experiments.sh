@@ -57,6 +57,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 if [ "$DRY" = "--dry-run" ]; then
   DRY_RUN=1 "$SMITHERS" up experiments.jsx
   DRY_RUN=1 "$SMITHERS" up workflows/token-optimize.jsx
+  DRY_RUN=1 "$SMITHERS" up workflows/bug-report.jsx
   echo "run-experiments: dry run complete (no state written, no artifact posted)"
   exit 0
 fi
@@ -96,5 +97,12 @@ fi
 echo "run-experiments: running model benchmark (token-optimize, shadow)…" >&2
 CHAD_TOKENOPT_APPLY= "$SMITHERS" up workflows/token-optimize.jsx >/dev/null 2>&1 \
   || echo "run-experiments: token-optimize benchmark non-fatal failure" >&2
+
+# Self-bug-report (shadow): Chad scans his own failures (failed runs/nodes + logs)
+# and drafts GitHub issues; any NEW bug waits for operator approval (and
+# CHAD_BUGREPORT_POST=1) in the runs IDE before it is actually filed. Best-effort.
+echo "run-experiments: running self-bug-report (shadow)…" >&2
+"$SMITHERS" up workflows/bug-report.jsx >/dev/null 2>&1 \
+  || echo "run-experiments: bug-report non-fatal failure" >&2
 
 exit "$rc"

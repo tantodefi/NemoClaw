@@ -9,7 +9,7 @@
     "experiments:dry": "DRY_RUN=1 smithers up experiments.jsx",
     "agents:probe": "node agents.js --probe",
     "ps": "smithers ps",
-    "resume": "smithers resume"
+    "resume": "smithers ps"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "latest",

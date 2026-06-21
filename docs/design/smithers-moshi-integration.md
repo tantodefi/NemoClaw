@@ -228,6 +228,41 @@ v0.23.0 ships composite components (`Panel`, `GatherAndSynthesize`, `ReviewLoop`
 - **`serve-runs.js` + `public/index.html`** — per-run/-node **token usage**, a **"reasoning hidden (final-only capture)"** indicator so short outputs read as intentional, **compute-node JSON outputs** rendered (not blank), and a **workflow catalog** that lists zero-run/scaffold workflows with a Launch button.
 - **Smoke passes** — real `smithers up` for the previously-empty scaffolds so their DBs carry data and the dashboard changes verify against reality.
 
+## Smithers coverage review + nightly self-improvement (2026-06-20)
+
+Where Chad's work now lives, and the human-in-the-loop model for the autonomous parts.
+
+**In Smithers (host-side `workflows/` + `experiments.jsx`, 12 durable workflows):**
+`experiments` (evolutionary prompt/model arena), `fusion` (3-stage ensemble),
+`token-optimize` (model×task benchmark + Approval-gated downgrade that writes
+`task-profiles.json`), `bug-report` (Chad scans his OWN failed runs/nodes + logs →
+clusters → Approval → `gh issue create`), `self-improve` (cron-telemetry → tuning
+proposals), `memory-curator`, `log-digest`, `mcp-health-probe`, `fail-only-report`,
+`issue-triage` (multi-spawn fix proposals), `content-pipeline`, `email-ladder`.
+
+**Runs nightly** (launchd `dev.nemoclaw.chad-experiments` → `run-experiments.sh`,
+Nemotron via the NVIDIA API): `experiments` → `token-optimize` (shadow benchmark,
+feeds the runs-IDE model×task matrix) → `bug-report` (shadow). So Chad self-improves
+*and* self-reports every night with zero supervision required — and anything that
+mutates state waits at a gate.
+
+**Human-in-the-loop (the trust boundary):** every mutating workflow is
+shadow-by-default AND `Approval`-gated — `self-improve` apply, `memory-curator`
+apply, `email-ladder` send, `content-pipeline` publish, `token-optimize` apply
+(`CHAD_TOKENOPT_APPLY=1`), `bug-report` post (`CHAD_BUGREPORT_POST=1`). Pending
+gates surface in the runs-IDE **Approvals** tab (and, via the `claudecode` tier's
+Moshi hooks, the operator's phone). Approve/deny there; nothing outward-facing
+fires without it.
+
+**Deliberately NOT in Smithers** (mechanical one-shots where it's pure overhead):
+backups, prune, gc, budget-audit, mail-check/send transport, gbrain-dream,
+auth-context. These stay deterministic wrappers (design §3b).
+
+**Candidate gaps (future, not blocking):** a `skill-improve` workflow (propose
+edits to Chad's own skills/workflows, Approval-gated) to fully close "all skills up
+for improvement"; `meeting-briefer` (calendar + fitness-RAG pre-session brief); the
+pod→host Moshi bridge so pod-side cron events (gbrain-dream, spawns) also notify.
+
 ## Next steps & hanging TODOs
 
 ### Needs operator intervention (I can't do these from here)

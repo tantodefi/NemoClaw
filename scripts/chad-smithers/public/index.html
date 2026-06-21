@@ -172,9 +172,11 @@ async function loadDetail(id){
       return `${t?`<span class="muted mono" style="font-size:11px" title="input ↓ / output ↑ tokens">${inp}↓ ${out}↑</span>`:''}${hid}`; };
     const stale=live&&run.heartbeat_at_ms&&(Date.now()-run.heartbeat_at_ms>60000);
     const cancelBtn=live?`<button class="danger" onclick="cancelRun('${esc(id)}')">Cancel</button>`:"";
+    const resumeBtn=String(run.status).toLowerCase()!=="finished"?`<button onclick="resumeRun('${esc(id)}')" title="Resume from the last durable checkpoint">Resume ⟳</button>`:"";
     const wfFile=run.workflow_path?(run.workflow_path.includes('/workflows/')?'workflows/'+run.workflow_path.split('/').pop():run.workflow_path.split('/').pop()):null;
     const rerunBtn=wfFile?`<button onclick="openLaunch('${esc(wfFile)}')" title="Launch this workflow again with adjustable settings">Re-run ⟳</button>`:"";
-    const actions=`<button onclick="loadChat('${esc(id)}')">Chat</button>${rerunBtn}<button onclick="forkRun('${esc(id)}')">Fork ⑂</button>${cancelBtn}`;
+    const graphBtn=wfFile?`<button onclick="renderRunDag('${esc(id)}','${esc(wfFile)}')" title="Task graph (status-colored)">Graph ⊞</button>`:"";
+    const actions=`<button onclick="loadChat('${esc(id)}')">Chat</button>${graphBtn}${rerunBtn}<button onclick="forkRun('${esc(id)}')">Fork ⑂</button>${resumeBtn}${cancelBtn}`;
     const att=attempts.map(a=>`<tr><td class="mono">${esc(a.node_id)} <a href="#" onclick="trace('${esc(id)}','${esc(a.node_id)}');return false" class="muted" style="font-size:11px">trace</a> <a href="#" onclick="diffNode('${esc(id)}','${esc(a.node_id)}');return false" class="muted" style="font-size:11px">diff</a></td>
       <td>${pill(a.state)}</td><td class="muted">${String(a.state).toLowerCase()==='in-progress'?'running':fmtDur(a.started_at_ms,a.finished_at_ms)}</td>
       <td>${nodeTokens(a.node_id)}</td>
@@ -212,6 +214,21 @@ async function loadDetail(id){
   } catch(e){ d.innerHTML=`<div class="empty">error: ${esc(e.message)}</div>`; }
 }
 async function cancelRun(id){ if(!confirm("Cancel this run?"))return; try{ await post("/api/runs/"+encodeURIComponent(id)+"/cancel"); setTimeout(()=>{loadDetail(id);loadRuns();},1000); }catch(e){ alert("cancel failed: "+e.message); } }
+async function resumeRun(id){ if(!confirm("Resume this run from its last checkpoint?"))return; try{ await post("/api/runs/"+encodeURIComponent(id)+"/resume"); setTimeout(()=>{loadDetail(id);loadRuns();},1500); }catch(e){ alert("resume failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
+// Status-colored task DAG for a run: overlay the run's attempt states onto the
+// workflow's static graph (rendered into the tracebox, mermaid w/ pre fallback).
+async function renderRunDag(id,wf){ const box=document.getElementById("tracebox"); if(!box)return; box.innerHTML="<h3>task graph · "+esc(wf)+"</h3><div class=muted>rendering…</div>";
+  try{ const [g,det]=await Promise.all([api("/api/workflow-graph?name="+encodeURIComponent(wf)),api("/api/runs/"+encodeURIComponent(id))]);
+    const dag=g.dag; if(!dag||!dag.nodes.length){ box.innerHTML="<h3>task graph</h3><div class=muted>no graph for this workflow</div>"; return; }
+    const st={}; (det.attempts||[]).forEach(a=>{ st[a.node_id]=String(a.state||"").toLowerCase(); });
+    const nid=x=>"n_"+String(x).replace(/[^a-zA-Z0-9]/g,"_");
+    let m="flowchart TD\n";
+    dag.nodes.forEach(n=>{ m+=`  ${nid(n.id)}["${String(n.label).replace(/"/g,"'")}"]\n`; const s=st[n.id]; const cls=s==="finished"?"ok":(s==="failed"||s==="errored")?"bad":(s==="in-progress"||s==="running")?"run":""; if(cls) m+=`  class ${nid(n.id)} ${cls}\n`; });
+    dag.edges.forEach(e=>{ m+=`  ${nid(e.from)} --> ${nid(e.to)}\n`; });
+    m+="classDef ok fill:#10331c,stroke:#3fb950,color:#e6edf3\nclassDef bad fill:#3a1518,stroke:#f85149,color:#e6edf3\nclassDef run fill:#0d2847,stroke:#58a6ff,color:#e6edf3\n";
+    if(window.mermaid){ try{ const {svg}=await mermaid.render("rd"+id.replace(/[^a-z0-9]/gi,"")+Date.now(),m); box.innerHTML="<h3>task graph <span class='muted' style='text-transform:none'>(green=done, red=failed, blue=running)</span></h3><div class='card' style='overflow:auto'>"+svg+"</div>"; return; }catch(e){} }
+    box.innerHTML="<h3>task graph</h3><pre>"+esc(m)+"</pre>";
+  }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
 async function forkRun(id){ if(!confirm("Fork this run (time-travel from its latest snapshot)?"))return; try{ await post("/api/runs/"+encodeURIComponent(id)+"/fork"); switchTab("runs"); setTimeout(loadRuns,1500); }catch(e){ alert("fork failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Access login or ?key=)":"")); } }
 async function loadChat(id){ const box=document.getElementById("chatbox"); box.innerHTML="<h3>agent chat</h3><div class=muted>loading…</div>"; try{ const {chat,error}=await api("/api/runs/"+encodeURIComponent(id)+"/chat"); box.innerHTML="<h3>agent chat</h3><div class='logpanel' style='max-height:360px;white-space:pre-wrap'>"+esc(chat||error||"(no chat output)")+"</div>"; }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
 function colorizeDiff(d){ return esc(d).split("\n").map(l=>{ if(l.startsWith("+")&&!l.startsWith("+++"))return "<span style='color:var(--green)'>"+l+"</span>"; if(l.startsWith("-")&&!l.startsWith("---"))return "<span style='color:var(--red)'>"+l+"</span>"; if(l.startsWith("@@"))return "<span style='color:var(--blue)'>"+l+"</span>"; return l; }).join("\n"); }
@@ -389,6 +406,18 @@ async function loadApprovals(){
 async function decide(runId,node,iteration,verb){ try{ await post(`/api/runs/${encodeURIComponent(runId)}/${verb}`,{node,iteration}); loadApprovals(); loadApprovalsBadge(); }catch(e){ alert(verb+" failed: "+e.message); } }
 
 const spark=(scores)=>{ const b="▁▂▃▄▅▆▇█"; return (scores||[]).map(s=>b[Math.min(7,Math.max(0,Math.round((Number(s)||0)*7)))]).join("")||"—"; };
+// rough inference-cost rank (cheaper = lower) for downgrade recommendations
+function costRank(m){ m=String(m); if(/nano/.test(m))return 1; if(/super|flash|gemma|gpt-oss|mini\b/.test(m))return 2; if(/claude-opus/.test(m))return 5; if(/claude/.test(m))return 4; if(/ultra|deepseek-v4-pro|397|maverick|kimi|glm-5|minimax|405|step-3/.test(m))return 3; return 2; }
+// dependency-free inline SVG charts (CDN libs gracefully absent behind Access)
+function svgBars(rows,{w=340,bh=16,gap=7,max=100}={}){ const lw=120,h=rows.length*(bh+gap)+4;
+  return `<svg width="100%" viewBox="0 0 ${w} ${h}" style="max-width:${w}px">`+rows.map((r,i)=>{const y=i*(bh+gap)+2;const bw=Math.max(0,Math.min(1,(Number(r.value)||0)/max))*(w-lw-34);
+    return `<text x="0" y="${y+bh-3}" fill="var(--muted)" font-size="11">${esc(String(r.label)).slice(0,18)}</text><rect x="${lw}" y="${y}" width="${bw.toFixed(1)}" height="${bh}" rx="3" fill="${r.color||'var(--blue)'}"/><text x="${(lw+bw+4).toFixed(1)}" y="${y+bh-3}" fill="var(--fg)" font-size="11">${r.value==null?'·':r.value}</text>`;}).join("")+`</svg>`; }
+function svgLines(series,{w=340,h=130,max=1}={}){ const pad=18,n=Math.max(2,...series.map(s=>s.points.length));
+  const X=i=>pad+(i*(w-pad*2)/(n-1)),Y=v=>h-pad-(Math.max(0,Math.min(1,(Number(v)||0)/max)))*(h-pad*2);
+  const axes=`<line x1="${pad}" y1="${h-pad}" x2="${w-pad}" y2="${h-pad}" stroke="var(--border)"/><line x1="${pad}" y1="${pad}" x2="${pad}" y2="${h-pad}" stroke="var(--border)"/>`;
+  const lines=series.map(s=>`<polyline fill="none" stroke="${s.color}" stroke-width="1.5" points="${s.points.map((v,i)=>`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ")}"/>`).join("");
+  const legend=series.map((s,i)=>`<text x="${(pad+i*84).toFixed(0)}" y="11" fill="${s.color}" font-size="10">${esc(String(s.label)).slice(0,11)}</text>`).join("");
+  return `<svg width="100%" viewBox="0 0 ${w} ${h}" style="max-width:${w}px">${axes}${lines}${legend}</svg>`; }
 async function loadExperiments(){
   const el=document.getElementById("experiments");
   try{
@@ -407,9 +436,32 @@ async function loadExperiments(){
       </tbody></table></div>
       <div class="muted" style="font-size:11px">From token-optimize benchmark runs — each task's fixture scored 0-100 by the judge. Runs nightly; widen state/downgrade-candidates.json for more coverage.</div>`
       : `<h3>model × task</h3><div class="muted">No benchmark data yet — run <span class="mono">token-optimize.jsx</span> (or wait for the nightly) to populate the matrix.</div>`;
+    // downgrade opportunities: cheapest model within tolerance of the best, per task
+    const TOL=6, recs=[];
+    if(mm&&mm.tasks) for(const t of mm.tasks){
+      const scored=mm.models.map(m=>({m,c:mm.matrix[t][m]})).filter(x=>x.c).map(x=>({m:x.m,score:x.c.mean}));
+      if(!scored.length)continue;
+      const best=scored.reduce((a,b)=>b.score>a.score?b:a);
+      const cheapest=scored.filter(x=>x.score>=best.score-TOL).sort((a,b)=>costRank(a.m)-costRank(b.m))[0];
+      if(cheapest&&costRank(cheapest.m)<costRank(best.m)) recs.push({task:t,use:cheapest.m,useScore:cheapest.score,vs:best.m,vsScore:best.score});
+    }
+    const modelBars=mm&&mm.models?mm.models.map(m=>({label:short(m),value:mm.modelAvg[m],color:"var(--green)"})).filter(r=>r.value!=null):[];
+    const colors=["#58a6ff","#3fb950","#d29922","#f85149"];
+    const champSeries=cands.filter(c=>c.status==="champion"&&(c.scores||[]).length).slice(0,4).map((c,i)=>({label:c.spec?.label||c.id,points:(c.scores||[]).map(Number),color:colors[i%4]}));
+    const outc={}; (rr.runs||[]).forEach(r=>{const s=String(r.status||"unknown").toLowerCase();outc[s]=(outc[s]||0)+1;});
+    const chartsHtml=`
+      <div class="row" style="gap:24px;flex-wrap:wrap;align-items:flex-start">
+        <div style="flex:1;min-width:280px"><h3>model average — all tasks</h3>${modelBars.length?svgBars(modelBars):'<div class=muted>no data</div>'}</div>
+        <div style="flex:1;min-width:280px"><h3>champion score trend</h3>${champSeries.length?svgLines(champSeries):'<div class=muted>no champions yet</div>'}</div>
+      </div>
+      <h3>downgrade opportunities ${recs.length?`<span class="pill" style="background:rgba(63,185,80,.15);color:var(--green)">${recs.length}</span>`:''}</h3>
+      ${recs.length?recs.map(r=>`<div class="card" style="padding:8px 12px"><b class="mono">${esc(r.task)}</b> → use <b>${esc(short(r.use))}</b> <span class="muted">(${r.useScore})</span> instead of ${esc(short(r.vs))} <span class="muted">(${r.vsScore})</span> — within ${TOL}pts at a cheaper tier. <a href="#" onclick="openLaunch('workflows/token-optimize.jsx');return false">propose ↗</a></div>`).join(""):'<div class="muted">none — each task is already on its cheapest within-tolerance model (or no benchmark data yet).</div>'}
+      <h3>run outcomes — all workflows</h3>
+      <div class="row" style="gap:10px;flex-wrap:wrap">${Object.entries(outc).sort((a,b)=>b[1]-a[1]).map(([s,n])=>`${pill(s)}&nbsp;<b>${n}</b>`).join("")||'<span class=muted>no runs</span>'}</div>`;
     el.innerHTML=`<div class="row"><h2 style="flex:1">Experiments — evolutionary arena</h2>
         <span class="meta">🏆 ${by.champion} champions · ${by.active} active · 🪦 ${by.retired} retired</span></div>
       ${matrixHtml}
+      ${chartsHtml}
       <h3>nightly runs (${nights.length})</h3>
       ${nights.length?`<table><thead><tr><th>night</th><th>status</th><th>dur</th><th>run</th></tr></thead><tbody>${
         nights.map(r=>`<tr class="run" style="cursor:pointer" onclick="switchTab('runs');selectRun('${esc(r.run_id)}')">

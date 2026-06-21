@@ -55,27 +55,21 @@ export const workflow = smithers((ctx) => {
           {`Triage this inbound message. Return JSON {operator, category, urgency, summary}.\n\n${JSON.stringify(inbound).slice(0, 4000)}`}
         </Task>
 
-        {/* Only draft for actual replies. */}
-        <Branch if={triage?.category === "reply"}>
-          <Task id="draft" output={outputs.draft} agent={pickAgent("draft")} fallbackAgent={pickFallback("draft")} {...taskOpts("draft")}>
+        {/* category gating is per-task skipIf — a `<Branch if={upstreamOutput}>`
+            does not reopen once triage completes (verified). Draft only for replies. */}
+        <Task id="draft" skipIf={triage?.category !== "reply"} output={outputs.draft} agent={pickAgent("draft")} fallbackAgent={pickFallback("draft")} {...taskOpts("draft")}>
             {`Draft a reply in the operator's voice. Return JSON {subject, body, confidence}.\n\nContext: ${triage?.summary ?? ""}\nOriginal: ${JSON.stringify(inbound).slice(0, 4000)}`}
           </Task>
 
           {/* Trust & safety gate on outbound (the layer the ladder lacked). */}
-          <Task id="moderation" output={outputs.moderation} agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
+          <Task id="moderation" skipIf={triage?.category !== "reply"} output={outputs.moderation} agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
             {`Screen this draft for anything that should NOT be auto-sent (PII leak, commitments, tone, hallucinated facts). Return JSON {safe, issues}.\n\n${draft?.body ?? ""}`}
           </Task>
 
-          {/* Human-in-the-loop. Auto-approvable operators skip the gate ONLY when
-              moderation is clean; everyone else (and any unsafe draft) pauses.
-              The Approval surfaces on the phone via Moshi when the agent is
-              constructed with approvalRouting. */}
-          <Branch if={!(autoApprovable && moderation?.safe)}>
-            <Approval id="human-approval"
-              prompt={`Approve reply to ${operator}? subject="${draft?.subject ?? ""}" issues=${JSON.stringify(moderation?.issues ?? [])}`} />
-          </Branch>
-
-          <Task id="send" output={outputs.send} sideEffect idempotencyKey={`send-${inbound.messageId ?? "unknown"}`}>
+          {/* Send — gated by needsApproval unless an allowlisted operator with a
+              clean moderation pass (human-in-the-loop; pauses as waiting-approval).
+              Surfaces on the phone via Moshi when constructed with approvalRouting. */}
+          <Task id="send" skipIf={triage?.category !== "reply"} needsApproval={!(autoApprovable && moderation?.safe)} output={outputs.send} sideEffect idempotencyKey={`send-${inbound.messageId ?? "unknown"}`}>
             {() => {
               if (!moderation?.safe) return { status: "queued-for-human", detail: `moderation flagged: ${(moderation?.issues || []).join("; ")}` };
               if (!SEND) return { status: "shadow-logged", detail: `SHADOW: would send "${draft?.subject}" to ${operator}` };
@@ -84,7 +78,6 @@ export const workflow = smithers((ctx) => {
               return { status: "blocked", detail: "CHAD_EMAIL_SEND=1 set but live send wiring intentionally deferred to chad-mail-send" };
             }}
           </Task>
-        </Branch>
       </Sequence>
     </Workflow>
   );

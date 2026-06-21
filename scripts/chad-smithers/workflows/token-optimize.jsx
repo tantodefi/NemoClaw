@@ -136,17 +136,11 @@ export default smithers((ctx) => {
           }}
         </Task>
 
-        {/* Operator gate — only when there's something to approve. */}
-        <Branch if={proposeCount > 0}>
-          <Approval id="downgrade-approval"
-            prompt={`Approve ${proposeCount} model downgrade(s)? ${(lastDecision?.downgrades || []).map((d) => `${d.task}: ${d.from.split("/").pop()}→${d.to.split("/").pop()} (${d.cheaperScore} vs ${d.currentScore})`).join("; ")}`} />
-        </Branch>
-
-        {/* Apply — reached only AFTER the approval gate passes (it precedes this
-            in the Sequence). Shadow unless CHAD_TOKENOPT_APPLY=1; snapshots
-            task-profiles.json first; writes only downgrades that carry an applyTo
-            dot-path (advisory-only candidates are logged, never auto-applied). */}
-        <Task id="apply" output={outputs.apply} sideEffect idempotencyKey={`tokenopt-apply-${new Date().toISOString().slice(0, 10)}`}>
+        {/* Apply — gated by needsApproval when downgrades are proposed (human
+            sign-off; pauses the run as waiting-approval). Shadow unless
+            CHAD_TOKENOPT_APPLY=1; snapshots task-profiles.json first; writes only
+            downgrades that carry an applyTo dot-path (advisory candidates logged). */}
+        <Task id="apply" output={outputs.apply} needsApproval={proposeCount > 0} sideEffect idempotencyKey={`tokenopt-apply-${new Date().toISOString().slice(0, 10)}`}>
           {() => {
             const d = decisions[decisions.length - 1] ?? { downgrades: [] };
             const appliable = (d.downgrades || []).filter((x) => x.applyTo);

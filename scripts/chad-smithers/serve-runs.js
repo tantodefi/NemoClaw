@@ -522,7 +522,29 @@ function cliAction(c, verb, extraArgs = []) {
   console.error(`${verb}: ${runId} by ${op} ${extraArgs.join(" ")}`);
   return c.json({ ok: true, output: r.out.slice(0, 600) });
 }
+// Resume a paused/approved/stale run DETACHED — it may run model-calling tasks,
+// so it must not block the request (unlike cliWithDb's 20s sync path). Uses
+// `up <wf> --resume <id> --force`: continues from the durable checkpoint in the
+// workflow's own named dbPath (no smithers.db symlink needed); --force handles
+// the waiting-event state a gate-paused run is left in. This is the continuation
+// after an approval is granted (granting alone only records the decision).
+function resumeDetached(runId) {
+  const wf = runWorkflowPath(runId);
+  if (!wf || !existsSync(wf)) return false;
+  const child = spawn(SMITHERS_BIN, ["up", wf, "--resume", runId, "--force"], { cwd: HERE, env: nvidiaEnv(), detached: true, stdio: "ignore" });
+  child.unref();
+  return true;
+}
 app.post("/api/runs/:runId/cancel", (c) => cliAction(c, "cancel"));
+// Resume a stalled/crashed/failed run from its last durable checkpoint (detached).
+app.post("/api/runs/:runId/resume", (c) => {
+  const op = operator(c);
+  if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const runId = c.req.param("runId");
+  const ok = resumeDetached(runId);
+  console.error(`resume: ${runId} by ${op}`);
+  return ok ? c.json({ ok: true, resumed: true }) : c.json({ error: "run not found" }, 404);
+});
 // Fork (time-travel): branch a new run from a run's snapshot. Resolves the
 // source run's workflow_path, runs detached, appears live under Runs.
 function runWorkflowPath(runId) {
@@ -569,13 +591,31 @@ app.get("/api/runs/:runId/diff/:node", (c) => {
   if (!db) return c.json({ diff: "", error: "run not found" });
   return c.json({ diff: cliWithDb(db, ["diff", c.req.param("runId"), c.req.param("node")]).out });
 });
+// Approve/deny a gate, then AUTO-RESUME (detached) so the approved action actually
+// executes (granting alone only records the decision; the paused run must resume).
 app.post("/api/runs/:runId/approve", async (c) => {
+  const op = operator(c);
+  if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
   const b = await c.req.json().catch(() => ({}));
-  return cliAction(c, "approve", b.node ? ["--node", b.node, "--iteration", String(b.iteration ?? 0)] : []);
+  const runId = c.req.param("runId");
+  const db = runDbPath(runId);
+  if (!db) return c.json({ error: "run not found" }, 404);
+  const grant = cliWithDb(db, ["approve", runId, ...(b.node ? ["--node", b.node, "--iteration", String(b.iteration ?? 0)] : [])]);
+  resumeDetached(runId);
+  console.error(`approve+resume: ${runId} by ${op} ${b.node || ""}`);
+  return c.json({ ok: true, output: grant.out.slice(0, 400), resumed: true });
 });
 app.post("/api/runs/:runId/deny", async (c) => {
+  const op = operator(c);
+  if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
   const b = await c.req.json().catch(() => ({}));
-  return cliAction(c, "deny", b.node ? ["--node", b.node, "--iteration", String(b.iteration ?? 0)] : []);
+  const runId = c.req.param("runId");
+  const db = runDbPath(runId);
+  if (!db) return c.json({ error: "run not found" }, 404);
+  const out = cliWithDb(db, ["deny", runId, ...(b.node ? ["--node", b.node, "--iteration", String(b.iteration ?? 0)] : [])]);
+  resumeDetached(runId);
+  console.error(`deny+resume: ${runId} by ${op} ${b.node || ""}`);
+  return c.json({ ok: true, output: out.out.slice(0, 400) });
 });
 // Pending approval gates across all DBs (for the approvals panel).
 app.get("/api/approvals", (c) => {
@@ -584,7 +624,7 @@ app.get("/api/approvals", (c) => {
     try {
       withDb(path, (db) => {
         if (!tableExists(db, "_smithers_approvals")) return;
-        for (const r of db.query("SELECT run_id, node_id, iteration, status, requested_at_ms, request_json FROM _smithers_approvals WHERE status='pending'").all())
+        for (const r of db.query("SELECT run_id, node_id, iteration, status, requested_at_ms, request_json FROM _smithers_approvals WHERE status IN ('pending','requested')").all())
           pending.push({ ...r, db: basename(path) });
       });
     } catch { /* */ }
