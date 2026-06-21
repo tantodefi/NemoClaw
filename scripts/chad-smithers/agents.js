@@ -37,8 +37,9 @@
 //   CHAD_NEMOTRON_MODEL       cheap-tier Nemotron id (default Ultra 550B; set to
 //                             Super 120B for a latency-sensitive path).
 //   CHAD_NEMOTRON_CAPABLE_MODEL  capable-tier Nemotron id (default Ultra 550B).
-//   CHAD_REASONING            "off" disables Nemotron reasoning; default ON
-//                             ("detailed thinking on" — max-logic by default).
+//   CHAD_REASONING            on|off. Default is TIER-AWARE: capable ON, cheap OFF
+//                             (cheap single-turn + reasoning + small cap → empty
+//                             output). "on"/"off" forces BOTH tiers.
 //   CHAD_LOCAL_BASE_URL       lmstudio OpenAI-compatible (default 127.0.0.1:1234/v1).
 //   CHAD_LOCAL_MODEL          local model id (default google/gemma-3-4b).
 //   CHAD_CAPABLE_BACKEND      force the capable tier: claudecode|codex|nemotron|
@@ -148,14 +149,23 @@ const backends = {
     const model = openaiCompatModel(
       p.shimUrl, modelId, env.NVIDIA_API_KEY || env.OPENAI_API_KEY, "chad-nemotron",
     );
-    const reasoning = opts.reasoning ?? (env.CHAD_REASONING !== "off");
+    // Tier-aware reasoning default. CHEAP single-turn work defaults reasoning OFF:
+    // with a small token cap, "detailed thinking on" can consume the entire budget
+    // and return an EMPTY final answer (finishReason=length, textLength=0 →
+    // INVALID_OUTPUT — the failure bug-report kept catching). CAPABLE tool-loop work
+    // keeps reasoning on. Force either tier with opts.reasoning or CHAD_REASONING=on|off.
+    const reasoning = opts.reasoning ?? (opts.cheap
+      ? (env.CHAD_REASONING === "on")
+      : (env.CHAD_REASONING !== "off"));
     return new ToolLoopAgent({
       model,
       // "detailed thinking on" = Nemotron reasoning; prepended to any task system.
       ...(reasoning ? { instructions: "detailed thinking on", allowSystemInMessages: true } : {}),
       // Frugal tier budget (env-overridable), CLAMPED to the model's registry
       // ceiling so a launch/override can never request more than the model supports.
-      maxOutputTokens: clampOutput(modelId, maxOut(opts.cheap, 16384, 2048)),
+      // Give reasoning runs token HEADROOM so chain-of-thought doesn't eat the whole
+      // budget and leave nothing for the answer (clamped to the model's ceiling).
+      maxOutputTokens: clampOutput(modelId, maxOut(opts.cheap, reasoning ? 32768 : 16384, reasoning ? 8192 : 2048)),
       maxSteps: opts.cheap ? (reasoning ? 2 : 1) : (opts.maxSteps ?? 12),
       // Abort the AI-SDK call if the hosted model hangs (connection released).
       timeout: { totalMs: opts.cheap ? CHEAP_TIMEOUT_MS : CAPABLE_TIMEOUT_MS },

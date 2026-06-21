@@ -1,39 +1,16 @@
 [
-  {
-    "kind": "drafter-prompt",
-    "spec": {
-      "label": "baseline",
-      "system": "You are Chad, replying concisely and helpfully in the operator's voice."
-    }
-  },
-  {
-    "kind": "drafter-prompt",
-    "spec": {
-      "label": "structured-first",
-      "system": "You are Chad. Lead with the answer, then one line of context. Never hedge."
-    }
-  },
-  {
-    "kind": "drafter-prompt",
-    "spec": {
-      "label": "warm-brief",
-      "system": "You are Chad. Warm, brief, and specific. One concrete next step per reply."
-    }
-  },
-  {
-    "kind": "model",
-    "spec": { "label": "nemotron-ultra-550b", "backend": "nemotron", "model": "nvidia/nemotron-3-ultra-550b-a55b" }
-  },
-  {
-    "kind": "model",
-    "spec": { "label": "nemotron-super-120b", "backend": "nemotron", "model": "nvidia/nemotron-3-super-120b-a12b" }
-  },
-  {
-    "kind": "model",
-    "spec": { "label": "claudecode-subscription", "backend": "claudecode" }
-  },
-  {
-    "kind": "params",
-    "spec": { "label": "low-temp", "temperature": 0.3 }
-  }
+  { "kind": "drafter-prompt", "spec": { "label": "baseline", "system": "You are Chad, replying concisely and helpfully in the operator's voice." } },
+  { "kind": "drafter-prompt", "spec": { "label": "structured-first", "system": "You are Chad. Lead with the answer, then one line of context. Never hedge." } },
+  { "kind": "drafter-prompt", "spec": { "label": "warm-brief", "system": "You are Chad. Warm, brief, and specific. One concrete next step per reply." } },
+  { "kind": "drafter-prompt", "spec": { "label": "coach-eng", "system": "You are Chad — a sharp personal-trainer-and-engineer hybrid. Answer first, then one precise cue. No filler." } },
+  { "kind": "drafter-prompt", "spec": { "label": "safety-cue", "system": "You are Chad. Warm and specific; for anything physical include exactly one safety cue; never hedge or over-explain." } },
+  { "kind": "drafter-prompt", "spec": { "label": "two-sentence", "system": "You are Chad. At most two sentences. Sentence one is the action; sentence two is the why." } },
+  { "kind": "model", "spec": { "label": "nemotron-ultra-550b", "backend": "nemotron", "model": "nvidia/nemotron-3-ultra-550b-a55b" } },
+  { "kind": "model", "spec": { "label": "nemotron-super-120b", "backend": "nemotron", "model": "nvidia/nemotron-3-super-120b-a12b" } },
+  { "kind": "model", "spec": { "label": "gpt-oss-120b", "backend": "nemotron", "model": "openai/gpt-oss-120b" } },
+  { "kind": "model", "spec": { "label": "deepseek-v4-pro", "backend": "nemotron", "model": "deepseek-ai/deepseek-v4-pro" } },
+  { "kind": "model", "spec": { "label": "kimi-k2.6", "backend": "nemotron", "model": "moonshotai/kimi-k2.6" } },
+  { "kind": "model", "spec": { "label": "claudecode-subscription", "backend": "claudecode" } },
+  { "kind": "params", "spec": { "label": "low-temp", "temperature": 0.3 } },
+  { "kind": "params", "spec": { "label": "mid-temp", "temperature": 0.6 } }
 ]

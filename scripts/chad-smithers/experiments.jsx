@@ -141,7 +141,23 @@ export const workflow = smithers((ctx) => {
             const sel = priorSelection[priorSelection.length - 1]
               ?? { champions: [], retired: [], activeCount: 0 };
             const md = renderReport(pop, sel);
-            if (!DRY_RUN) writeReport(md);
+            if (!DRY_RUN) {
+              writeReport(md);
+              // Value loop: export the top drafter-prompt champion so prod can adopt
+              // the winning prompt instead of leaving it stranded in the leaderboard.
+              try {
+                const champ = pop.candidates
+                  .filter((c) => c.status === "champion" && c.kind === "drafter-prompt" && c.spec?.system)
+                  .sort((a, b) => (b.rollingMean || 0) - (a.rollingMean || 0))[0];
+                if (champ) {
+                  const { writeFileSync, mkdirSync } = require("node:fs");
+                  const { dirname, join } = require("node:path");
+                  mkdirSync(dirname(REPORT_PATH), { recursive: true });
+                  writeFileSync(join(dirname(REPORT_PATH), "champion-prompt.json"),
+                    JSON.stringify({ label: champ.spec.label, system: champ.spec.system, rollingMean: champ.rollingMean, trials: champ.trials, exportedAt: new Date().toISOString() }, null, 2) + "\n");
+                }
+              } catch { /* */ }
+            }
             // Operator-visible OpenWebUI artifact is posted by the cron wrapper
             // (chad-experiment-smithers) via chad-webui after this returns, so
             // the post survives even if the LLM tier is down.

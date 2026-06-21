@@ -82,6 +82,7 @@
   <span class="tab" data-tab="approvals">Approvals <span id="apvBadge"></span></span>
   <span class="tab" data-tab="experiments">Experiments</span>
   <span class="spacer"></span>
+  <span id="bell" title="Approval notifications" style="cursor:pointer;font-size:15px;margin-right:4px" onclick="toggleNotify()">🔔</span>
   <span class="meta" id="meta">loading…</span>
 </header>
 
@@ -399,7 +400,17 @@ async function loadApprovalsBadge(){ try{ const {pending}=await api("/api/approv
   _apvInit=true;
 }catch{} }
 function notifyApproval(p){ try{ if(window.Notification && Notification.permission==="granted"){ const n=new Notification("Chad · approval needed", { body:`${p.db||""} · ${esc(p.node_id)} (run ${String(p.run_id).slice(0,8)})`, tag:`apv-${p.run_id}-${p.node_id}` }); n.onclick=()=>{ try{window.focus();}catch{} switchTab("approvals"); n.close(); }; } }catch{} }
-function enableNotifications(){ try{ if(window.Notification && Notification.permission==="default") Notification.requestPermission(); }catch{} }
+function enableNotifications(){ try{ if(window.Notification && Notification.permission==="default") Notification.requestPermission().then(updateBell); }catch{} }
+// Header bell: always-visible control for approval browser-push (the per-run
+// "Approval notify" dropdown lives in the launch drawer; this exposes the
+// dashboard-wide channel + its state so it's not hidden).
+function updateBell(){ const b=document.getElementById("bell"); if(!b)return; if(!window.Notification){ b.textContent="🔕"; b.title="No Notification API in this browser"; return; }
+  const p=Notification.permission; b.textContent=p==="granted"?"🔔":"🔕";
+  b.title=p==="granted"?"Approval browser notifications ON — click to test":p==="denied"?"Notifications blocked (enable in browser site settings)":"Click to enable approval notifications"; }
+function toggleNotify(){ if(!window.Notification){ alert("This browser has no Notification API."); return; }
+  if(Notification.permission==="granted"){ try{ new Notification("Chad · notifications on",{body:"You'll be pinged here when a run needs approval."}); }catch{} }
+  else { Notification.requestPermission().then(updateBell); }
+  updateBell(); }
 async function loadApprovals(){
   const el=document.getElementById("approvals");
   try{ const {pending}=await api("/api/approvals");
@@ -499,6 +510,7 @@ function switchTab(tab){
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>switchTab(t.dataset.tab));
 
 loadRuns();
+updateBell();
 enableNotifications(); // ask once for desktop approval notifications
 document.addEventListener("click", enableNotifications, { once: true }); // fallback: some browsers need a gesture
 setInterval(()=>{ if(document.getElementById("view-runs").style.display!=="none") loadRuns(); }, 5000);

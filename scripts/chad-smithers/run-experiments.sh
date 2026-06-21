@@ -99,17 +99,17 @@ echo "run-experiments: running model benchmark (token-optimize, shadow)…" >&2
 CHAD_TOKENOPT_APPLY= "$SMITHERS" up workflows/token-optimize.jsx >/dev/null 2>&1 \
   || echo "run-experiments: token-optimize benchmark non-fatal failure" >&2
 
-# Self-bug-report (shadow): Chad scans his own failures (failed runs/nodes + logs)
-# and drafts GitHub issues; any NEW bug waits for operator approval (and
-# CHAD_BUGREPORT_POST=1) in the runs IDE before it is actually filed. Best-effort.
-echo "run-experiments: running self-bug-report (shadow)…" >&2
-"$SMITHERS" up workflows/bug-report.jsx >/dev/null 2>&1 \
-  || echo "run-experiments: bug-report non-fatal failure" >&2
-
-# Self-skill-improvement (shadow): Chad proposes enhancements to his own
-# workflows/skills; any proposal waits for operator approval before it's filed.
-echo "run-experiments: running skill-improve (shadow)…" >&2
-"$SMITHERS" up workflows/skill-improve.jsx >/dev/null 2>&1 \
-  || echo "run-experiments: skill-improve non-fatal failure" >&2
+# Reporting loop — ONCE daily (the 05:00 invocation only) so the benchmark loop
+# above can run 3x/day without spamming the approval queue. bug-report (own
+# failures → issues), self-improve (cron telemetry → tunings; needs
+# CHAD_SIGNAL_SSH for real signal), skill-improve (workflow enhancements). All
+# shadow + Approval-gated; each waits for operator sign-off before acting.
+if [ "$(date +%H)" = "05" ]; then
+  for wf in bug-report self-improve skill-improve; do
+    echo "run-experiments: running $wf (shadow)…" >&2
+    "$SMITHERS" up "workflows/$wf.jsx" >/dev/null 2>&1 \
+      || echo "run-experiments: $wf non-fatal failure" >&2
+  done
+fi
 
 exit "$rc"

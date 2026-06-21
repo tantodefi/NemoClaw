@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# run-workflow.sh <workflow.jsx> — generic host-side cron driver for ONE Smithers
+# workflow. Sets the NVIDIA inference env (like run-experiments.sh) so launchd
+# timers can run ops/benchmark workflows on a schedule. Per-workflow flock so two
+# fires never overlap (Smithers' resume already dedupes the real work).
+#
+# Used by dev.nemoclaw.chad-{logdigest,mcphealth,failreport}.plist.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE"
+WF="${1:?usage: run-workflow.sh <workflow file, e.g. workflows/log-digest.jsx>}"
+SMITHERS="${SMITHERS_BIN:-$HERE/node_modules/.bin/smithers}"
+CREDS="${CHAD_HOST_CREDS:-/Users/r/.nemoclaw/credentials.json}"
+
+if [ -z "${NVIDIA_API_KEY:-}" ] && [ -f "$CREDS" ]; then
+  NVIDIA_API_KEY="$(python3 -c "import json;print(json.load(open('$CREDS')).get('NVIDIA_API_KEY',''))" 2>/dev/null || true)"
+  export NVIDIA_API_KEY
+fi
+export CHAD_INFERENCE_BASE_URL="${CHAD_INFERENCE_BASE_URL:-https://integrate.api.nvidia.com/v1}"
+export CHAD_CAPABLE_BACKEND="${CHAD_CAPABLE_BACKEND:-nemotron}"
+export CHAD_CHEAP_BACKEND="${CHAD_CHEAP_BACKEND:-nemotron}"
+
+LOCK="/tmp/chad-wf-$(basename "$WF" .jsx).lock.d"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "run-workflow: $WF already running; exiting" >&2
+  exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+echo "run-workflow: $WF @ $(date -u +%FT%TZ)" >&2
+exec "$SMITHERS" up "$WF"

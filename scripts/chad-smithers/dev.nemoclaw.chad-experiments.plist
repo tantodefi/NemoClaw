@@ -16,11 +16,15 @@
   </dict>
   <!-- Nightly at 05:00 local — after webui-ingest (04:30); coexists with the
        pod chad-experiment-cron (shadow) until parity is proven. -->
+  <!-- 3x/day (05/13/21): the benchmark loop (experiments + token-optimize) runs
+       each time for more arena trials + matrix data; the reporting loop
+       (bug/self/skill-improve) only fires on the 05:00 run (see run-experiments.sh). -->
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>5</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
+  <array>
+    <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>/Users/r/.nemoclaw/openwebui/chad-experiments.out.log</string>
   <key>StandardErrorPath</key><string>/Users/r/.nemoclaw/openwebui/chad-experiments.err.log</string>

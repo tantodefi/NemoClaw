@@ -32,10 +32,10 @@ export const POLICY = {
   windowSize: 7,        // rolling window: average over the last N trials
   minTrials: 3,         // don't retire a candidate before this many trials
   retireBelow: 0.45,    // rolling mean below this (after minTrials) → retired
-  championTopK: 2,      // top-K active candidates promoted to champion (prod use)
-  targetActive: 6,      // keep at least this many active candidates (start wide)
-  maxActive: 10,        // ceiling on simultaneous active candidates (budget)
-  expandPerRun: 1,      // at most N new candidates spawned per run when below target
+  championTopK: 3,      // top-K active candidates promoted to champion (feed fusion panel)
+  targetActive: 10,     // keep at least this many active candidates (wider arena)
+  maxActive: 16,        // ceiling on simultaneous active candidates (budget)
+  expandPerRun: 4,      // spawn up to N new candidates per run to fill the arena fast
 };
 
 export function loadPopulation(path) {
