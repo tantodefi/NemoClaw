@@ -269,6 +269,7 @@ function openLaunch(name, pre={}){
     <div class="grid2">
       <label class="fld">Reasoning<select id="lx-reasoning"><option value="">default</option><option value="on">on</option><option value="off">off</option></select></label>
       <label class="fld">Dry run (no side effects)<select id="lx-dry"><option value="">no</option><option value="1">yes</option></select></label>
+      <label class="fld">Approval notify<select id="lx-notify"><option value="">dashboard only</option><option value="browser">browser push</option><option value="webui">OpenWebUI note</option><option value="email">email</option><option value="telegram">Telegram/WhatsApp (if configured)</option></select></label>
       <label class="fld">Timeout · capable (s)<input id="lx-tcap" type="number" min="1" placeholder="600"></label>
       <label class="fld">Timeout · cheap (s)<input id="lx-tcheap" type="number" min="1" placeholder="120"></label>
       <label class="fld">Max output tokens · capable<input id="lx-maxcap" type="number" min="1" placeholder="16384"></label>
@@ -338,7 +339,7 @@ async function submitLaunch(name){
   const env={}, val=(id)=>{ const e=document.getElementById(id); return e?String(e.value).trim():""; };
   const setSel=(id,key)=>{ const v=val(id); if(v) env[key]=v; };
   const setNum=(id,key,mult=1)=>{ const v=val(id); if(v&&!isNaN(Number(v))) env[key]=String(Math.round(Number(v)*mult)); };
-  setSel("lx-reasoning","CHAD_REASONING"); setSel("lx-dry","DRY_RUN");
+  setSel("lx-reasoning","CHAD_REASONING"); setSel("lx-dry","DRY_RUN"); setSel("lx-notify","CHAD_APPROVAL_NOTIFY");
   setNum("lx-tcap","CHAD_TASK_TIMEOUT_MS",1000); setNum("lx-tcheap","CHAD_TASK_TIMEOUT_MS_CHEAP",1000);
   setNum("lx-maxcap","CHAD_MAX_OUTPUT_TOKENS"); setNum("lx-maxcheap","CHAD_MAX_OUTPUT_TOKENS_CHEAP");
   setSel("lx-bcap","CHAD_CAPABLE_BACKEND"); setSel("lx-bcheap","CHAD_CHEAP_BACKEND");
@@ -390,7 +391,15 @@ async function newWorkflow(){ const name=prompt("New workflow file (e.g. workflo
   const tmpl=`/** @jsxImportSource smithers-orchestrator */\nimport { createSmithers } from "smithers-orchestrator";\nimport { z } from "zod";\nimport { pickAgent } from "../agents.js";\n\nconst api = createSmithers({ result: z.object({ summary: z.string() }) }, { dbPath: "./new-flow.db" });\nconst { smithers, Workflow, Task, Sequence, outputs } = api;\n\nexport default smithers((ctx) => (\n  <Workflow name="new-flow">\n    <Sequence>\n      <Task id="step" output={outputs.result} agent={pickAgent("draft")}>\n        {"Reply as Chad. Return JSON { summary }."}\n      </Task>\n    </Sequence>\n  </Workflow>\n));\n`;
   try{ await post("/api/workflow-file",{name,content:tmpl}); await loadWorkflows(); editWorkflow(name); }catch(e){ alert("create failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Cloudflare Access login, or ?key=)":"")); } }
 
-async function loadApprovalsBadge(){ try{ const {pending}=await api("/api/approvals"); const b=document.getElementById("apvBadge"); b.innerHTML=pending.length?`<span class="pill pending">${pending.length}</span>`:""; }catch{} }
+let _seenApprovals=new Set(), _apvInit=false;
+async function loadApprovalsBadge(){ try{ const {pending}=await api("/api/approvals"); const b=document.getElementById("apvBadge"); b.innerHTML=pending.length?`<span class="pill pending">${pending.length}</span>`:"";
+  // Browser push: fire a desktop/PWA notification on NEW pending approvals (after
+  // the first load so we don't burst on open). The easy "push via runs.supachad.com".
+  for(const p of pending){ const k=`${p.run_id}:${p.node_id}:${p.iteration}`; if(!_seenApprovals.has(k)){ _seenApprovals.add(k); if(_apvInit) notifyApproval(p); } }
+  _apvInit=true;
+}catch{} }
+function notifyApproval(p){ try{ if(window.Notification && Notification.permission==="granted"){ const n=new Notification("Chad · approval needed", { body:`${p.db||""} · ${esc(p.node_id)} (run ${String(p.run_id).slice(0,8)})`, tag:`apv-${p.run_id}-${p.node_id}` }); n.onclick=()=>{ try{window.focus();}catch{} switchTab("approvals"); n.close(); }; } }catch{} }
+function enableNotifications(){ try{ if(window.Notification && Notification.permission==="default") Notification.requestPermission(); }catch{} }
 async function loadApprovals(){
   const el=document.getElementById("approvals");
   try{ const {pending}=await api("/api/approvals");
@@ -490,6 +499,8 @@ function switchTab(tab){
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>switchTab(t.dataset.tab));
 
 loadRuns();
+enableNotifications(); // ask once for desktop approval notifications
+document.addEventListener("click", enableNotifications, { once: true }); // fallback: some browsers need a gesture
 setInterval(()=>{ if(document.getElementById("view-runs").style.display!=="none") loadRuns(); }, 5000);
 setInterval(loadApprovalsBadge, 15000);
 </script>

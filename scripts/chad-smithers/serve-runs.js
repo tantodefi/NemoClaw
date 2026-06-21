@@ -54,6 +54,14 @@ const HOST_CREDS = process.env.CHAD_HOST_CREDS || "/Users/r/.nemoclaw/credential
 // Per-model liveness probe written by nvidia-liveness.py (1-token probe per model,
 // daily). Used to show only currently-live models in the launch drawer.
 const LIVENESS_FILE = process.env.CHAD_LIVENESS_FILE || join(dirname(HOST_CREDS), "openwebui/liveness.json");
+// Approval push notifications (best-effort). Channels in CHAD_APPROVAL_NOTIFY
+// (comma list): `browser` is handled client-side; `webui`/`email` dispatch from
+// here via the pod. Off by default — set on the chad-runs-ui service to enable.
+const NOTIFY_CHANNELS = (process.env.CHAD_APPROVAL_NOTIFY || "").split(",").map((s) => s.trim()).filter(Boolean);
+const POD_SSH = process.env.CHAD_POD_SSH || "openshell-chad";
+const POD_WEBUI = process.env.CHAD_WEBUI_POD_BIN || "/sandbox/.openclaw-data/bin/chad-webui";
+const OPERATOR_EMAIL = process.env.CHAD_OPERATOR_EMAIL || "tantodefi@proton.me";
+const RUNS_PUBLIC_URL = process.env.CHAD_RUNS_PUBLIC_URL || "https://runs.supachad.com";
 // Machine auth for Chad: SMITHERS_API_KEY env, else SMITHERS_RUNS_API_KEY from
 // host credentials.json. Gates writes (alongside Cloudflare Access email). Empty
 // = writes require the Cf-Access email only (browser).
@@ -636,5 +644,41 @@ app.get("/api/approvals", (c) => {
 app.get("/", (c) => c.html(readFileSync(join(HERE, "public/index.html"), "utf8")));
 app.get("/index.html", (c) => c.html(readFileSync(join(HERE, "public/index.html"), "utf8")));
 
-console.error(`serve-runs: durable DB dashboard on http://${HOST}:${PORT}  (scanning ${DB_DIR})`);
+// ── Approval notifier (best-effort push for pending gates) ───────────────────
+// Polls for new pending/requested approvals and pushes via the configured
+// pod-side channels. Deduped per (run,node,iteration). Browser push is separate
+// (client-side). Telegram/WhatsApp/Moshi need the openclaw channel / moshi notify
+// path wired (see docs) — not dispatched here yet.
+const _notifiedApprovals = new Set();
+const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+function podRun(cmd) {
+  try { const c = spawn("ssh", ["-n", "-o", "ConnectTimeout=15", POD_SSH, cmd], { stdio: "ignore" }); c.on("error", () => {}); c.unref(); } catch { /* */ }
+}
+function dispatchApproval(p) {
+  const title = "Chad · approval needed";
+  const body = `${p.db} · ${p.node_id} (run ${String(p.run_id).slice(0, 8)}) — approve at ${RUNS_PUBLIC_URL}`;
+  if (NOTIFY_CHANNELS.includes("webui")) podRun(`${POD_WEBUI} notes create --title ${shq(title)} --content ${shq(body)} --tags chad-approvals 2>/dev/null || true`);
+  if (NOTIFY_CHANNELS.includes("email")) podRun(`chad-mail-send --to ${shq(OPERATOR_EMAIL)} --subject ${shq(title)} --body ${shq(body)} 2>/dev/null || true`);
+}
+function approvalNotifier() {
+  if (!NOTIFY_CHANNELS.some((c) => c === "webui" || c === "email")) return; // nothing server-side to do
+  setInterval(() => {
+    for (const path of listDbs()) {
+      try {
+        withDb(path, (db) => {
+          if (!tableExists(db, "_smithers_approvals")) return;
+          for (const r of db.query("SELECT run_id, node_id, iteration FROM _smithers_approvals WHERE status IN ('pending','requested')").all()) {
+            const k = `${r.run_id}:${r.node_id}:${r.iteration}`;
+            if (_notifiedApprovals.has(k)) continue;
+            _notifiedApprovals.add(k);
+            dispatchApproval({ ...r, db: basename(path) });
+          }
+        });
+      } catch { /* */ }
+    }
+  }, 20000);
+}
+approvalNotifier();
+
+console.error(`serve-runs: durable DB dashboard on http://${HOST}:${PORT}  (scanning ${DB_DIR})${NOTIFY_CHANNELS.length ? ` · approval-notify: ${NOTIFY_CHANNELS.join(",")}` : ""}`);
 export default { port: PORT, hostname: HOST, fetch: app.fetch };

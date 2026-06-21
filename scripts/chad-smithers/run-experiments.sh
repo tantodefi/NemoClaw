@@ -58,6 +58,7 @@ if [ "$DRY" = "--dry-run" ]; then
   DRY_RUN=1 "$SMITHERS" up experiments.jsx
   DRY_RUN=1 "$SMITHERS" up workflows/token-optimize.jsx
   DRY_RUN=1 "$SMITHERS" up workflows/bug-report.jsx
+  DRY_RUN=1 "$SMITHERS" up workflows/skill-improve.jsx
   echo "run-experiments: dry run complete (no state written, no artifact posted)"
   exit 0
 fi
@@ -104,5 +105,11 @@ CHAD_TOKENOPT_APPLY= "$SMITHERS" up workflows/token-optimize.jsx >/dev/null 2>&1
 echo "run-experiments: running self-bug-report (shadow)…" >&2
 "$SMITHERS" up workflows/bug-report.jsx >/dev/null 2>&1 \
   || echo "run-experiments: bug-report non-fatal failure" >&2
+
+# Self-skill-improvement (shadow): Chad proposes enhancements to his own
+# workflows/skills; any proposal waits for operator approval before it's filed.
+echo "run-experiments: running skill-improve (shadow)…" >&2
+"$SMITHERS" up workflows/skill-improve.jsx >/dev/null 2>&1 \
+  || echo "run-experiments: skill-improve non-fatal failure" >&2
 
 exit "$rc"

@@ -148,6 +148,7 @@ they would do unless an explicit env flag is set.
 | `log-digest.jsx` | Cluster host service-log errors → note (quiet if clean) | `CHAD_LOGDIGEST_POST=1` |
 | `token-optimize.jsx` | "Tokenmaxxing": probe whether a cheaper model matches a task's quality → Approval-gated downgrade; on approval+`APPLY=1` writes the cheaper model into `../task-profiles.json` (snapshot-first, dot-path). Runs nightly (shadow); feeds the Experiments **model × task** matrix. | `state/downgrade-candidates.json`, `CHAD_TOKENOPT_BAR/TOLERANCE`, `CHAD_TOKENOPT_APPLY=1` |
 | `bug-report.jsx` | Chad catches his OWN failures (failed runs/nodes across the DBs + host logs) → clusters into distinct bugs → Approval → `gh issue create` (dedups open issues). Shadow unless `CHAD_BUGREPORT_POST=1`. Runs nightly. | `CHAD_BUGREPORT_REPO`, `CHAD_BUGREPORT_POST=1`, `CHAD_BUGREPORT_LABEL` |
+| `skill-improve.jsx` | Chad proposes ENHANCEMENTS to his own workflows/skills (robustness/perf/cost/feature/docs) → Approval → files GitHub enhancement issues (never edits source). Shadow unless `CHAD_SKILLIMPROVE_POST=1`. Runs nightly. | `CHAD_SKILLIMPROVE_REPO`, `CHAD_SKILLIMPROVE_POST=1` |
 
 ## chad-spawn bridge (lib/spawn.js)
 

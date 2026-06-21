@@ -263,6 +263,39 @@ edits to Chad's own skills/workflows, Approval-gated) to fully close "all skills
 for improvement"; `meeting-briefer` (calendar + fitness-RAG pre-session brief); the
 pod→host Moshi bridge so pod-side cron events (gbrain-dream, spawns) also notify.
 
+## Approval notification channels (2026-06-21)
+
+How the operator learns a run is waiting at a `needsApproval` gate. The launch
+drawer has an **"Approval notify"** dropdown (per-run, sets `CHAD_APPROVAL_NOTIFY`).
+
+**Before this:** pull-only — the runs-IDE **Approvals** tab + badge (operator had to
+look). The `claudecode` tier's Moshi hooks only fire for `claude` CLI
+PermissionRequests, NOT Smithers `needsApproval` gates, so gates were effectively
+silent until someone checked.
+
+**Wired now (easy):**
+- **Browser push (runs.supachad.com)** — the dashboard fires a desktop/PWA
+  `Notification` on each new pending approval (grant permission once; it asks on
+  load/first click). Zero infra, works immediately. Best for an operator at a desk.
+- **OpenWebUI note + email** — `serve-runs` polls for new approvals and dispatches
+  via the pod (`chad-webui notes create` / `chad-mail-send`) when
+  `CHAD_APPROVAL_NOTIFY` includes `webui`/`email` on the chad-runs-ui service.
+  Best-effort, deduped. (Verify the pod CLI arg names before relying on it.)
+
+**Effort to wire the rest:**
+- **Telegram/WhatsApp (openclaw channel)** — medium. If Chad's openclaw agent has a
+  TG/WhatsApp channel configured, add a dispatch that sends through the openclaw
+  messaging path (or `chad-webui`-style bridge). Needs the channel set up + the
+  send command confirmed.
+- **Moshi app** — hard. `moshi-hook` has **no generic notify/push verb** (push only
+  flows through `claude` lifecycle hooks), so an arbitrary "approval pending" push
+  needs the `claude-hook` stdin schema captured and a synthetic-event emitter
+  (Phase-2 follow-up, see §Phase 1). Not a quick win.
+
+**Recommendation:** browser push (on now) + `CHAD_APPROVAL_NOTIFY=webui` for an
+async OpenWebUI trail; add email for away-from-desk; TG/WhatsApp once the openclaw
+channel is configured.
+
 ## Next steps & hanging TODOs
 
 ### Needs operator intervention (I can't do these from here)
