@@ -9,3 +9,5 @@ state/population.json
 state/last-report.md
 state/posted-notes.log
 state/models.json
+state/champion-prompt.json
+state/mcp-health-last.json

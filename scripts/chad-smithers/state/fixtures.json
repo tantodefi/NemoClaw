@@ -1,14 +1,10 @@
 [
-  {
-    "id": "fixture-squat-depth",
-    "operator": "tjcooke",
-    "input": "Client asks: how low should I be going on squats if my knees click?",
-    "rubric": "Actionable, safe, in-voice, asks no unnecessary follow-up."
-  },
-  {
-    "id": "fixture-pr-nudge",
-    "operator": "tantodefi",
-    "input": "Reviewer left a comment asking for a test on the new endpoint.",
-    "rubric": "Concrete next step, acknowledges the comment, no over-promising."
-  }
+  { "id": "draft-squat-depth", "taskKind": "draft", "operator": "tjcooke", "input": "Client asks: how low should I go on squats if my knees click?", "rubric": "Actionable + safe + in Chad's voice; exactly one cue; no unnecessary follow-up." },
+  { "id": "draft-pr-nudge", "taskKind": "draft", "operator": "tantodefi", "input": "Reviewer left a comment asking for a test on the new endpoint.", "rubric": "Concrete next step, acknowledges the comment, no over-promising." },
+  { "id": "draft-reschedule", "taskKind": "draft", "operator": "tjcooke", "input": "Client wants to move tomorrow's 7am session to the evening.", "rubric": "Warm, confirms a specific time, one line only." },
+  { "id": "summarize-logs", "taskKind": "summarize", "input": "Cluster these: gateway ECONNREFUSED x12; shim 200 OK; tunnel closed 1000 x3; gbrain 0% coverage.", "rubric": "Groups repeats into distinct issues with one next action each; flags the 0% coverage as the real signal." },
+  { "id": "summarize-thread", "taskKind": "summarize", "input": "Summarize a 20-message thread debating whether to downgrade a cron task's model.", "rubric": "Captures the decision + the single open question in under 3 sentences." },
+  { "id": "classify-bug", "taskKind": "classify", "input": "Issue: 'gateway crashes ~20s after start in the k8s pod, nothing in the app logs'.", "rubric": "Correct severity + the single most likely root cause; no hedging." },
+  { "id": "coder-clamp", "taskKind": "coder", "input": "Write a JavaScript one-liner clamping n to the range [0, max].", "rubric": "Correct, minimal, returns only the code." },
+  { "id": "extract-recall", "taskKind": "extract", "input": "What do we know about the gbrain embed model reaching end-of-life?", "rubric": "Accurate recall, cites the fact, no fabrication." }
 ]

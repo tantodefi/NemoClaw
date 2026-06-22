@@ -44,6 +44,9 @@ fi
 export CHAD_INFERENCE_BASE_URL="${CHAD_INFERENCE_BASE_URL:-https://integrate.api.nvidia.com/v1}"
 export CHAD_CAPABLE_BACKEND="${CHAD_CAPABLE_BACKEND:-nemotron}"
 export CHAD_CHEAP_BACKEND="${CHAD_CHEAP_BACKEND:-nemotron}"
+# self-improve reads pod cron telemetry (~/.openclaw/cron-runs.jsonl) over ssh;
+# without this it sees no signal and proposes nothing. Best-effort (graceful if absent).
+export CHAD_SIGNAL_SSH="${CHAD_SIGNAL_SSH:-openshell-chad}"
 
 # Portable atomic lock (mkdir succeeds for exactly one racer). flock is absent
 # on macOS, where this runner lives; Smithers' own resume already dedupes the

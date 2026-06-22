@@ -288,6 +288,36 @@ function modelMatrix() {
   return { tasks: taskList, models: modelList, matrix, best, modelAvg };
 }
 
+// rough inference-cost tier (cheaper = lower) — mirrors the dashboard's costRank.
+function costRankS(m) { m = String(m); if (/nano/.test(m)) return 1; if (/super|flash|gemma|gpt-oss|mini\b/.test(m)) return 2; if (/claude-opus/.test(m)) return 5; if (/claude/.test(m)) return 4; if (/ultra|deepseek-v4-pro|397|maverick|kimi|glm-5|minimax|405|step-3/.test(m)) return 3; return 2; }
+
+// Efficiency view: total tokens (by workflow) across all runs + the downgrade
+// opportunities (from the model×task matrix) and which tasks are ALREADY on a cheap
+// tier in task-profiles.json — the "measure of value/efficiency" the operator asked for.
+function efficiency() {
+  let totalTokens = 0; const byWorkflow = {};
+  for (const r of allRuns()) {
+    try { const t = runTelemetry(r.run_id).tokens.totalTokens || 0; totalTokens += t; byWorkflow[r.workflow_name] = (byWorkflow[r.workflow_name] || 0) + t; } catch { /* */ }
+  }
+  const mm = modelMatrix(); const TOL = 6; const downgrades = [];
+  for (const t of mm.tasks) {
+    const scored = mm.models.map((m) => ({ m, c: mm.matrix[t][m] })).filter((x) => x.c).map((x) => ({ m: x.m, score: x.c.mean }));
+    if (!scored.length) continue;
+    const best = scored.reduce((a, b) => (b.score > a.score ? b : a));
+    const cheapest = scored.filter((x) => x.score >= best.score - TOL).sort((a, b) => costRankS(a.m) - costRankS(b.m))[0];
+    if (cheapest && costRankS(cheapest.m) < costRankS(best.m)) {
+      downgrades.push({ task: t, from: best.m, to: cheapest.m, savingsPct: Math.round((1 - costRankS(cheapest.m) / costRankS(best.m)) * 100) });
+    }
+  }
+  const applied = [];
+  try {
+    const tp = JSON.parse(readFileSync(join(HERE, "..", "task-profiles.json"), "utf8"));
+    const walk = (obj, path) => { for (const [k, v] of Object.entries(obj || {})) { if (k === "model" && typeof v === "string" && costRankS(v) <= 2) applied.push({ profile: path || "(root)", model: v }); else if (v && typeof v === "object") walk(v, path ? `${path}.${k}` : k); } };
+    walk(tp.profiles || {}, "");
+  } catch { /* */ }
+  return { totalTokens, byWorkflow, downgrades, applied };
+}
+
 // ── IDE actions (launch / cancel / approve) ──────────────────────────────────
 const SMITHERS_BIN = process.env.SMITHERS_BIN || join(HERE, "node_modules/.bin/smithers");
 const WF_DIRS = [HERE, join(HERE, "workflows")];
@@ -491,6 +521,8 @@ app.get("/api/model-limits", (c) => c.json(listLimits()));
 app.get("/api/models", (c) => c.json(liveModels()));
 // Read: model x task-kind performance matrix (best model per task) for the dashboard.
 app.get("/api/model-matrix", (c) => c.json(modelMatrix()));
+// Read: efficiency view — tokens by workflow + downgrade savings + applied.
+app.get("/api/efficiency", (c) => c.json(efficiency()));
 // Read: preflight a prospective launch's settings (advisory; no side effects).
 app.post("/api/preflight", async (c) => {
   const body = await c.req.json().catch(() => ({}));

@@ -55,7 +55,7 @@
 //               Mamba-Transformer MoE, built for long-running agentic/tool-loop
 //               work — capable-tier default). Adopted 2026-06-13.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { clampOutput } from "./lib/model-limits.js";
 
@@ -126,6 +126,14 @@ function maxOut(cheap, capDefault, cheapDefault) {
     : Number(env.CHAD_MAX_OUTPUT_TOKENS || capDefault);
 }
 
+// championSystem — the arena's current winning drafter system prompt, written by
+// experiments.jsx to state/champion-prompt.json when a drafter-prompt champion is
+// promoted. Closes the value loop: draft-tier agents adopt it automatically.
+// Returns undefined if none has been exported yet.
+function championSystem() {
+  try { const s = JSON.parse(readFileSync(new URL("./state/champion-prompt.json", import.meta.url), "utf8")).system; return s || undefined; } catch { return undefined; }
+}
+
 // ── Backend constructors ─────────────────────────────────────────────────────
 // Each returns a Smithers-compatible agent instance. `cheap` controls token
 // ceilings so single-turn work stays frugal.
@@ -159,8 +167,9 @@ const backends = {
       : (env.CHAD_REASONING !== "off"));
     return new ToolLoopAgent({
       model,
-      // "detailed thinking on" = Nemotron reasoning; prepended to any task system.
-      ...(reasoning ? { instructions: "detailed thinking on", allowSystemInMessages: true } : {}),
+      // System = the arena-winning drafter prompt (opts.system, draft roles) + the
+      // reasoning directive when on. Either present → set instructions.
+      ...(() => { const sys = [opts.system, reasoning ? "detailed thinking on" : null].filter(Boolean).join("\n\n"); return sys ? { instructions: sys, allowSystemInMessages: true } : {}; })(),
       // Frugal tier budget (env-overridable), CLAMPED to the model's registry
       // ceiling so a launch/override can never request more than the model supports.
       // Give reasoning runs token HEADROOM so chain-of-thought doesn't eat the whole
@@ -297,7 +306,9 @@ export function pickAgent(role, opts = {}) {
   const backend = opts.backend || (tier === "capable" ? autoCapable() : autoCheap());
   const ctor = backends[backend];
   if (!ctor) throw new Error(`agents.js: unknown backend "${backend}"`);
-  return ctor({ cheap: tier === "cheap", ...opts });
+  // Draft-role agents adopt the arena's winning drafter prompt as their system.
+  const system = opts.system ?? (role === "draft" ? championSystem() : undefined);
+  return ctor({ cheap: tier === "cheap", ...opts, system });
 }
 
 // ── Backend availability (for safe fallback selection) ───────────────────────

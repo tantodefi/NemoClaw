@@ -441,7 +441,7 @@ function svgLines(series,{w=340,h=130,max=1}={}){ const pad=18,n=Math.max(2,...s
 async function loadExperiments(){
   const el=document.getElementById("experiments");
   try{
-    const [exp,rr,mm]=await Promise.all([api("/api/experiments"),api("/api/runs").catch(()=>({runs:[]})),api("/api/model-matrix").catch(()=>null)]);
+    const [exp,rr,mm,eff]=await Promise.all([api("/api/experiments"),api("/api/runs").catch(()=>({runs:[]})),api("/api/model-matrix").catch(()=>null),api("/api/efficiency").catch(()=>null)]);
     const {population,report}=exp;
     const nights=(rr.runs||[]).filter(r=>r.workflow_name==="chad-experiments");
     const cands=(population.candidates||[]).slice().sort((a,b)=>(b.rollingMean||0)-(a.rollingMean||0));
@@ -478,10 +478,24 @@ async function loadExperiments(){
       ${recs.length?recs.map(r=>`<div class="card" style="padding:8px 12px"><b class="mono">${esc(r.task)}</b> → use <b>${esc(short(r.use))}</b> <span class="muted">(${r.useScore})</span> instead of ${esc(short(r.vs))} <span class="muted">(${r.vsScore})</span> — within ${TOL}pts at a cheaper tier. <a href="#" onclick="openLaunch('workflows/token-optimize.jsx');return false">propose ↗</a></div>`).join(""):'<div class="muted">none — each task is already on its cheapest within-tolerance model (or no benchmark data yet).</div>'}
       <h3>run outcomes — all workflows</h3>
       <div class="row" style="gap:10px;flex-wrap:wrap">${Object.entries(outc).sort((a,b)=>b[1]-a[1]).map(([s,n])=>`${pill(s)}&nbsp;<b>${n}</b>`).join("")||'<span class=muted>no runs</span>'}</div>`;
+    // efficiency: tokens by workflow + downgrade savings + already-cheap profiles
+    const fmtTok=(n)=>n>=1000?(n/1000).toFixed(1)+"k":String(n||0);
+    const effBars=eff&&eff.byWorkflow?Object.entries(eff.byWorkflow).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([w,v])=>({label:String(w).replace(/^chad-/,""),value:v,color:"var(--blue)"})):[];
+    const maxTok=effBars.length?Math.max(...effBars.map(b=>b.value)):1;
+    const effHtml=eff?`
+      <h3>efficiency — ${fmtTok(eff.totalTokens)} tokens across all runs</h3>
+      <div class="row" style="gap:24px;flex-wrap:wrap;align-items:flex-start">
+        <div style="flex:1;min-width:280px"><div class="muted" style="font-size:11px;margin-bottom:4px">tokens by workflow</div>${effBars.length?svgBars(effBars,{max:maxTok}):'<div class=muted>no token data yet</div>'}</div>
+        <div style="flex:1;min-width:280px"><div class="muted" style="font-size:11px;margin-bottom:4px">downgrade savings</div>
+          ${eff.downgrades&&eff.downgrades.length?eff.downgrades.map(d=>`<div style="font-size:12px">${esc(d.task)}: <b>${esc(short(d.from))}→${esc(short(d.to))}</b> <span style="color:var(--green)">~${d.savingsPct}% cheaper tier</span></div>`).join(""):'<div class=muted>none — tasks already on the cheapest within tolerance</div>'}
+          <div class="muted" style="font-size:11px;margin-top:6px">✓ ${(eff.applied||[]).length} task-profile(s) already on a cheap (super/nano) tier</div>
+        </div>
+      </div>`:"";
     el.innerHTML=`<div class="row"><h2 style="flex:1">Experiments — evolutionary arena</h2>
         <span class="meta">🏆 ${by.champion} champions · ${by.active} active · 🪦 ${by.retired} retired</span></div>
       ${matrixHtml}
       ${chartsHtml}
+      ${effHtml}
       <h3>nightly runs (${nights.length})</h3>
       ${nights.length?`<table><thead><tr><th>night</th><th>status</th><th>dur</th><th>run</th></tr></thead><tbody>${
         nights.map(r=>`<tr class="run" style="cursor:pointer" onclick="switchTab('runs');selectRun('${esc(r.run_id)}')">
