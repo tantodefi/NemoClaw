@@ -23,6 +23,12 @@ fi
 export CHAD_INFERENCE_BASE_URL="${CHAD_INFERENCE_BASE_URL:-https://integrate.api.nvidia.com/v1}"
 export CHAD_CAPABLE_BACKEND="${CHAD_CAPABLE_BACKEND:-nemotron}"
 export CHAD_CHEAP_BACKEND="${CHAD_CHEAP_BACKEND:-nemotron}"
+# Headless: CLI agents (claude/codex/opencode) can't auth under launchd and the
+# host claude hooks pollute output — keep selection AND fallback nemotron-only.
+export CHAD_DISABLE_CLI_AGENTS="${CHAD_DISABLE_CLI_AGENTS:-1}"
+# NB: the cheap tier defaults to Super 120B (reasoning-off, ~3s) in agents.js — fast
+# enough for the 120s cheap cap. Ultra 550B (~7 tok/s) is capable-tier only. Set
+# CHAD_NEMOTRON_MODEL here only to pin a different cheap model for ops workflows.
 
 LOCK="/tmp/chad-wf-$(basename "$WF" .jsx).lock.d"
 if ! mkdir "$LOCK" 2>/dev/null; then

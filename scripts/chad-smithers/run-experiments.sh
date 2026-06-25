@@ -44,6 +44,9 @@ fi
 export CHAD_INFERENCE_BASE_URL="${CHAD_INFERENCE_BASE_URL:-https://integrate.api.nvidia.com/v1}"
 export CHAD_CAPABLE_BACKEND="${CHAD_CAPABLE_BACKEND:-nemotron}"
 export CHAD_CHEAP_BACKEND="${CHAD_CHEAP_BACKEND:-nemotron}"
+# Headless: CLI agents (claude/codex/opencode) can't auth under launchd and the
+# host claude hooks pollute output — keep selection AND fallback nemotron-only.
+export CHAD_DISABLE_CLI_AGENTS="${CHAD_DISABLE_CLI_AGENTS:-1}"
 # self-improve reads pod cron telemetry (~/.openclaw/cron-runs.jsonl) over ssh;
 # without this it sees no signal and proposes nothing. Best-effort (graceful if absent).
 export CHAD_SIGNAL_SSH="${CHAD_SIGNAL_SSH:-openshell-chad}"

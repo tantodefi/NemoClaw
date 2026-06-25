@@ -34,17 +34,31 @@
 // ── Env knobs ──────────────────────────────────────────────────────────────
 //   CHAD_INFERENCE_BASE_URL   OpenAI-compatible base (default chad-shim).
 //   NVIDIA_API_KEY            key for the hosted Nemotron / NIM path.
-//   CHAD_NEMOTRON_MODEL       cheap-tier Nemotron id (default Ultra 550B; set to
-//                             Super 120B for a latency-sensitive path).
+//   CHAD_NEMOTRON_MODEL       cheap-tier Nemotron id (default Super 120B — fast,
+//                             ~3s reasoning-off; Ultra is too slow for cheap work).
 //   CHAD_NEMOTRON_CAPABLE_MODEL  capable-tier Nemotron id (default Ultra 550B).
-//   CHAD_REASONING            on|off. Default is TIER-AWARE: capable ON, cheap OFF
-//                             (cheap single-turn + reasoning + small cap → empty
-//                             output). "on"/"off" forces BOTH tiers.
+//   CHAD_REASONING            on|off. Default is TIER-AWARE: capable ON, cheap OFF.
+//                             Enforced via reasoning_effort/chat_template_kwargs
+//                             body injection (the "detailed thinking off" system
+//                             directive is a NO-OP on Nemotron-3). Reasoning-on with
+//                             a small cap eats the budget → empty output, so cheap
+//                             stays off. "on"/"off" forces BOTH tiers.
 //   CHAD_LOCAL_BASE_URL       lmstudio OpenAI-compatible (default 127.0.0.1:1234/v1).
 //   CHAD_LOCAL_MODEL          local model id (default google/gemma-3-4b).
 //   CHAD_CAPABLE_BACKEND      force the capable tier: claudecode|codex|nemotron|
 //                             opencode|anthropic|local. Unset = auto-detect.
 //   CHAD_CHEAP_BACKEND        force the cheap tier (default nemotron).
+//   CHAD_DISABLE_CLI_AGENTS   "1" removes the CLI-backed agents (claude/codex/
+//                             opencode) from BOTH auto-selection and fallback.
+//                             Set by the cron wrappers: under launchd the CLIs
+//                             can't auth (subscription/keychain is GUI-bound) and
+//                             the host `claude` hooks pollute output, so headless
+//                             runs stay nemotron-only (retries re-run nemotron).
+//   CHAD_CLAUDE_SETTING_SOURCES  comma list passed to `claude --setting-sources`
+//                             (default "project,local"): EXCLUDES user-level
+//                             settings so host lifecycle hooks (claude-mem
+//                             SessionStart, …) don't inject hook events into the
+//                             stream-json parser → AGENT_CLI_ERROR. Auth survives.
 //   CHAD_OPENCODE_MODEL       the "big pickle" model id once confirmed (pending).
 //   ANTHROPIC_API_KEY         enables the @ai-sdk/anthropic fallback (only used
 //                             if present AND credits restored — API is 402 today).
@@ -92,15 +106,23 @@ function binOnPath(bin) {
 let _probe;
 export function probe() {
   if (_probe) return _probe;
+  // Headless gate: under launchd the CLI-backed agents (claude/codex/opencode)
+  // can't authenticate (subscription/keychain is GUI-bound) and the host
+  // `claude` lifecycle hooks pollute the stream-json output the parser expects
+  // (caused the mcp-health AGENT_CLI_ERROR via the claudecode fallback). The
+  // cron wrappers set CHAD_DISABLE_CLI_AGENTS=1 so these never enter selection
+  // OR fallback and a scheduled run stays nemotron-only.
+  const cliOff = env.CHAD_DISABLE_CLI_AGENTS === "1";
   _probe = {
     nvidiaKey: Boolean(env.NVIDIA_API_KEY || env.OPENAI_API_KEY),
     anthropicKey: Boolean(env.ANTHROPIC_API_KEY),
     shimUrl: env.CHAD_INFERENCE_BASE_URL || "http://127.0.0.1:8901/v1",
     localUrl: env.CHAD_LOCAL_BASE_URL || "http://127.0.0.1:1234/v1",
     sdk: Boolean(ToolLoopAgent && createOpenAICompatible),
-    claudeCli: binOnPath("claude") && Boolean(ClaudeCodeAgent),
-    codexCli: binOnPath("codex") && Boolean(CodexAgent),
-    opencodeCli: binOnPath("opencode") && Boolean(OpenCodeAgent),
+    claudeCli: !cliOff && binOnPath("claude") && Boolean(ClaudeCodeAgent),
+    codexCli: !cliOff && binOnPath("codex") && Boolean(CodexAgent),
+    opencodeCli: !cliOff && binOnPath("opencode") && Boolean(OpenCodeAgent),
+    cliDisabled: cliOff,
     // Anthropic API returns 402 (no credits) as of 2026-06; set
     // CHAD_ANTHROPIC_CREDITS_OK=1 once restored to let the fallback engage.
     anthropicApi402: env.CHAD_ANTHROPIC_CREDITS_OK !== "1",
@@ -108,12 +130,44 @@ export function probe() {
   return _probe;
 }
 
+// ── Nemotron-3 reasoning control ─────────────────────────────────────────────
+// VERIFIED 2026-06-22: the "detailed thinking on/off" SYSTEM directive is a NO-OP
+// on Nemotron-3 (every model reasoned regardless). Reasoning is ON by default and
+// only `reasoning_effort:"none"` / `chat_template_kwargs:{thinking:false}` actually
+// disable it. The AI-SDK has no first-class field for chat_template_kwargs, so when
+// reasoning should be OFF we inject both into the request body via a fetch wrapper.
+// This matters because reasoning-on quietly ate the cheap 2048-token budget →
+// EMPTY answers (the "empty response" bug) and pushed Ultra past the 120s cap.
+function reasoningOffFetch(baseFetch = fetch) {
+  return async (url, init) => {
+    if (init && typeof init.body === "string" && init.body.includes('"messages"')) {
+      try {
+        const b = JSON.parse(init.body);
+        // `reasoning_effort:"none"` + `chat_template_kwargs` are NEMOTRON-3
+        // EXTENSIONS. Strict OpenAI-style validators (gpt-oss, llama-4, … via NIM)
+        // REJECT reasoning_effort:"none" with a 400 (must be low|medium|high) — so
+        // only inject for Nemotron models. Other models keep their default (which is
+        // fine for fusion panelists); this avoids breaking the non-Nemotron panel.
+        if (/nemotron/i.test(String(b.model || ""))) {
+          b.reasoning_effort = "none";
+          b.chat_template_kwargs = { ...(b.chat_template_kwargs || {}), thinking: false };
+          init = { ...init, body: JSON.stringify(b) };
+        }
+      } catch { /* non-JSON body — leave as-is */ }
+    }
+    return baseFetch(url, init);
+  };
+}
+
 // ── OpenAI-compatible provider factory (Nemotron / NIM / local) ──────────────
-function openaiCompatModel(baseURL, modelId, apiKey, name) {
+function openaiCompatModel(baseURL, modelId, apiKey, name, reasoningOff = false) {
   if (!createOpenAICompatible) {
     throw new Error("agents.js: @ai-sdk/openai-compatible not installed — run `bun install`");
   }
-  const provider = createOpenAICompatible({ name, baseURL, apiKey: apiKey || "not-needed" });
+  const provider = createOpenAICompatible({
+    name, baseURL, apiKey: apiKey || "not-needed",
+    ...(reasoningOff ? { fetch: reasoningOffFetch() } : {}),
+  });
   return provider(modelId);
 }
 
@@ -134,6 +188,19 @@ function championSystem() {
   try { const s = JSON.parse(readFileSync(new URL("./state/champion-prompt.json", import.meta.url), "utf8")).system; return s || undefined; } catch { return undefined; }
 }
 
+// directiveSystem — operator-configured system-prompt additions from
+// state/directives.json (systemPrompts: { all, <role> }), injected into EVERY
+// pickAgent call. The in-app Directives tab edits this file; empty strings inject
+// nothing (opt-in). Lets the operator enforce house style / guardrails / focus
+// across all workflows without touching code.
+function directiveSystem(role) {
+  try {
+    const sp = JSON.parse(readFileSync(new URL("./state/directives.json", import.meta.url), "utf8")).systemPrompts || {};
+    const s = [sp.all, sp[role]].filter((x) => x && String(x).trim()).join("\n\n");
+    return s || undefined;
+  } catch { return undefined; }
+}
+
 // ── Backend constructors ─────────────────────────────────────────────────────
 // Each returns a Smithers-compatible agent instance. `cheap` controls token
 // ceilings so single-turn work stays frugal.
@@ -150,34 +217,40 @@ const backends = {
     // opts.model lets a workflow/experiment request ANY model in NVIDIA's
     // OpenAI-compatible catalog (gpt-oss-120b, deepseek-v4-pro, llama-4-maverick,
     // kimi-k2.6, nemotron-nano-omni-reasoning, …) for parallel A/B + fusion.
+    // Tier defaults (verified 2026-06-22, speed vs quality): CHEAP single-turn →
+    // Super 120B (~3s reasoning-off, frontier-tier 120B quality); CAPABLE tool-loop/
+    // judge → Ultra 550B (best reasoning, ~7 tok/s is fine there). Ultra was the
+    // WRONG cheap default — it generates ~1085 tok in 145-166s, blowing the 120s
+    // cheap cap. Override per tier with CHAD_NEMOTRON_MODEL / _CAPABLE_MODEL.
     const modelId = opts.model
       || (opts.cheap
-        ? (env.CHAD_NEMOTRON_MODEL || "nvidia/nemotron-3-ultra-550b-a55b")
+        ? (env.CHAD_NEMOTRON_MODEL || "nvidia/nemotron-3-super-120b-a12b")
         : (env.CHAD_NEMOTRON_CAPABLE_MODEL || "nvidia/nemotron-3-ultra-550b-a55b"));
-    const model = openaiCompatModel(
-      p.shimUrl, modelId, env.NVIDIA_API_KEY || env.OPENAI_API_KEY, "chad-nemotron",
-    );
-    // Tier-aware reasoning default. CHEAP single-turn work defaults reasoning OFF:
-    // with a small token cap, "detailed thinking on" can consume the entire budget
-    // and return an EMPTY final answer (finishReason=length, textLength=0 →
-    // INVALID_OUTPUT — the failure bug-report kept catching). CAPABLE tool-loop work
-    // keeps reasoning on. Force either tier with opts.reasoning or CHAD_REASONING=on|off.
+    // Tier-aware reasoning. CHEAP → OFF (fast; leaves the whole token budget for
+    // the answer — reasoning-on previously ate the 2048 cap → EMPTY answers).
+    // CAPABLE → ON. Force with opts.reasoning or CHAD_REASONING=on|off. The control
+    // is request-body injection (reasoningOffFetch), NOT a system directive (no-op).
     const reasoning = opts.reasoning ?? (opts.cheap
       ? (env.CHAD_REASONING === "on")
       : (env.CHAD_REASONING !== "off"));
+    const model = openaiCompatModel(
+      p.shimUrl, modelId, env.NVIDIA_API_KEY || env.OPENAI_API_KEY, "chad-nemotron", !reasoning,
+    );
     return new ToolLoopAgent({
       model,
-      // System = the arena-winning drafter prompt (opts.system, draft roles) + the
-      // reasoning directive when on. Either present → set instructions.
-      ...(() => { const sys = [opts.system, reasoning ? "detailed thinking on" : null].filter(Boolean).join("\n\n"); return sys ? { instructions: sys, allowSystemInMessages: true } : {}; })(),
+      // System = the arena-winning drafter prompt (opts.system, draft roles) only.
+      // The reasoning directive is gone — it never worked; reasoning is controlled
+      // at the request-body level (see reasoningOffFetch / openaiCompatModel).
+      ...(opts.system ? { instructions: opts.system, allowSystemInMessages: true } : {}),
       // Frugal tier budget (env-overridable), CLAMPED to the model's registry
-      // ceiling so a launch/override can never request more than the model supports.
-      // Give reasoning runs token HEADROOM so chain-of-thought doesn't eat the whole
-      // budget and leave nothing for the answer (clamped to the model's ceiling).
+      // ceiling. With reasoning truly off, 2048 is ample for a direct answer;
+      // reasoning-on tiers get headroom so chain-of-thought doesn't starve the answer.
       maxOutputTokens: clampOutput(modelId, maxOut(opts.cheap, reasoning ? 32768 : 16384, reasoning ? 8192 : 2048)),
       maxSteps: opts.cheap ? (reasoning ? 2 : 1) : (opts.maxSteps ?? 12),
       // Abort the AI-SDK call if the hosted model hangs (connection released).
-      timeout: { totalMs: opts.cheap ? CHEAP_TIMEOUT_MS : CAPABLE_TIMEOUT_MS },
+      // opts.timeoutMs lets a task pin extra headroom — e.g. a cheap-tier task
+      // deliberately on the slow Ultra (email draft) needs more than the 120s cap.
+      timeout: { totalMs: opts.timeoutMs ?? (opts.cheap ? CHEAP_TIMEOUT_MS : CAPABLE_TIMEOUT_MS) },
       ...opts.agent,
     });
   },
@@ -232,6 +305,12 @@ const backends = {
       timeoutMs: opts.timeoutMs ?? 900_000,
       // Default skip = autonomous + non-blocking; flip for the approval ladder.
       dangerouslySkipPermissions: opts.approvalRouting ? false : true,
+      // Autonomous runs EXCLUDE user-level settings so host lifecycle hooks
+      // (claude-mem SessionStart, …) don't inject `hook_started` events into the
+      // stream-json the parser expects → AGENT_CLI_ERROR. Verified: dropping
+      // "user" keeps OAuth/subscription auth (subtype:success). The approval
+      // ladder WANTS the user hooks (Moshi phone), so it loads ALL sources.
+      ...(opts.approvalRouting ? {} : { settingSources: env.CHAD_CLAUDE_SETTING_SOURCES || "project,local" }),
       ...opts.agent,
     });
   },
@@ -306,8 +385,11 @@ export function pickAgent(role, opts = {}) {
   const backend = opts.backend || (tier === "capable" ? autoCapable() : autoCheap());
   const ctor = backends[backend];
   if (!ctor) throw new Error(`agents.js: unknown backend "${backend}"`);
-  // Draft-role agents adopt the arena's winning drafter prompt as their system.
-  const system = opts.system ?? (role === "draft" ? championSystem() : undefined);
+  // Compose the agent's system prompt: an explicit opts.system wins; otherwise the
+  // arena's winning drafter prompt (draft role only) PLUS the operator's directive
+  // system prompt (all roles, from the Directives tab). Either may be empty.
+  const auto = [role === "draft" ? championSystem() : undefined, directiveSystem(role)].filter(Boolean).join("\n\n");
+  const system = opts.system ?? (auto || undefined);
   return ctor({ cheap: tier === "cheap", ...opts, system });
 }
 
@@ -335,6 +417,11 @@ function backendAvailable(b) {
  * panelists, where you want that specific model or nothing (use continueOnFail).
  */
 export function pickFallback(role, opts = {}) {
+  // Headless/cron: nemotron-only, no cross-backend fallback. Smithers' own retry
+  // re-runs the primary (nemotron) — the right behavior when no other backend can
+  // auth headless. Prevents escaping to claudecode (the mcp-health failure) or a
+  // local lmstudio that isn't running under launchd.
+  if (probe().cliDisabled) return undefined;
   const tier = opts.tier || ROLE_TIER[role] || "cheap";
   const primary = opts.backend || (tier === "capable" ? autoCapable() : autoCheap());
   const order = tier === "capable"

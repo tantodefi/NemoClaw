@@ -1,0 +1,18 @@
+{
+  "_comment": "Operator directives that steer Chad's self-improvement loops. Edit in the dashboard Directives tab (or here). TRACKED input. Two effects: (1) `experiments` free-text steers the arena's breeding (reflective mutation) and scoring (judge); (2) `systemPrompts` are optional system-prompt additions agents.js injects into EVERY workflow's agent calls (all + per-role). Empty strings = no injection (opt-in).",
+  "_updated": "2026-06-24",
+  "experiments": "Prioritize operator-facing draft quality: warm, specific, exactly one concrete next step, never hedge. For physical-training advice always include exactly one safety cue. Be moderately creative when breeding new prompts, but never trade away safety or specificity for novelty. Favor robustness against terse, ambiguous, or multi-intent inputs. Retire prompts that are verbose or generic.",
+  "creativity": "moderate",
+  "priorities": [
+    "draft",
+    "summarize",
+    "classify"
+  ],
+  "systemPrompts": {
+    "_doc": "Injected by agents.js#directiveSystem. Key by role (draft|classify|summarize|judge|evaluate|optimize|...) or 'all'. Empty = nothing injected. Use to enforce house style or guardrails across every workflow request.",
+    "all": "",
+    "draft": "",
+    "judge": ""
+  },
+  "_updatedBy": "key-auth"
+}

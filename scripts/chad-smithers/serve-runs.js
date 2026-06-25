@@ -26,12 +26,14 @@
 
 import { Hono } from "hono";
 import { Database } from "bun:sqlite";
-import { readdirSync, readFileSync, writeFileSync, existsSync, statSync, symlinkSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync, existsSync, statSync, symlinkSync, unlinkSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn, execFileSync } from "node:child_process";
 import { preflight, listLimits } from "./lib/model-limits.js";
+import { scanSignal } from "./lib/signal.js";
+import { harvestFixtures } from "./lib/fixtures.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.CHAD_RUNS_PORT || 7331);
@@ -54,10 +56,26 @@ const HOST_CREDS = process.env.CHAD_HOST_CREDS || "/Users/r/.nemoclaw/credential
 // Per-model liveness probe written by nvidia-liveness.py (1-token probe per model,
 // daily). Used to show only currently-live models in the launch drawer.
 const LIVENESS_FILE = process.env.CHAD_LIVENESS_FILE || join(dirname(HOST_CREDS), "openwebui/liveness.json");
-// Approval push notifications (best-effort). Channels in CHAD_APPROVAL_NOTIFY
-// (comma list): `browser` is handled client-side; `webui`/`email` dispatch from
-// here via the pod. Off by default — set on the chad-runs-ui service to enable.
-const NOTIFY_CHANNELS = (process.env.CHAD_APPROVAL_NOTIFY || "").split(",").map((s) => s.trim()).filter(Boolean);
+// Approval push notifications (best-effort). The default channel set comes from
+// CHAD_APPROVAL_NOTIFY (comma list) but is now LIVE-EDITABLE from the Approvals
+// tab → persisted to state/notify-config.json (so a change sticks without a
+// service restart). `browser` is client-side; `webui`/`email` dispatch via the
+// pod here; `telegram` needs an openclaw channel (advertised, not yet wired).
+const NOTIFY_DEFAULT = (process.env.CHAD_APPROVAL_NOTIFY || "").split(",").map((s) => s.trim()).filter(Boolean);
+const NOTIFY_CFG_PATH = join(HERE, "state", "notify-config.json");
+const AVAILABLE_CHANNELS = [
+  { id: "browser", label: "Browser push", ready: true, note: "desktop/PWA notification — enable per-browser via the 🔔 bell" },
+  { id: "webui", label: "OpenWebUI note", ready: true, note: "posts a note via the pod chad-webui" },
+  { id: "email", label: "Email", ready: true, note: "emails the operator via chad-mail-send" },
+  { id: "telegram", label: "Telegram / WhatsApp", ready: false, note: "needs an openclaw channel configured on the pod" },
+];
+function liveNotifyChannels() {
+  try { const s = JSON.parse(readFileSync(NOTIFY_CFG_PATH, "utf8")).channels; if (Array.isArray(s)) return s; } catch { /* */ }
+  return NOTIFY_DEFAULT;
+}
+function saveNotifyChannels(channels) {
+  try { mkdirSync(dirname(NOTIFY_CFG_PATH), { recursive: true }); writeFileSync(NOTIFY_CFG_PATH, JSON.stringify({ channels, updatedAt: Date.now() }, null, 2)); return true; } catch { return false; }
+}
 const POD_SSH = process.env.CHAD_POD_SSH || "openshell-chad";
 const POD_WEBUI = process.env.CHAD_WEBUI_POD_BIN || "/sandbox/.openclaw-data/bin/chad-webui";
 const OPERATOR_EMAIL = process.env.CHAD_OPERATOR_EMAIL || "tantodefi@proton.me";
@@ -188,7 +206,20 @@ function allRuns() {
       });
     } catch { /* skip unreadable/locked db */ }
   }
+  // Tag runs that belong to a workflow chain so the UI can badge + cross-link them.
+  const cidx = chainRunIndex();
+  for (const r of runs) { const c = cidx[r.run_id]; if (c) { r.chainId = c.chainId; r.chainStep = c.step; r.chainSteps = c.total; r.chainStatus = c.chainStatus; } }
   return runs.sort((a, b) => (b.created_at_ms ?? 0) - (a.created_at_ms ?? 0));
+}
+// runId -> { chainId, step (1-based), total, chainStatus } across all chains.
+function chainRunIndex() {
+  const m = {};
+  try {
+    for (const ch of loadChains()) (ch.steps || []).forEach((s, i) => {
+      if (s.runId) m[s.runId] = { chainId: ch.id, step: i + 1, total: ch.steps.length, chainStatus: ch.status };
+    });
+  } catch { /* */ }
+  return m;
 }
 
 // Full detail for one run: the run row, its task attempts, and any workflow
@@ -264,6 +295,10 @@ function modelMatrix() {
           if (!Array.isArray(arr)) continue;
           for (const s of arr) {
             if (!s || typeof s.scorePct !== "number" || !s.candidate || !s.model) continue;
+            // Drop junk from early test runs: real task-kinds are lowercase slugs
+            // and real models are namespaced ids ("/"). Filters the "Chad"/prose
+            // candidates and gpt-4 / "unknown" placeholder models out of the matrix.
+            if (!/^[a-z0-9][a-z0-9-]*$/.test(String(s.candidate)) || !String(s.model).includes("/")) continue;
             tasks.add(s.candidate); models.add(s.model);
             const k = `${s.candidate} ${s.model}`;
             (cell[k] ??= { sum: 0, n: 0 }); cell[k].sum += s.scorePct; cell[k].n += 1;
@@ -291,14 +326,74 @@ function modelMatrix() {
 // rough inference-cost tier (cheaper = lower) — mirrors the dashboard's costRank.
 function costRankS(m) { m = String(m); if (/nano/.test(m)) return 1; if (/super|flash|gemma|gpt-oss|mini\b/.test(m)) return 2; if (/claude-opus/.test(m)) return 5; if (/claude/.test(m)) return 4; if (/ultra|deepseek-v4-pro|397|maverick|kimi|glm-5|minimax|405|step-3/.test(m)) return 3; return 2; }
 
-// Efficiency view: total tokens (by workflow) across all runs + the downgrade
-// opportunities (from the model×task matrix) and which tasks are ALREADY on a cheap
-// tier in task-profiles.json — the "measure of value/efficiency" the operator asked for.
+// ── Cost model (rough $/1M-token estimates) ──────────────────────────────────
+// Powers the "money/tokens saved" widget. Two framings: (1) the FRONTIER
+// counterfactual — what every token would cost on a top frontier model — vs the
+// ~$0 we actually pay (Nemotron is free via the NVIDIA key); (2) the
+// token-optimize downgrade math (from-tier vs to-tier $). All estimates, tunable
+// in state/model-costs.json (tracked).
+let _costs;
+function costTable() {
+  if (_costs) return _costs;
+  let cfg = {};
+  try { cfg = JSON.parse(readFileSync(join(HERE, "state/model-costs.json"), "utf8")); } catch { /* */ }
+  const tiers = cfg.tiers || { frontier: [15, 75], large: [3, 12], mid: [0.6, 2.4], small: [0.1, 0.4], free: [0, 0] };
+  _costs = {
+    tiers,
+    frontier: cfg.frontier?.per1M || tiers.frontier || [15, 75],
+    frontierLabel: cfg.frontier?.label || "frontier",
+    patterns: (cfg.patterns || []).map(([re, tier]) => [new RegExp(re, "i"), tier]),
+    defaultTier: cfg.defaultTier || "mid",
+    actualTier: cfg.actualTier || "free",
+  };
+  return _costs;
+}
+function rateFor(model) {
+  const c = costTable();
+  for (const [re, tier] of c.patterns) if (re.test(String(model))) return c.tiers[tier] || c.tiers[c.defaultTier];
+  return c.tiers[c.defaultTier] || [0.6, 2.4];
+}
+const dollars = (inTok, outTok, rate) => (inTok / 1e6) * rate[0] + (outTok / 1e6) * rate[1];
+const blend = (rate) => rate[0] * 0.3 + rate[1] * 0.7; // ~30/70 in/out mix → one $/1M number
+
+// Efficiency view: token volume (split in/out, by workflow + by model) across all
+// runs, the FRONTIER-vs-actual cost counterfactual, the downgrade opportunities
+// (with $ savings) from the model×task matrix, and which tasks are ALREADY cheap.
 function efficiency() {
-  let totalTokens = 0; const byWorkflow = {};
+  const c = costTable();
+  let inTok = 0, outTok = 0;
+  const byWorkflow = {}, byModel = {};
   for (const r of allRuns()) {
-    try { const t = runTelemetry(r.run_id).tokens.totalTokens || 0; totalTokens += t; byWorkflow[r.workflow_name] = (byWorkflow[r.workflow_name] || 0) + t; } catch { /* */ }
+    try {
+      const tel = runTelemetry(r.run_id).tokens;
+      const it = tel.inputTokens || 0, ot = (tel.outputTokens || 0) + (tel.reasoningTokens || 0);
+      inTok += it; outTok += ot;
+      const w = (byWorkflow[r.workflow_name] ||= { tokens: 0, inTok: 0, outTok: 0 });
+      w.inTok += it; w.outTok += ot; w.tokens += it + ot;
+      for (const n of Object.values(tel.byNode || {})) {
+        const m = n.model || "unknown";
+        const bm = (byModel[m] ||= { tokens: 0, inTok: 0, outTok: 0 });
+        const ni = n.inputTokens || 0, no = (n.outputTokens || 0) + (n.reasoningTokens || 0);
+        bm.inTok += ni; bm.outTok += no; bm.tokens += ni + no;
+      }
+    } catch { /* */ }
   }
+  const totalTokens = inTok + outTok;
+  const frontierCost = dollars(inTok, outTok, c.frontier);
+  const actualCost = dollars(inTok, outTok, c.tiers[c.actualTier] || [0, 0]);
+  // "at market rates" must cover ALL tokens: telemetry often lacks a model label
+  // (agentFamily unknown for Nemotron), so price the labeled subset per-model and
+  // the remainder at the default tier — else this badly undercounts vs frontier.
+  let listCost = 0, knownIn = 0, knownOut = 0;
+  for (const [m, b] of Object.entries(byModel)) { listCost += dollars(b.inTok, b.outTok, rateFor(m)); knownIn += b.inTok; knownOut += b.outTok; }
+  listCost += dollars(Math.max(0, inTok - knownIn), Math.max(0, outTok - knownOut), c.tiers[c.defaultTier] || [0.6, 2.4]);
+  for (const w of Object.values(byWorkflow)) w.frontierCost = dollars(w.inTok, w.outTok, c.frontier);
+  const cost = {
+    frontierLabel: c.frontierLabel, frontierRate: c.frontier,
+    frontierCost, actualCost, listCost, saved: frontierCost - actualCost,
+    byModel: Object.fromEntries(Object.entries(byModel)
+      .map(([m, b]) => [m, { ...b, estCost: dollars(b.inTok, b.outTok, rateFor(m)), frontierCost: dollars(b.inTok, b.outTok, c.frontier) }])),
+  };
   const mm = modelMatrix(); const TOL = 6; const downgrades = [];
   for (const t of mm.tasks) {
     const scored = mm.models.map((m) => ({ m, c: mm.matrix[t][m] })).filter((x) => x.c).map((x) => ({ m: x.m, score: x.c.mean }));
@@ -306,7 +401,10 @@ function efficiency() {
     const best = scored.reduce((a, b) => (b.score > a.score ? b : a));
     const cheapest = scored.filter((x) => x.score >= best.score - TOL).sort((a, b) => costRankS(a.m) - costRankS(b.m))[0];
     if (cheapest && costRankS(cheapest.m) < costRankS(best.m)) {
-      downgrades.push({ task: t, from: best.m, to: cheapest.m, savingsPct: Math.round((1 - costRankS(cheapest.m) / costRankS(best.m)) * 100) });
+      const bf = blend(rateFor(best.m)), bt = blend(rateFor(cheapest.m));
+      downgrades.push({ task: t, from: best.m, to: cheapest.m,
+        savingsPct: bf > 0 ? Math.round((1 - bt / bf) * 100) : 0,
+        savedPer1M: Math.round(Math.max(0, bf - bt) * 100) / 100 });
     }
   }
   const applied = [];
@@ -315,7 +413,68 @@ function efficiency() {
     const walk = (obj, path) => { for (const [k, v] of Object.entries(obj || {})) { if (k === "model" && typeof v === "string" && costRankS(v) <= 2) applied.push({ profile: path || "(root)", model: v }); else if (v && typeof v === "object") walk(v, path ? `${path}.${k}` : k); } };
     walk(tp.profiles || {}, "");
   } catch { /* */ }
-  return { totalTokens, byWorkflow, downgrades, applied };
+  return { totalTokens, inputTokens: inTok, outputTokens: outTok, byWorkflow, cost, downgrades, applied };
+}
+
+// ── Scheduled jobs (launchd timers) — read-only view ─────────────────────────
+// Parse the host LaunchAgents plists (schedule + what each runs) and cross-ref
+// `launchctl list` (loaded / running / last exit) + the workflow's last real run.
+const LAUNCH_AGENTS = join(process.env.HOME || "/Users/r", "Library/LaunchAgents");
+function parsePlist(path) {
+  try { return JSON.parse(execFileSync("plutil", ["-convert", "json", "-o", "-", path], { timeout: 5000 }).toString()); }
+  catch { return null; }
+}
+function launchctlState() {
+  const map = {};
+  try {
+    for (const line of execFileSync("launchctl", ["list"], { timeout: 5000 }).toString().split("\n")) {
+      const m = line.match(/^(\S+)\t(\S+)\t(dev\.nemoclaw\.chad-\S+)/);
+      if (m) map[m[3]] = { pid: m[1] === "-" ? null : Number(m[1]), lastExit: m[2] === "-" ? null : Number(m[2]) };
+    }
+  } catch { /* */ }
+  return map;
+}
+function humanSchedule(p) {
+  if (p.StartInterval) { const s = Number(p.StartInterval); return s % 3600 === 0 ? `every ${s / 3600}h` : s % 60 === 0 ? `every ${s / 60}m` : `every ${s}s`; }
+  const sci = p.StartCalendarInterval;
+  if (sci) {
+    const wd = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    return (Array.isArray(sci) ? sci : [sci]).map((c) =>
+      `${String(c.Hour ?? 0).padStart(2, "0")}:${String(c.Minute ?? 0).padStart(2, "0")}${c.Weekday != null ? " " + (wd[c.Weekday] || "wd" + c.Weekday) : ""}`).join(", ");
+  }
+  return p.RunAtLoad ? "at load only" : "—";
+}
+function classifyJob(args) {
+  const a = (args || []).map(String);
+  const rw = a.find((x) => x.endsWith("run-workflow.sh"));
+  if (rw) return { kind: "workflow", target: a[a.indexOf(rw) + 1] || null };
+  if (a.some((x) => x.endsWith("run-experiments.sh"))) return { kind: "workflow", target: "experiments.jsx", bundle: "+ token-optimize each run; bug-report/self-improve/skill-improve at 05:00" };
+  if (a.some((x) => x.endsWith("serve-runs.js"))) return { kind: "service", target: "runs dashboard (this UI)" };
+  if (a.some((x) => x.endsWith("refresh-models.js"))) return { kind: "ops", target: "model catalog refresh" };
+  return { kind: "infra", target: basename(a.find((x) => /\.(sh|js|py)$/.test(x)) || a[a.length - 1] || "") };
+}
+function schedules() {
+  const st = launchctlState(); const out = [];
+  let files = [];
+  try { files = readdirSync(LAUNCH_AGENTS).filter((f) => /^dev\.nemoclaw\.chad-.*\.plist$/.test(f)); } catch { /* */ }
+  for (const f of files) {
+    const p = parsePlist(join(LAUNCH_AGENTS, f)); if (!p) continue;
+    const label = p.Label || f.replace(/\.plist$/, "");
+    const cls = classifyJob(p.ProgramArguments);
+    const s = st[label] || {};
+    let lastRun = null;
+    if (cls.kind === "workflow" && cls.target) {
+      const db = dbForWorkflowFile(cls.target);
+      if (db) { try { lastRun = withDb(db, (d) => tableExists(d, "_smithers_runs") ? d.query("SELECT created_at_ms, status FROM _smithers_runs ORDER BY created_at_ms DESC LIMIT 1").get() : null); } catch { /* */ } }
+    }
+    out.push({
+      label: label.replace(/^dev\.nemoclaw\./, ""), kind: cls.kind, target: cls.target, bundle: cls.bundle || null,
+      schedule: humanSchedule(p), runAtLoad: !!p.RunAtLoad, loaded: label in st, running: s.pid != null,
+      lastExit: s.lastExit ?? null, lastRun,
+    });
+  }
+  const order = { workflow: 0, service: 1, ops: 2, infra: 3 };
+  return out.sort((a, b) => (order[a.kind] - order[b.kind]) || a.label.localeCompare(b.label));
 }
 
 // ── IDE actions (launch / cancel / approve) ──────────────────────────────────
@@ -447,27 +606,40 @@ app.get("/api/catalog", (c) => {
   });
   return c.json({ workflows });
 });
+// The serializable per-node control props the graph carries (agent/model are
+// runtime instances and are NOT in the graph JSON — for those the run DAG reads
+// the resolved model+tokens from telemetry.byNode). These are the "settings
+// passed into each node" the node inspector surfaces and lets you tweak.
+const NODE_CFG_KEYS = ["timeoutMs", "retries", "continueOnFail", "needsApproval",
+  "skipIf", "sideEffect", "waitAsync", "heartbeatTimeoutMs", "idempotencyKey", "output"];
+function nodeConfig(props = {}) {
+  const cfg = {};
+  for (const k of NODE_CFG_KEYS) if (props[k] !== undefined) cfg[k] = props[k];
+  return cfg;
+}
 // Parse a `smithers graph --format json` xml tree into a task DAG (sequence =
-// chain, parallel/branch = fan) for visual rendering (mermaid).
+// chain, parallel/branch = fan) for visual rendering (mermaid). Each task node
+// carries its type, the enclosing group (parallel/branch), and its declared
+// control config so the dashboard can inspect + tweak per-node settings.
 function graphToDag(xml) {
   const nodes = [], edges = []; let auto = 0;
   const idOf = (n) => n.props?.id || n.props?.name || (n.tag.replace("smithers:", "") + "_" + (auto++));
-  function walk(node, parents) {
+  function walk(node, parents, group) {
     const tag = (node.tag || "").replace("smithers:", "");
     const kids = node.children || [];
     if (tag === "task") {
       const id = idOf(node);
-      nodes.push({ id, label: node.props?.id || id });
+      nodes.push({ id, label: node.props?.id || id, type: "task", group, config: nodeConfig(node.props) });
       parents.forEach((p) => edges.push({ from: p, to: id }));
       return [id];
     }
     if (tag === "parallel" || tag === "branch") {
-      let outs = []; for (const k of kids) outs = outs.concat(walk(k, parents)); return outs.length ? outs : parents;
+      let outs = []; for (const k of kids) outs = outs.concat(walk(k, parents, tag)); return outs.length ? outs : parents;
     }
     // sequence / workflow / wrapper: chain children
-    let prev = parents; for (const k of kids) prev = walk(k, prev); return prev;
+    let prev = parents; for (const k of kids) prev = walk(k, prev, group); return prev;
   }
-  walk(xml, []);
+  walk(xml, [], null);
   return { nodes, edges };
 }
 app.get("/api/workflow-graph", (c) => {
@@ -523,6 +695,31 @@ app.get("/api/models", (c) => c.json(liveModels()));
 app.get("/api/model-matrix", (c) => c.json(modelMatrix()));
 // Read: efficiency view — tokens by workflow + downgrade savings + applied.
 app.get("/api/efficiency", (c) => c.json(efficiency()));
+// Read: scheduled jobs (launchd timers) — schedule, target workflow, live status.
+app.get("/api/schedules", (c) => c.json({ schedules: schedules() }));
+// Read: review-worthy run signal (failed/stale/low-quality) across all DBs.
+app.get("/api/signal", (c) => c.json(scanSignal(DB_DIR, { days: Number(c.req.query("days")) || 14 })));
+// Read: the arena fixture set — static (curated) + harvested (real run inputs).
+app.get("/api/fixtures", (c) => {
+  let stat = []; try { stat = JSON.parse(readFileSync(join(HERE, "state/fixtures.json"), "utf8")); } catch { /* */ }
+  let harvested = []; try { harvested = harvestFixtures(DB_DIR, { perKind: 2 }); } catch { /* */ }
+  return c.json({ static: stat, harvested });
+});
+// Read/write: operator directives steering the self-improvement loops. Injected
+// into experiment breeding/scoring (experiments.jsx) + every agent's system prompt
+// (agents.js#directiveSystem). Write is Access-gated like the other mutations.
+const DIRECTIVES_PATH = join(HERE, "state", "directives.json");
+app.get("/api/directives", (c) => { try { return c.json(JSON.parse(readFileSync(DIRECTIVES_PATH, "utf8"))); } catch { return c.json({}); } });
+app.post("/api/directives", async (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return c.json({ error: "body must be a JSON object" }, 400);
+  body._updated = new Date().toISOString().slice(0, 10); body._updatedBy = op;
+  try { mkdirSync(dirname(DIRECTIVES_PATH), { recursive: true }); writeFileSync(DIRECTIVES_PATH, JSON.stringify(body, null, 2) + "\n"); }
+  catch (e) { return c.json({ error: "save failed: " + e.message }, 500); }
+  console.error(`directives saved by ${op}`);
+  return c.json({ ok: true, savedBy: op });
+});
 // Read: preflight a prospective launch's settings (advisory; no side effects).
 app.post("/api/preflight", async (c) => {
   const body = await c.req.json().catch(() => ({}));
@@ -664,12 +861,187 @@ app.get("/api/approvals", (c) => {
     try {
       withDb(path, (db) => {
         if (!tableExists(db, "_smithers_approvals")) return;
-        for (const r of db.query("SELECT run_id, node_id, iteration, status, requested_at_ms, request_json FROM _smithers_approvals WHERE status IN ('pending','requested')").all())
+        // Only gates whose run is still live — a cancelled/finished run leaves its
+        // approval row as 'requested', which would otherwise show as a phantom
+        // pending gate (and inflate the badge) forever.
+        for (const r of db.query(
+          `SELECT a.run_id, a.node_id, a.iteration, a.status, a.requested_at_ms, a.request_json
+           FROM _smithers_approvals a JOIN _smithers_runs r ON a.run_id = r.run_id
+           WHERE a.status IN ('pending','requested')
+             AND r.status NOT IN ('finished','failed','cancelled','denied','errored')`).all())
           pending.push({ ...r, db: basename(path) });
       });
     } catch { /* */ }
   }
   return c.json({ pending });
+});
+// Approval-notify default: the channel set the server-side notifier dispatches on
+// (browser is client-side). Live-editable from the Approvals tab.
+app.get("/api/notify-config", (c) => c.json({ channels: liveNotifyChannels(), available: AVAILABLE_CHANNELS, default: NOTIFY_DEFAULT }));
+app.post("/api/notify-config", async (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  const valid = new Set(AVAILABLE_CHANNELS.map((x) => x.id));
+  const channels = (Array.isArray(body.channels) ? body.channels : []).filter((x) => valid.has(x));
+  saveNotifyChannels(channels);
+  console.error(`notify-config: [${channels.join(",") || "none"}] by ${op}`);
+  return c.json({ ok: true, channels });
+});
+
+// ── Workflow chaining ────────────────────────────────────────────────────────
+// String multiple workflows into a sequential pipeline: each step launches only
+// after the prior step reaches a terminal (finished) state, optionally feeding
+// the prior step's primary output in as the next step's ctx.input. A step that
+// pauses at an approval gate HOLDS the chain (the runner keeps polling) until the
+// operator approves in the Approvals tab — so chains compose cleanly with the
+// existing gate flow. Chains persist to state/chains/<id>.json, so an in-flight
+// chain survives a server restart and renders in the dashboard. Step launches
+// reuse the same bounded, allowlisted path as /api/launch (no arbitrary code/env).
+const CHAINS_DIR = join(HERE, "state", "chains");
+function loadChains() {
+  try {
+    return readdirSync(CHAINS_DIR).filter((f) => f.endsWith(".json"))
+      .map((f) => { try { return JSON.parse(readFileSync(join(CHAINS_DIR, f), "utf8")); } catch { return null; } })
+      .filter(Boolean).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  } catch { return []; }
+}
+function saveChain(ch) {
+  try { mkdirSync(CHAINS_DIR, { recursive: true }); writeFileSync(join(CHAINS_DIR, ch.id + ".json"), JSON.stringify(ch, null, 2)); } catch { /* */ }
+}
+function dbForWorkflowFile(name) {
+  const stem = basename(name).replace(/\.(jsx|tsx)$/, "");
+  for (const p of listDbs()) { const ds = basename(p).replace(/\.db$/, ""); if (stem === ds || stem.startsWith(ds + "-")) return p; }
+  return null;
+}
+// Newest run in the workflow's DB created since `sinceMs` — how we discover the
+// runId of a detached `smithers up` we just spawned (it generates the id itself).
+function findStepRun(name, sinceMs) {
+  const db = dbForWorkflowFile(name); if (!db) return null;
+  try {
+    return withDb(db, (d) => tableExists(d, "_smithers_runs")
+      ? d.query("SELECT run_id, status FROM _smithers_runs WHERE created_at_ms >= ? ORDER BY created_at_ms DESC LIMIT 1").get(sinceMs - 2000) : null);
+  } catch { return null; }
+}
+function findRunStatus(runId) {
+  for (const p of listDbs()) {
+    try { const r = withDb(p, (d) => tableExists(d, "_smithers_runs") ? d.query("SELECT status FROM _smithers_runs WHERE run_id=?").get(runId) : null); if (r) return r.status; } catch { /* */ }
+  }
+  return null;
+}
+// Primary output of a finished run, to feed the next step as input. Prefer a
+// report/result/synthesize/fusion table, else the last output table's last row.
+function runOutputPayload(runId) {
+  const d = runDetail(runId); if (!d) return null;
+  const tables = Object.keys(d.outputs || {}); if (!tables.length) return null;
+  const pick = ["report", "result", "synthesize", "fusion"].find((t) => tables.includes(t)) || tables[tables.length - 1];
+  const rows = d.outputs[pick] || []; const row = rows[rows.length - 1] || {};
+  const { run_id, node_id, iteration, ...rest } = row; void run_id; void node_id; void iteration;
+  return { table: pick, ...rest };
+}
+function launchChainStep(ch, idx) {
+  const step = ch.steps[idx];
+  const wf = resolveWorkflow(step.workflow);
+  if (!wf) { step.status = "error"; step.error = "unknown workflow"; ch.status = "failed"; return; }
+  let input = step.input;
+  if (ch.passOutput && idx > 0) {
+    const prev = ch.steps[idx - 1];
+    const payload = prev.runId ? runOutputPayload(prev.runId) : null;
+    if (payload) input = { ...(input || {}), from: prev.workflow, output: payload };
+  }
+  const args = ["up", wf];
+  if (input) args.push("--input", JSON.stringify(input));
+  const extra = pickLaunchEnv(step.env);
+  const child = spawn(SMITHERS_BIN, args, { cwd: HERE, env: { ...nvidiaEnv(), ...extra }, detached: true, stdio: "ignore" });
+  child.unref();
+  step.status = "launching"; step.startedAt = Date.now();
+  console.error(`chain ${ch.id}: launched step ${idx} ${basename(wf)} (pid ${child.pid})`);
+}
+// One advance step for a running chain. Returns true if anything changed (→ save).
+function advanceChain(ch) {
+  if (ch.status !== "running") return false;
+  const step = ch.steps[ch.current];
+  if (!step) { ch.status = "finished"; ch.finishedAt = Date.now(); return true; }
+  if (!step.runId) {
+    if (!step.startedAt) { launchChainStep(ch, ch.current); return true; }
+    const r = findStepRun(step.workflow, step.startedAt);     // discover the runId
+    if (r) { step.runId = r.run_id; step.status = r.status; return true; }
+    return false;                                             // not visible yet; next tick
+  }
+  const status = findRunStatus(step.runId);
+  let changed = false;
+  if (status && status !== step.status) { step.status = status; changed = true; }
+  const s = String(step.status || "").toLowerCase();
+  if (s === "finished") {
+    step.finishedAt = step.finishedAt || Date.now();
+    if (ch.current + 1 < ch.steps.length) ch.current += 1;
+    else { ch.status = "finished"; ch.finishedAt = Date.now(); }
+    changed = true;
+  } else if (s === "failed" || s === "cancelled" || s === "denied" || s === "errored") {
+    ch.status = "failed"; ch.finishedAt = Date.now(); changed = true;   // a failed step stops the chain
+  } // running / waiting-approval / waiting-event → keep polling (chain held)
+  return changed;
+}
+function chainTick() {
+  setInterval(() => {
+    for (const ch of loadChains()) { if (ch.status === "running" && advanceChain(ch)) saveChain(ch); }
+  }, 4000);
+}
+
+app.get("/api/chains", (c) => c.json({ chains: loadChains() }));
+app.get("/api/chains/:id", (c) => { const ch = loadChains().find((x) => x.id === c.req.param("id")); return ch ? c.json(ch) : c.json({ error: "not found" }, 404); });
+app.post("/api/chains", async (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  const steps = Array.isArray(body.steps) ? body.steps : [];
+  if (steps.length < 2) return c.json({ error: "a chain needs at least 2 steps" }, 400);
+  for (const s of steps) if (!resolveWorkflow(s.workflow || "")) return c.json({ error: `unknown workflow: ${s.workflow}` }, 400);
+  const ch = {
+    id: `chain-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    createdAt: Date.now(), createdBy: op, status: "running", passOutput: !!body.passOutput, current: 0,
+    steps: steps.map((s) => ({ workflow: s.workflow, input: s.input || null, env: pickLaunchEnv(s.env), status: "pending" })),
+  };
+  saveChain(ch);
+  console.error(`chain start: ${ch.id} by ${op} (${steps.map((s) => s.workflow).join(" → ")})`);
+  return c.json({ ok: true, id: ch.id, chain: ch });
+});
+app.post("/api/chains/:id/cancel", (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const ch = loadChains().find((x) => x.id === c.req.param("id"));
+  if (!ch) return c.json({ error: "not found" }, 404);
+  const cur = ch.steps[ch.current];
+  if (cur && cur.runId) { const db = runDbPath(cur.runId); if (db) cliWithDb(db, ["cancel", cur.runId]); }
+  ch.status = "cancelled"; ch.finishedAt = Date.now(); saveChain(ch);
+  console.error(`chain cancel: ${ch.id} by ${op}`);
+  return c.json({ ok: true });
+});
+// Resume a failed/cancelled chain: re-run the step it stopped on (fresh) and let
+// the runner carry on. A step that merely paused at an approval gate is handled by
+// the normal approve→resume flow, so this is for the failed/cancelled case.
+app.post("/api/chains/:id/resume", (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const ch = loadChains().find((x) => x.id === c.req.param("id"));
+  if (!ch) return c.json({ error: "not found" }, 404);
+  const i = ch.steps.findIndex((s) => !["finished"].includes(String(s.status || "").toLowerCase()));
+  const idx = i === -1 ? ch.steps.length - 1 : i;
+  const step = ch.steps[idx];
+  step.runId = null; step.startedAt = null; step.finishedAt = null; step.status = "pending"; delete step.error;
+  ch.current = idx; ch.status = "running"; delete ch.finishedAt;
+  saveChain(ch);
+  console.error(`chain resume: ${ch.id} from step ${idx} by ${op}`);
+  return c.json({ ok: true, resumedFrom: idx });
+});
+// Re-run a chain from a specific step (reset that step + everything after it).
+app.post("/api/chains/:id/rerun-step", async (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const ch = loadChains().find((x) => x.id === c.req.param("id"));
+  if (!ch) return c.json({ error: "not found" }, 404);
+  const body = await c.req.json().catch(() => ({}));
+  const idx = Math.max(0, Math.min(ch.steps.length - 1, Number(body.index) || 0));
+  for (let i = idx; i < ch.steps.length; i++) { const s = ch.steps[i]; s.runId = null; s.startedAt = null; s.finishedAt = null; s.status = "pending"; delete s.error; }
+  ch.current = idx; ch.status = "running"; delete ch.finishedAt;
+  saveChain(ch);
+  console.error(`chain rerun-step: ${ch.id} from step ${idx} by ${op}`);
+  return c.json({ ok: true, rerunFrom: idx });
 });
 
 // Static dashboard.
@@ -687,19 +1059,25 @@ function podRun(cmd) {
   try { const c = spawn("ssh", ["-n", "-o", "ConnectTimeout=15", POD_SSH, cmd], { stdio: "ignore" }); c.on("error", () => {}); c.unref(); } catch { /* */ }
 }
 function dispatchApproval(p) {
+  const channels = liveNotifyChannels();
   const title = "Chad · approval needed";
   const body = `${p.db} · ${p.node_id} (run ${String(p.run_id).slice(0, 8)}) — approve at ${RUNS_PUBLIC_URL}`;
-  if (NOTIFY_CHANNELS.includes("webui")) podRun(`${POD_WEBUI} notes create --title ${shq(title)} --content ${shq(body)} --tags chad-approvals 2>/dev/null || true`);
-  if (NOTIFY_CHANNELS.includes("email")) podRun(`chad-mail-send --to ${shq(OPERATOR_EMAIL)} --subject ${shq(title)} --body ${shq(body)} 2>/dev/null || true`);
+  if (channels.includes("webui")) podRun(`${POD_WEBUI} notes create --title ${shq(title)} --content ${shq(body)} --tags chad-approvals 2>/dev/null || true`);
+  if (channels.includes("email")) podRun(`chad-mail-send --to ${shq(OPERATOR_EMAIL)} --subject ${shq(title)} --body ${shq(body)} 2>/dev/null || true`);
 }
 function approvalNotifier() {
-  if (!NOTIFY_CHANNELS.some((c) => c === "webui" || c === "email")) return; // nothing server-side to do
+  // Always poll — the dispatch channel set is live-editable from the Approvals tab,
+  // so a channel can be enabled after startup; dispatchApproval no-ops when none on.
   setInterval(() => {
     for (const path of listDbs()) {
       try {
         withDb(path, (db) => {
           if (!tableExists(db, "_smithers_approvals")) return;
-          for (const r of db.query("SELECT run_id, node_id, iteration FROM _smithers_approvals WHERE status IN ('pending','requested')").all()) {
+          for (const r of db.query(
+            `SELECT a.run_id, a.node_id, a.iteration FROM _smithers_approvals a
+             JOIN _smithers_runs r ON a.run_id = r.run_id
+             WHERE a.status IN ('pending','requested')
+               AND r.status NOT IN ('finished','failed','cancelled','denied','errored')`).all()) {
             const k = `${r.run_id}:${r.node_id}:${r.iteration}`;
             if (_notifiedApprovals.has(k)) continue;
             _notifiedApprovals.add(k);
@@ -711,6 +1089,7 @@ function approvalNotifier() {
   }, 20000);
 }
 approvalNotifier();
+chainTick(); // advance any running workflow chains
 
-console.error(`serve-runs: durable DB dashboard on http://${HOST}:${PORT}  (scanning ${DB_DIR})${NOTIFY_CHANNELS.length ? ` · approval-notify: ${NOTIFY_CHANNELS.join(",")}` : ""}`);
+console.error(`serve-runs: durable DB dashboard on http://${HOST}:${PORT}  (scanning ${DB_DIR})${liveNotifyChannels().length ? ` · approval-notify: ${liveNotifyChannels().join(",")}` : ""}`);
 export default { port: PORT, hostname: HOST, fetch: app.fetch };

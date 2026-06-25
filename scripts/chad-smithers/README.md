@@ -185,8 +185,109 @@ smithers up experiments.jsx --resume <runId> --force   # resume a crashed/stalle
   best model per task-kind. The launch drawer gained per-tier model pickers
   (capable/cheap → `CHAD_NEMOTRON_*_MODEL`, all workflows) and a liveness-filtered
   fusion model multi-select (`/api/models`).
+- **Ops-hardening + chaining + node inspection pass (2026-06-22):**
+  - `mcp-health-probe` fixed (it was the one failing run). It failed on a
+    **claudecode fallback**: the cron wrappers force the *primary* to nemotron, but
+    `pickFallback` deliberately picks a *different* backend — the `claude` CLI,
+    which under launchd can't auth AND emits `SessionStart` hook JSON that breaks
+    the parser (`AGENT_CLI_ERROR`). Fix: `CHAD_DISABLE_CLI_AGENTS=1` (set by the
+    cron wrappers) removes CLI agents from selection AND fallback (nemotron-only
+    headless); `claudecode` also passes `settingSources:"project,local"` so the
+    host hooks don't pollute it when used interactively (auth verified to survive).
+    The probe's `check` is now **deterministic** (set comparison, no LLM — a health
+    probe must not hang on a slow 550B call), and the gbrain command was wrong
+    (`gbrain health`, not `get-health`).
+  - All **5 never-run scaffolds** (self-improve, email-ladder, issue-triage,
+    content-pipeline, memory-curator) smoke-passed — each wakes cleanly (finished,
+    or paused at its approval gate). The approve→resume gate flow verified
+    end-to-end (`smithers approve` via a symlinked `smithers.db` → `up --resume
+    --force` → finished).
+  - **Workflow chaining** (new **Chains** tab + `/api/chains`): run workflows in
+    sequence — a step launches when the prior reaches `finished`; an approval-gated
+    step *holds* the chain (resumes the chain when you approve in the Approvals
+    tab); optionally feed each step's primary output into the next step's
+    `ctx.input.output`. Chains persist to `state/chains/` and survive a restart.
+  - **Graph node inspection**: click any node in a workflow graph OR a run DAG to
+    see its declared settings (timeout/retries/continueOnFail/needsApproval/…) and
+    — on a run DAG — the **resolved** model/agent/tokens it actually used. "Tweak &
+    re-run" pre-fills the launch drawer. `graphToDag` carries per-node type/group/config.
+  - `/api/approvals` now excludes gates whose run is already terminal (no phantom
+    pending badge). `CRON-WORKFLOW-MAP.md` maps pod-cron ↔ workflow overlap.
+  - **Dashboard pass 2:** graph nodes now carry on-node metadata badges
+    (🔒gate/⏱timeout/↻retries/⇢keep/✎fx) + a **hover tooltip** (declared config,
+    and on a run DAG the resolved model/tokens/state + an output snippet). The
+    **Approvals tab** gained a notify-settings card — pick the default channels
+    (browser/webui/email/telegram) live, persisted to `state/notify-config.json`
+    via `/api/notify-config` (read each tick by the notifier, no restart). The
+    **Experiments dashboard** was revamped around a **money/tokens-saved hero**: a
+    rough cost model (`state/model-costs.json`, tunable) computes the frontier
+    counterfactual — what every token would cost on a frontier model vs the ~$0 we
+    pay on free Nemotron — plus per-model frontier/market cost and downgrade $/1M
+    savings. `/api/efficiency` returns the cost block.
+  - **Schedules tab** (`/api/schedules`, read-only): parses the host launchd
+    plists (`~/Library/LaunchAgents/dev.nemoclaw.chad-*`) for each job's cadence +
+    target workflow, cross-referenced with `launchctl list` (loaded/running/last
+    exit) and the workflow's last real run — grouped workflow / service / ops /
+    infra. (It immediately surfaced a stale `log-digest` failure that was the same
+    fallback-escape bug, here escaping to the local lmstudio backend — covered by
+    the `CHAD_DISABLE_CLI_AGENTS=1` fix.)
+  - **Dashboard pass 3 (experiments + chains):** the model×task matrix now filters
+    junk from early test runs (real task-kind slugs × namespaced model ids only).
+    **Reflective mutation (the Hermes/GEPA borrow):** `experiments.jsx` BREEDS a new
+    drafter-prompt each run by reasoning about *why* the leaders win, instead of only
+    selecting from static seeds — the arena is now self-generating. Guardrailed:
+    text-only, capped by `POLICY.maxActive`, deduped by label, never auto-promoted
+    (must win evaluation next round); `CHAD_EXPERIMENT_MUTATE=0` disables.
+    **Chain recovery + cross-linking:** a failed chain resumes from the step it
+    stopped on (`/api/chains/:id/resume`) or re-runs from any step (`/rerun-step`);
+    the Chains UI gained per-step Resume/Fork/Rerun + a chain-level Resume, step
+    durations, and a done count; runs everywhere are tagged with their `chainId`
+    (allRuns annotation) and badge-link back to the chain card (`gotoChain`).
+  - **Directives + trace-grounding (pass 4):** the arena's input was STATIC — the same
+    8 `fixtures.json` fed to every candidate every run, no memory. Added: (1) a
+    **Directives** tab + `state/directives.json` (`/api/directives`) — operator
+    free-text that steers the arena's breeding + scoring (`experiments`) and optional
+    per-role/`all` **system prompts injected into every workflow** via
+    `agents.js#directiveSystem` (generalizes `championSystem`). (2) `lib/signal.js` +
+    `/api/signal` — scans every DB for failed/stale/low-quality runs into a digest,
+    surfaced on the Directives tab AND fed into the reflective-mutation prompt
+    (`signalText`), so breeding reacts to real failures, not just synthetic fixtures
+    (the Hermes "read traces → improve" loop, now closed end-to-end). (3)
+    `lib/fixtures.js` + `/api/fixtures` — **harvests REAL run inputs** (email-ladder
+    messages, fusion prompts, log samples, triaged issues) into taskKind-tagged
+    fixtures that augment the static 8, so candidates are scored against LIVE cases
+    instead of only the hand-written set (`CHAD_HARVEST_MAX`, cached 60s). Surfaced
+    on the Directives tab. This closes the last static-input-context gap.
 
 ### Gotchas learned during bring-up (don't regress these)
+
+- **A health/ops probe must not depend on inference.** The cheap tier defaults to
+  Ultra 550B (~30s/call, spikes past the 120s task cap under load), so an LLM-gated
+  probe times out. Keep the probe decision deterministic (set comparison / HTTP
+  code); reserve the model for non-blocking enrichment only.
+- **`pickFallback` escapes the forced backend.** Forcing `CHAD_*_BACKEND=nemotron`
+  only pins the PRIMARY; the fallback picks a *different* backend, which headless is
+  the unusable `claude` CLI. Cron/launchd contexts must also set
+  `CHAD_DISABLE_CLI_AGENTS=1`.
+- **Nemotron-3 reasoning: the "detailed thinking off" system directive is a NO-OP**
+  (verified 2026-06-22 — every model reasoned regardless). Reasoning is ON by
+  default; only `reasoning_effort:"none"` or `chat_template_kwargs:{thinking:false}`
+  in the request body disable it. `agents.js` injects both via a `fetch` wrapper
+  (`reasoningOffFetch`) when a tier is reasoning-off. Why it matters: reasoning-on
+  silently ate the cheap 2048-token budget → EMPTY/truncated answers, and pushed
+  Ultra 550B (~7 tok/s, 145-166s for ~1k tok) past the 120s cheap cap. Cheap tier
+  now defaults to **Super 120B + reasoning-off (~3s, complete)**; Ultra is
+  capable-tier only. Measure with a streaming probe (look at `reasoning_content` +
+  `finish_reason`), not just wall time.
+- **What stays on Ultra after the cheap→Super flip:** every `judge`-role call
+  (capable tier — evaluation/moderation/scoring/proposals across 8 workflows). The
+  only cheap-tier draft that's operator-facing, `email-ladder`'s reply, is pinned
+  back to Ultra via `CHAD_EMAIL_DRAFT_MODEL` (gated + not latency-critical, 300s
+  task timeout for the slow model). fusion/token-optimize `draft` pin their own
+  models (panel/benchmark), so they're unaffected. The arena benchmarks Ultra-vs-
+  Super on the cheap roles (log-cluster, email-drafter, content-gen, triage-classify
+  in `state/downgrade-candidates.json`, benchmark-only rows) so token-optimize can
+  flag any real Ultra win instead of guessing.
 
 - **zod MUST be v4** (`^4.3.6`, matches Smithers). A 3.x `/v4` shim makes the
   agents package's `toJSONSchema` throw `Non-representable type: optional`.

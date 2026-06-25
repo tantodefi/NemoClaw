@@ -24,7 +24,6 @@ import { z } from "zod";
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_HEALTH_DB || "./mcp-health.db";
 const SNAPSHOT = process.env.CHAD_HEALTH_SNAPSHOT || "./state/mcp-health-last.json";
@@ -54,9 +53,12 @@ function gatherSignals() {
     try { sig.push({ server, healthy: true, detail: fn() }); }
     catch (e) { sig.push({ server, healthy: false, detail: String(e.message || e).slice(0, 200) }); }
   };
-  // gbrain health (pod). Unhealthy or 0% coverage = the silent-failure signal.
+  // gbrain health (pod). The CLI subcommand is `health` (NOT `get-health` —
+  // that's the MCP tool name; the CLI rejects it as "Unknown command", which a
+  // health probe must treat as unhealthy). Emits "Health score: N/10" +
+  // "Embed coverage: X%" — 0% coverage is the documented silent-failure signal.
   tryProbe("gbrain", () =>
-    execSync(`ssh -n -o ConnectTimeout=15 ${POD} 'gbrain get-health 2>&1 | head -c 400'`, { encoding: "utf8" }).trim());
+    execSync(`ssh -n -o ConnectTimeout=15 ${POD} 'gbrain health 2>&1 | head -c 400'`, { encoding: "utf8" }).trim());
   // NVIDIA inference reachability (host has the key + egress).
   tryProbe("nvidia-nim", () =>
     execSync(`curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://integrate.api.nvidia.com/v1/models -H "Authorization: Bearer $NVIDIA_API_KEY"`, { encoding: "utf8" }).trim());
@@ -86,15 +88,50 @@ export const workflow = smithers((ctx) => {
           }}
         </Task>
 
-        {/* Cheap agent decides "material change vs last snapshot" — fail-only. */}
-        <Task id="check" output={outputs.check} agent={pickAgent("classify")} fallbackAgent={pickFallback("classify")} {...taskOpts("classify")}>
-          {[
-            "You are the change detector for Chad's MCP/inference health probe.",
-            `Current signals (JSON): ${JSON.stringify((ctx.outputs.probe ?? [])[0]?.signals ?? "[]")}`,
-            `Last known unhealthy set: ${JSON.stringify(loadSnapshot().unhealthy)}`,
-            "Return JSON { materialChange (bool), unhealthy (string[] of unhealthy server names), summary (one sentence) }.",
-            "materialChange = true ONLY if the unhealthy set differs from last known, or any HTTP code is not 200, or gbrain reports 0% / error.",
-          ].join("\n\n")}
+        {/* Material-change detection — DETERMINISTIC, no LLM. A health probe must
+            not depend on slow inference: the cheap tier defaults to Ultra 550B
+            (~30s/call, spikes past the 120s cap under load), which made an LLM
+            `check` time out and fail the whole probe. Set comparison + HTTP-code
+            check needs no model — fast (<1s), free, and reliable, which is the
+            entire point of an hourly ops monitor. */}
+        <Task id="check" output={outputs.check}>
+          {() => {
+            const signals = JSON.parse((ctx.outputs.probe ?? [])[0]?.signals ?? "[]");
+            const prior = new Set(loadSnapshot().unhealthy);
+            // HTTP probes (nvidia-nim/chad-shim) return the status code as detail
+            // and DON'T throw on non-200, so a 200 is the only healthy code; gbrain
+            // returns health text — unhealthy if it reports an error / 0% coverage;
+            // a probe that threw is already healthy:false from gatherSignals().
+            const isUnhealthy = (s) => {
+              if (!s.healthy) return true;                  // probe threw
+              const d = String(s.detail ?? "").trim();
+              if (d === "") return true;                    // empty = no signal
+              if (/^\d{3}$/.test(d)) return d !== "200";    // HTTP status code
+              // Any text that is a command/exec error is unhealthy — this is what
+              // catches a renamed/missing CLI (the old `gbrain get-health` printed
+              // "Unknown command", which previously read as healthy).
+              if (/\b(error|unhealthy|failed|failure|timeout|unknown command|not found|no such|refused|denied|traceback|exception)\b/i.test(d)) return true;
+              // gbrain health text: the documented silent-failure modes are embed
+              // coverage collapsing to 0% (the EOL-410 incident) or a low score.
+              if (s.server === "gbrain") {
+                const cov = d.match(/embed coverage:\s*([\d.]+)\s*%/i);
+                if (cov && Number(cov[1]) === 0) return true;
+                const score = d.match(/health score:\s*(\d+)\s*\/\s*10/i);
+                if (score && Number(score[1]) < 4) return true;
+              }
+              return false;
+            };
+            const unhealthy = signals.filter(isUnhealthy).map((s) => s.server);
+            const now = new Set(unhealthy);
+            const materialChange =
+              now.size !== prior.size
+              || [...now].some((u) => !prior.has(u))
+              || [...prior].some((p) => !now.has(p));
+            const summary = unhealthy.length
+              ? `${unhealthy.length} unhealthy: ${unhealthy.join(", ")}`
+              : "all probes healthy";
+            return { materialChange, unhealthy, summary };
+          }}
         </Task>
 
         <Task id="report" output={outputs.report}>

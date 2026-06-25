@@ -22,6 +22,14 @@ import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_EMAIL_DB || "./email-ladder.db";
 const SEND = process.env.CHAD_EMAIL_SEND === "1";
+// The reply DRAFT is the one operator-facing cheap-tier output, so pin it to the
+// higher-quality Ultra 550B (the arena's small but real +2 over Super where a
+// human reads the result). It's gated (approval before send), Ultra-moderated, and
+// NOT latency-critical, so the extra latency is fine — but Ultra is ~7 tok/s, so
+// give the task generous timeout headroom. Triage/moderation are unaffected.
+// Set CHAD_EMAIL_DRAFT_MODEL="" to fall back to the cheap-tier default (Super).
+const DRAFT_MODEL = process.env.CHAD_EMAIL_DRAFT_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b";
+const DRAFT_TIMEOUT_MS = Number(process.env.CHAD_EMAIL_DRAFT_TIMEOUT_MS || 300_000);
 // Per-operator autonomy: only these may be auto-approved (the trust boundary).
 const ADMIN_ALLOWLIST = (process.env.CHAD_EMAIL_ADMIN_ALLOWLIST || "").split(",").filter(Boolean);
 
@@ -57,7 +65,7 @@ export const workflow = smithers((ctx) => {
 
         {/* category gating is per-task skipIf — a `<Branch if={upstreamOutput}>`
             does not reopen once triage completes (verified). Draft only for replies. */}
-        <Task id="draft" skipIf={triage?.category !== "reply"} output={outputs.draft} agent={pickAgent("draft")} fallbackAgent={pickFallback("draft")} {...taskOpts("draft")}>
+        <Task id="draft" skipIf={triage?.category !== "reply"} output={outputs.draft} agent={pickAgent("draft", DRAFT_MODEL ? { model: DRAFT_MODEL, timeoutMs: DRAFT_TIMEOUT_MS } : {})} fallbackAgent={pickFallback("draft")} {...taskOpts("draft", DRAFT_MODEL ? { timeoutMs: DRAFT_TIMEOUT_MS } : {})}>
             {`Draft a reply in the operator's voice. Return JSON {subject, body, confidence}.\n\nContext: ${triage?.summary ?? ""}\nOriginal: ${JSON.stringify(inbound).slice(0, 4000)}`}
           </Task>
 

@@ -11,3 +11,5 @@ state/posted-notes.log
 state/models.json
 state/champion-prompt.json
 state/mcp-health-last.json
+state/chains/
+state/notify-config.json

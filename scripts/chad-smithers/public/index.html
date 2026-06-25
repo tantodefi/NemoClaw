@@ -80,7 +80,10 @@
   <span class="tab active" data-tab="runs">Runs</span>
   <span class="tab" data-tab="workflows">Workflows</span>
   <span class="tab" data-tab="approvals">Approvals <span id="apvBadge"></span></span>
+  <span class="tab" data-tab="chains">Chains</span>
+  <span class="tab" data-tab="schedules">Schedules</span>
   <span class="tab" data-tab="experiments">Experiments</span>
+  <span class="tab" data-tab="directives">Directives</span>
   <span class="spacer"></span>
   <span id="bell" title="Approval notifications" style="cursor:pointer;font-size:15px;margin-right:4px" onclick="toggleNotify()">🔔</span>
   <span class="meta" id="meta">loading…</span>
@@ -95,7 +98,10 @@
 </div>
 <div id="view-workflows" class="pane" style="display:none"><div id="workflows"></div></div>
 <div id="view-approvals" class="pane" style="display:none"><div id="approvals"></div></div>
+<div id="view-chains" class="pane" style="display:none"><div id="chains"></div></div>
+<div id="view-schedules" class="pane" style="display:none"><div id="schedules"></div></div>
 <div id="view-experiments" class="pane" style="display:none"><div id="experiments"></div></div>
+<div id="view-directives" class="pane" style="display:none"><div id="directives"></div></div>
 <div id="launchModal" class="modal-bg" style="display:none"></div>
 
 <script>
@@ -147,7 +153,7 @@ function renderRuns(){
   const rows=allRuns.filter(r=>!f || `${r.workflow_name} ${r.status} ${r.run_id} ${r.db}`.toLowerCase().includes(f));
   const tb=document.getElementById("runs");
   tb.innerHTML=rows.map(r=>`<tr class="run ${r.run_id===selected?'sel':''}" data-id="${esc(r.run_id)}">
-    <td><div>${esc(r.workflow_name||'?')}</div><div class="muted mono" style="font-size:11px">${esc((r.run_id||'').slice(0,8))} · ${esc(r.db)}</div></td>
+    <td><div>${esc(r.workflow_name||'?')}${r.chainId?` <a href="#" onclick="event.stopPropagation();gotoChain('${esc(r.chainId)}');return false" class="pill" style="background:rgba(88,166,255,.15);color:var(--blue);font-size:10px" title="part of chain ${esc(r.chainId)}">🔗 ${r.chainStep}/${r.chainSteps}</a>`:''}</div><div class="muted mono" style="font-size:11px">${esc((r.run_id||'').slice(0,8))} · ${esc(r.db)}</div></td>
     <td>${pill(r.status)}</td><td class="muted">${fmtTime(r.started_at_ms||r.created_at_ms)}</td>
     <td class="muted">${isLive(r)?'…':fmtDur(r.started_at_ms,r.finished_at_ms)}</td></tr>`).join("")
     || `<tr><td colspan=4 class=empty>${f?'no matches':'No runs yet.'}</td></tr>`;
@@ -200,8 +206,9 @@ async function loadDetail(id){
     }).join("");
     const logHtml=(logs.events||[]).map(ev=>{const ts=ev.timestampMs?new Date(ev.timestampMs).toLocaleTimeString():"";return `<div class="ev t-${esc(ev.type||'')}"><span class="ts">${ts}</span> ${esc(ev.type||ev.raw||'')}${ev.nodeId?' · '+esc(ev.nodeId):''}${ev.message?' · '+esc(ev.message):''}</div>`;}).join("");
     d.innerHTML=`<div class="row"><h2 style="flex:1">${esc(run.workflow_name||'run')} ${pill(run.status)}${stale?' <span class="stale">⚠ stale</span>':''}</h2>${actions}</div>
-      <div class="muted mono">${esc(run.run_id)} · ${esc(run.db)}</div>
+      <div class="muted mono">${esc(run.run_id)} · ${esc(run.db)}${(()=>{const cr=allRuns.find(r=>r.run_id===id);return cr&&cr.chainId?` · <a href="#" onclick="gotoChain('${esc(cr.chainId)}');return false" title="part of a workflow chain">🔗 chain ${esc(cr.chainId)} · step ${cr.chainStep}/${cr.chainSteps}</a>`:'';})()}</div>
       <div class="muted">started ${fmtTime(run.started_at_ms)} · ${live?'<b style="color:var(--blue)">running…</b>':'finished '+fmtTime(run.finished_at_ms)} · ${fmtDur(run.started_at_ms,run.finished_at_ms)}</div>
+      ${(()=>{const ff=new Set((attempts||[]).filter(a=>String(a.state).toLowerCase()==='failed').map(a=>a.node_id));return (String(run.status).toLowerCase()==='finished'&&ff.size)?`<div style="color:var(--yellow);font-size:12px;margin-top:2px">✓ finished with ${ff.size} tolerated task failure${ff.size>1?'s':''} (continueOnFail / fallback) — e.g. a slow or unsupported panel model; the run completed with the rest.</div>`:'';})()}
       ${telemetry.tokens&&telemetry.tokens.totalTokens?`<div class="muted">tokens · ${telemetry.tokens.inputTokens}↓ in · ${telemetry.tokens.outputTokens}↑ out${telemetry.tokens.reasoningTokens?` · ${telemetry.tokens.reasoningTokens} reasoning`:''} · ${telemetry.tokens.totalTokens} total</div>`:''}
       ${run.error_json?`<h3>error</h3><pre class="err">${esc(run.error_json)}</pre>`:""}
       <div id="chatbox"></div>
@@ -223,11 +230,14 @@ async function renderRunDag(id,wf){ const box=document.getElementById("tracebox"
     const dag=g.dag; if(!dag||!dag.nodes.length){ box.innerHTML="<h3>task graph</h3><div class=muted>no graph for this workflow</div>"; return; }
     const st={}; (det.attempts||[]).forEach(a=>{ st[a.node_id]=String(a.state||"").toLowerCase(); });
     const nid=x=>"n_"+String(x).replace(/[^a-zA-Z0-9]/g,"_");
+    const byNid={}; dag.nodes.forEach(n=>byNid[nid(n.id)]=n);
     let m="flowchart TD\n";
-    dag.nodes.forEach(n=>{ m+=`  ${nid(n.id)}["${String(n.label).replace(/"/g,"'")}"]\n`; const s=st[n.id]; const cls=s==="finished"?"ok":(s==="failed"||s==="errored")?"bad":(s==="in-progress"||s==="running")?"run":""; if(cls) m+=`  class ${nid(n.id)} ${cls}\n`; });
+    dag.nodes.forEach(n=>{ m+=`  ${nid(n.id)}["${mlabel(n)}"]\n`; const s=st[n.id]; const cls=s==="finished"?"ok":(s==="failed"||s==="errored")?"bad":(s==="in-progress"||s==="running")?"run":""; if(cls) m+=`  class ${nid(n.id)} ${cls}\n`; });
     dag.edges.forEach(e=>{ m+=`  ${nid(e.from)} --> ${nid(e.to)}\n`; });
     m+="classDef ok fill:#10331c,stroke:#3fb950,color:#e6edf3\nclassDef bad fill:#3a1518,stroke:#f85149,color:#e6edf3\nclassDef run fill:#0d2847,stroke:#58a6ff,color:#e6edf3\n";
-    if(window.mermaid){ try{ const {svg}=await mermaid.render("rd"+id.replace(/[^a-z0-9]/gi,"")+Date.now(),m); box.innerHTML="<h3>task graph <span class='muted' style='text-transform:none'>(green=done, red=failed, blue=running)</span></h3><div class='card' style='overflow:auto'>"+svg+"</div>"; return; }catch(e){} }
+    if(window.mermaid){ try{ const {svg}=await mermaid.render("rd"+id.replace(/[^a-z0-9]/gi,"")+Date.now(),m);
+      box.innerHTML="<h3>task graph <span class='muted' style='text-transform:none'>(green=done, red=failed, blue=running · click a node to inspect)</span></h3><div class='card' style='overflow:auto'>"+svg+"</div><div id='ni-rundag'></div>";
+      bindGraphNodes(box, byNid, {wf, runId:id, telemetry:det.telemetry, attempts:det.attempts, target:"ni-rundag"}); return; }catch(e){} }
     box.innerHTML="<h3>task graph</h3><pre>"+esc(m)+"</pre>";
   }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
 async function forkRun(id){ if(!confirm("Fork this run (time-travel from its latest snapshot)?"))return; try{ await post("/api/runs/"+encodeURIComponent(id)+"/fork"); switchTab("runs"); setTimeout(loadRuns,1500); }catch(e){ alert("fork failed: "+e.message+(String(e.message).includes("forbidden")?"\n(needs Access login or ?key=)":"")); } }
@@ -294,6 +304,11 @@ function openLaunch(name, pre={}){
   </div>`;
   m.style.display="flex";
   m.onclick=()=>closeLaunch(); // click backdrop closes (modal stops propagation)
+  // Prefill from the node inspector's "Tweak & re-run" (maps node settings to the
+  // global run knobs): tcap/tcheap=timeout(s), maxcap/maxcheap, mcap/mcheap=model.
+  const setv=(id,v)=>{ const e=document.getElementById(id); if(e&&v!=null&&v!=="") e.value=v; };
+  setv("lx-tcap",pre.tcap); setv("lx-tcheap",pre.tcheap); setv("lx-maxcap",pre.maxcap); setv("lx-maxcheap",pre.maxcheap);
+  if(pre.note){ const s=document.getElementById("lx-status"); if(s){ s.style.color="var(--muted)"; s.textContent=pre.note; } }
   _lxWarned=false; lxLimits(name); lxModels();
 }
 // Live model roster (catalog ∩ liveness probe) from /api/models. Feeds the
@@ -365,12 +380,97 @@ async function showGraph(name){ const box=document.getElementById(wfBox(name)); 
   try{ const {dag}=await api("/api/workflow-graph?name="+encodeURIComponent(name));
     if(window.mermaid && dag && dag.nodes.length){
       const nid=(id)=>"n_"+String(id).replace(/[^a-zA-Z0-9]/g,"_");
-      let g="flowchart TD\n"; dag.nodes.forEach(n=>g+=`  ${nid(n.id)}["${String(n.label).replace(/"/g,"'")}"]\n`);
+      const byNid={}; dag.nodes.forEach(n=>byNid[nid(n.id)]=n);
+      let g="flowchart TD\n"; dag.nodes.forEach(n=>g+=`  ${nid(n.id)}["${mlabel(n)}"]\n`);
       dag.edges.forEach(e=>g+=`  ${nid(e.from)} --> ${nid(e.to)}\n`);
-      try{ const {svg}=await mermaid.render("mm"+wfBox(name)+Date.now(), g); box.innerHTML="<div class='card' style='overflow:auto'>"+svg+"</div>"; return; }catch(err){}
+      const tgt="ni-"+wfBox(name);
+      try{ const {svg}=await mermaid.render("mm"+wfBox(name)+Date.now(), g);
+        box.innerHTML="<div class='card' style='overflow:auto'>"+svg+"</div><div class='muted' style='font-size:11px;margin:4px 0'>↳ click a node to inspect its settings</div><div id='"+tgt+"'></div>";
+        bindGraphNodes(box, byNid, {wf:name, target:tgt}); return; }catch(err){}
     }
     box.innerHTML="<pre style='max-height:320px'>"+esc(JSON.stringify(dag,null,2))+"</pre>";
   }catch(e){ box.innerHTML="<div class=err>"+esc(e.message)+"</div>"; } }
+// Make rendered mermaid nodes clickable → the node settings inspector. Robust
+// per-render (closes over the right node map + context) instead of a global
+// mermaid click callback, so multiple graphs can be open at once.
+function bindGraphNodes(box, byNid, ctx){
+  const tip=ensureNodeTip();
+  box.querySelectorAll("g.node").forEach(g=>{
+    const m=(g.id||"").match(/(n_[A-Za-z0-9_]+)/); const node=m&&byNid[m[1]];
+    if(!node) return; g.style.cursor="pointer";
+    g.addEventListener("click",(e)=>{ e.stopPropagation(); showNodeInspector(node,ctx); });
+    g.addEventListener("mousemove",(e)=>{ tip.style.left=Math.min(e.clientX+14,window.innerWidth-380)+"px"; tip.style.top=(e.clientY+16)+"px"; });
+    g.addEventListener("mouseenter",()=>{ tip.innerHTML=nodeTipHtml(node,ctx); tip.style.display="block"; });
+    g.addEventListener("mouseleave",()=>{ tip.style.display="none"; });
+  });
+}
+function ensureNodeTip(){ let t=document.getElementById("nodeTip"); if(!t){ t=document.createElement("div"); t.id="nodeTip";
+  t.style.cssText="position:fixed;z-index:80;pointer-events:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;box-shadow:0 10px 30px rgba(0,0,0,.55);display:none;max-width:360px;line-height:1.5"; document.body.appendChild(t);} return t; }
+// Compact on-node metadata badge (rendered into the mermaid label as a 2nd line).
+function nodeMetaBadge(cfg){ if(!cfg) return ""; const b=[];
+  if(cfg.needsApproval) b.push("🔒gate"); if(cfg.skipIf) b.push("?cond"); if(cfg.continueOnFail) b.push("⇢keep");
+  if(cfg.sideEffect) b.push("✎fx"); if(cfg.retries!=null) b.push("↻"+cfg.retries); if(cfg.timeoutMs) b.push("⏱"+Math.round(Number(cfg.timeoutMs)/1000)+"s");
+  return b.join("  "); }
+// mermaid node label = name + a small 2nd line of metadata badges (htmlLabels).
+function mlabel(n){ const t=String(n.label).replace(/"/g,"'"); const b=nodeMetaBadge(n.config);
+  return b?`${t}<br/><span style='font-size:9px;color:#8b949e'>${b}</span>`:t; }
+// Hover tooltip content: declared config + (run DAG) the resolved model/tokens/
+// state and a snippet of the data the node produced.
+function nodeTipHtml(node,ctx){
+  const cfg=node.config||{};
+  const cfgline=Object.entries(cfg).map(([k,v])=>`${k}=${/timeoutMs$/i.test(k)?Math.round(Number(v)/1000)+'s':v}`).join(" · ")||"compute node (deterministic)";
+  let rt="";
+  if(ctx.runId){
+    const tok=(ctx.telemetry&&ctx.telemetry.tokens&&ctx.telemetry.tokens.byNode||{})[node.id];
+    const att=(ctx.attempts||[]).filter(a=>a.node_id===node.id); const last=att[att.length-1];
+    const bits=[];
+    if(tok&&tok.model) bits.push("model "+String(tok.model).split('/').pop());
+    if(tok) bits.push(`${tok.inputTokens||0}↓ ${(tok.outputTokens||0)+(tok.reasoningTokens||0)}↑ tok`);
+    if(last) bits.push("state "+last.state);
+    if(bits.length) rt+=`<div style="color:var(--blue);margin-top:3px">${esc(bits.join(" · "))}</div>`;
+    const txt=last&&last.response_text;
+    if(txt) rt+=`<div class="muted" style="margin-top:3px;white-space:pre-wrap">${esc(String(txt).slice(0,180))}${String(txt).length>180?'…':''}</div>`;
+  }
+  return `<b class="mono">${esc(node.id)}</b> <span class="muted">${esc(node.type||'task')}${node.group?' · in '+esc(node.group):''}</span>
+    <div class="muted mono" style="font-size:11px;margin-top:2px">${esc(cfgline)}</div>${rt}
+    <div class="muted" style="font-size:10px;margin-top:4px">click for full inspector + tweak</div>`;
+}
+// The "settings passed into each node" panel + tweak actions. Declared control
+// props come from the graph; for a run DAG the resolved model/agent/tokens/state
+// come from the run's telemetry — the concrete settings the node actually used.
+function showNodeInspector(node,ctx){
+  const t=document.getElementById(ctx.target); if(!t) return;
+  const cfg=node.config||{};
+  const human=(k,v)=>(/timeoutMs$/i.test(k)? Math.round(Number(v)/1000)+"s" : String(v));
+  const cfgRows=Object.keys(cfg).length
+    ? Object.entries(cfg).map(([k,v])=>`<tr><td class="muted mono">${esc(k)}</td><td class="mono">${esc(human(k,v))}</td></tr>`).join("")
+    : `<tr><td colspan=2 class=muted>compute node — deterministic step (no agent / control props)</td></tr>`;
+  let runtime="";
+  if(ctx.runId){
+    const tok=(ctx.telemetry&&ctx.telemetry.tokens&&ctx.telemetry.tokens.byNode&&ctx.telemetry.tokens.byNode[node.id])||null;
+    const att=(ctx.attempts||[]).filter(a=>a.node_id===node.id); const last=att[att.length-1];
+    const rows=[];
+    if(tok&&tok.model) rows.push(["model",tok.model]);
+    if(tok&&tok.agent) rows.push(["agent",tok.agent]);
+    if(tok) rows.push(["tokens",`${tok.inputTokens||0}↓ in · ${(tok.outputTokens||0)+(tok.reasoningTokens||0)}↑ out`]);
+    if(last) rows.push(["state",last.state]);
+    if(att.length>1) rows.push(["attempts",att.length]);
+    if(last&&last.error_json) rows.push(["error",(()=>{try{return JSON.parse(last.error_json).message}catch{return last.error_json}})()]);
+    runtime=rows.length?`<h3 style="margin-top:10px">resolved at runtime</h3><table>${rows.map(([k,v])=>`<tr><td class="muted mono">${esc(k)}</td><td class="mono">${esc(String(v)).slice(0,220)}</td></tr>`).join("")}</table>`
+      :`<div class="muted" style="margin-top:8px">no runtime telemetry for this node (compute node, or run produced no token events)</div>`;
+  }
+  const pre={}; if(cfg.timeoutMs) pre.tcap=Math.round(Number(cfg.timeoutMs)/1000);
+  t.innerHTML=`<div class="card" style="margin-top:8px">
+    <div class="row"><b class="mono" style="flex:1">${esc(node.id)}</b><span class="pill" style="background:#21262d;color:var(--muted)">${esc(node.type||"task")}${node.group?` · in ${esc(node.group)}`:""}</span></div>
+    <h3>declared settings</h3><table>${cfgRows}</table>
+    ${runtime}
+    <div class="row" style="margin-top:10px">
+      <button onclick="switchTab('workflows');setTimeout(()=>editWorkflow('${esc(ctx.wf)}'),60)" title="Open the workflow source">Edit source ✎</button>
+      <button class="primary" onclick='openLaunch(${JSON.stringify(ctx.wf)},${JSON.stringify(pre)})' title="Re-run this workflow with adjustable settings">Tweak &amp; re-run ▶</button>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:4px">Per-node timeout/model map to the launch drawer's global run knobs (Smithers env is tier-global, not per-node).</div>
+  </div>`;
+}
 async function editWorkflow(name){ const box=document.getElementById(wfBox(name)); box.innerHTML="<div class=muted>loading source…</div>";
   try{ const f=await api("/api/workflow-file?name="+encodeURIComponent(name));
     box.innerHTML=`<textarea class="editor" id="ed-${wfBox(name)}" spellcheck="false">${esc(f.content)}</textarea>
@@ -413,8 +513,9 @@ function toggleNotify(){ if(!window.Notification){ alert("This browser has no No
   updateBell(); }
 async function loadApprovals(){
   const el=document.getElementById("approvals");
-  try{ const {pending}=await api("/api/approvals");
-    el.innerHTML="<h2>Pending approvals</h2>"+(pending.length?pending.map(p=>{
+  try{
+    const [{pending},nc]=await Promise.all([api("/api/approvals"),api("/api/notify-config").catch(()=>({channels:[],available:[]}))]);
+    el.innerHTML=notifyConfigHtml(nc)+"<h2 style='margin-top:16px'>Pending approvals</h2>"+(pending.length?pending.map(p=>{
       let req=""; try{ req=JSON.parse(p.request_json||"{}").prompt||""; }catch{}
       return `<div class="card"><div class="muted mono">${esc(p.run_id)} · ${esc(p.node_id)} · iter ${p.iteration} · ${esc(p.db)}</div>
         <div style="margin:6px 0">${esc(req||"(approval gate)")}</div>
@@ -423,7 +524,196 @@ async function loadApprovals(){
     }).join(""):"<div class=muted>No pending approvals. Chad's autonomy gates (e.g. email replies) show here.</div>");
   }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
 }
+// Approval-notify default settings + channel toggles (the operator's "page me on
+// every gate, and how" control). Browser push is per-device (the bell); webui/
+// email dispatch server-side even with the tab closed.
+function notifyConfigHtml(nc){
+  const cur=new Set(nc.channels||[]);
+  const boxes=(nc.available||[]).map(ch=>`<label style="display:inline-flex;align-items:center;gap:6px;margin:2px 16px 2px 0;${ch.ready?'':'opacity:.55'}" title="${esc(ch.note||'')}">
+    <input type="checkbox" data-chan="${esc(ch.id)}" ${cur.has(ch.id)?'checked':''} ${ch.ready?'':'disabled'}> ${esc(ch.label)}${ch.ready?'':' <span class="muted" style="font-size:10px">needs config</span>'}</label>`).join("");
+  const curTxt=cur.size?[...cur].join(", "):'<span style="color:var(--yellow)">dashboard only</span>';
+  return `<div class="card"><div class="row"><b style="flex:1">🔔 Approval notifications</b>
+      <span class="muted" style="font-size:12px">default: <b>${curTxt}</b></span></div>
+    <div style="margin-top:8px">${boxes||'<span class=muted>no channels</span>'}</div>
+    <div class="row" style="margin-top:8px"><span class="muted" id="nc-status" style="flex:1;font-size:12px"></span>
+      <button onclick="enableNotifications();updateBell()" title="Grant this browser permission for desktop push">Enable browser push</button>
+      <button class="primary" onclick="saveNotifyConfig()">Save defaults</button></div>
+    <div class="muted" style="font-size:11px;margin-top:4px">OpenWebUI/email page you with the tab closed; browser push is per-device (the 🔔 bell). Per-run overrides live in the launch drawer.</div></div>`;
+}
+async function saveNotifyConfig(){
+  const channels=[...document.querySelectorAll('#view-approvals input[data-chan]:checked')].map(x=>x.dataset.chan);
+  const st=document.getElementById("nc-status"); if(st){ st.style.color="var(--muted)"; st.textContent="saving…"; }
+  try{ await post("/api/notify-config",{channels}); if(st){ st.style.color="var(--green)"; st.textContent="✓ saved: "+(channels.join(", ")||"dashboard only"); } }
+  catch(e){ if(st){ st.style.color="var(--red)"; st.textContent="failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":""); } }
+}
 async function decide(runId,node,iteration,verb){ try{ await post(`/api/runs/${encodeURIComponent(runId)}/${verb}`,{node,iteration}); loadApprovals(); loadApprovalsBadge(); }catch(e){ alert(verb+" failed: "+e.message); } }
+
+// ── Chains ───────────────────────────────────────────────────────────────────
+let _chainSteps=[], _wfOptions=null;
+async function loadChains(){
+  const el=document.getElementById("chains");
+  try{
+    if(!_wfOptions){ try{ const d=await api("/api/catalog"); _wfOptions=d.workflows.map(w=>w.name); }
+                     catch{ const d=await api("/api/workflows"); _wfOptions=d.workflows.map(w=>w.name); } }
+    el.innerHTML=`<div class="row"><h2 style="flex:1">Workflow chains</h2></div>
+      <div class="muted">Run workflows in sequence — each step starts when the previous reaches <span class="mono">finished</span>. A step that pauses at an approval gate holds the chain until you approve it (Approvals tab). Optionally feed each step's primary output into the next step's <span class="mono">ctx.input.output</span>.</div>
+      ${chainBuilderHtml()}
+      <h3>chains</h3><div id="chain-list"><div class="muted">loading…</div></div>`;
+    renderChainSteps(); refreshChainList();
+  }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
+}
+function chainBuilderHtml(){
+  return `<div class="card"><div class="row"><b style="flex:1">New chain</b>
+      <label class="muted" style="font-size:12px;cursor:pointer"><input type="checkbox" id="ch-pass"> pass each step's output → next</label></div>
+    <div id="ch-steps"></div>
+    <div class="row" style="margin-top:8px"><button onclick="addChainStep()">+ Add step</button>
+      <span style="flex:1"></span><span class="muted" id="ch-status" style="font-size:12px"></span>
+      <button class="primary" onclick="startChain()">Start chain ▶</button></div></div>`;
+}
+function stepOptions(sel){ return (_wfOptions||[]).map(n=>`<option ${n===sel?"selected":""}>${esc(n)}</option>`).join(""); }
+function renderChainSteps(){
+  const box=document.getElementById("ch-steps"); if(!box)return;
+  if(_chainSteps.length<2){ const d=(_wfOptions||[])[0]||""; while(_chainSteps.length<2) _chainSteps.push({workflow:d}); }
+  const inp="flex:1;background:#0b0f14;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 8px";
+  box.innerHTML=_chainSteps.map((s,i)=>`<div class="row" style="margin:4px 0;align-items:flex-start">
+    <span class="muted mono" style="width:18px;padding-top:6px">${i+1}</span>
+    <select onchange="_chainSteps[${i}].workflow=this.value" style="${inp}">${stepOptions(s.workflow)}</select>
+    <input placeholder='input JSON (optional)' value="${esc(s.inputRaw||'')}" oninput="_chainSteps[${i}].inputRaw=this.value" style="${inp};font-family:ui-monospace,monospace;font-size:12px">
+    <button onclick="_chainSteps.splice(${i},1);renderChainSteps()" ${_chainSteps.length<=2?"disabled title='min 2 steps'":""}>✕</button></div>`).join("");
+}
+function addChainStep(){ _chainSteps.push({workflow:(_wfOptions||[])[0]||""}); renderChainSteps(); }
+async function startChain(){
+  const st=document.getElementById("ch-status"); st.style.color="var(--muted)"; st.textContent="";
+  const steps=[];
+  for(const s of _chainSteps){ if(!s.workflow) continue; let input=null;
+    if(s.inputRaw&&s.inputRaw.trim()){ try{ input=JSON.parse(s.inputRaw); }catch{ st.style.color="var(--red)"; st.textContent="step input must be valid JSON: "+s.workflow; return; } }
+    steps.push({workflow:s.workflow,...(input?{input}:{})}); }
+  if(steps.length<2){ st.style.color="var(--red)"; st.textContent="a chain needs at least 2 steps"; return; }
+  st.textContent="starting…";
+  try{ await post("/api/chains",{steps,passOutput:document.getElementById("ch-pass").checked});
+    _chainSteps=[]; loadChains();
+  }catch(e){ st.style.color="var(--red)"; st.textContent="failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":""); }
+}
+async function refreshChainList(){
+  const box=document.getElementById("chain-list"); if(!box)return;
+  try{ const {chains}=await api("/api/chains");
+    box.innerHTML=chains.length?chains.map(chainCardHtml).join(""):'<div class="muted">No chains yet. Build one above.</div>';
+  }catch{ /* keep prior render */ }
+}
+function chainCardHtml(ch){
+  const failed=ch.status==="failed"||ch.status==="cancelled";
+  const sbtn="font-size:11px;padding:2px 7px";
+  const flow=ch.steps.map((s,i)=>{
+    const cur=i===ch.current&&ch.status==="running";
+    const st=String(s.status||'pending').toLowerCase();
+    const rid=s.runId;
+    const open=rid?`<a href="#" onclick="switchTab('runs');selectRun('${esc(rid)}');return false" title="open run detail">${esc(rid.slice(0,8))} ↗</a>`:'<span class="muted">—</span>';
+    const acts=`<div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap">
+      ${rid&&st!=='finished'?`<button style="${sbtn}" onclick="resumeRun('${esc(rid)}')" title="Resume this step's run from its checkpoint">Resume ⟳</button>`:''}
+      ${rid?`<button style="${sbtn}" onclick="forkRun('${esc(rid)}')" title="Fork this step's run (time-travel)">Fork ⑂</button>`:''}
+      <button style="${sbtn}" onclick="rerunChainStep('${esc(ch.id)}',${i})" title="Re-run the chain from this step (resets this + later steps)">Rerun ↺</button>
+    </div>`;
+    const border=cur?'var(--accent)':(st==='failed'?'var(--red)':st==='finished'?'#1f6f43':'var(--border)');
+    return `<div style="display:inline-block;vertical-align:top;border:1px solid ${border};border-radius:8px;padding:6px 10px;margin:3px;min-width:150px">
+      <div class="muted" style="font-size:10px">step ${i+1}${cur?' · current':''}</div>
+      <div class="mono" style="font-size:12px">${esc(s.workflow.replace(/^workflows\//,''))}</div>
+      <div style="margin-top:3px">${pill(s.status||'pending')} ${open}</div>
+      ${s.startedAt?`<div class="muted" style="font-size:10px">${fmtDur(s.startedAt,s.finishedAt)}</div>`:''}
+      ${acts}</div>`;
+  }).join('<span class="muted" style="margin:0 1px">→</span>');
+  const ctrls=`${failed?`<button class="primary" onclick="resumeChain('${esc(ch.id)}')" title="Re-run the step it stopped on and continue">Resume chain ▶</button>`:''}
+    ${ch.status==="running"?`<button class="danger" onclick="cancelChain('${esc(ch.id)}')">Cancel</button>`:''}`;
+  const done=ch.steps.filter(s=>String(s.status).toLowerCase()==='finished').length;
+  return `<div class="card" id="chaincard-${esc(ch.id)}"><div class="row"><b class="mono" style="flex:1">${esc(ch.id)}</b>${pill(ch.status)} ${ctrls}</div>
+    <div class="muted" style="font-size:11px">by ${esc(ch.createdBy||'?')} · ${fmtTime(ch.createdAt)} · ${done}/${ch.steps.length} done${ch.finishedAt?` · took ${fmtDur(ch.createdAt,ch.finishedAt)}`:''}${ch.passOutput?' · passes output →':''}</div>
+    <div style="margin-top:8px">${flow}</div></div>`;
+}
+async function cancelChain(id){ if(!confirm("Cancel this chain (and its running step)?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/cancel"); refreshChainList(); }catch(e){ alert("cancel failed: "+e.message); } }
+async function resumeChain(id){ if(!confirm("Resume this chain from the step it stopped on?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/resume"); refreshChainList(); }catch(e){ alert("resume failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
+async function rerunChainStep(id,index){ if(!confirm("Re-run the chain from step "+(index+1)+"? Resets this and all later steps."))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/rerun-step",{index}); refreshChainList(); }catch(e){ alert("rerun failed: "+e.message); } }
+// Jump from a run's chain badge to its card in the Chains tab.
+function gotoChain(id){ switchTab('chains'); setTimeout(()=>{ const el=document.getElementById('chaincard-'+id); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); el.style.outline='2px solid var(--accent)'; setTimeout(()=>el.style.outline='',1600); } },400); }
+
+// ── Schedules (launchd timers, read-only) ────────────────────────────────────
+async function loadSchedules(){
+  const el=document.getElementById("schedules");
+  try{ const {schedules}=await api("/api/schedules");
+    const kinds={workflow:"Workflow schedules",service:"Services",ops:"Ops jobs",infra:"Infrastructure"};
+    const groups={}; schedules.forEach(s=>(groups[s.kind]=groups[s.kind]||[]).push(s));
+    el.innerHTML=`<div class="row"><h2 style="flex:1">Schedules</h2><span class="meta">${schedules.length} launchd timers</span></div>
+      <div class="muted">macOS launchd drives Chad's scheduled runs (read-only here). Launch a one-off from <a href="#" onclick="switchTab('workflows');return false">Workflows</a>; change a cadence by editing the .plist + running <span class="mono">install-schedules.sh</span>.</div>`+
+      (Object.keys(kinds).filter(k=>groups[k]).map(k=>`<h3>${kinds[k]}</h3>${schedTable(groups[k])}`).join("")||'<div class=muted>no chad launchd timers found.</div>');
+  }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
+}
+function schedTable(rows){
+  return `<table><thead><tr><th>job</th><th>runs</th><th>schedule</th><th>status</th><th>last run</th></tr></thead><tbody>`+
+    rows.map(s=>{
+      const isWf=s.kind==="workflow"&&s.target&&/\.jsx$/.test(s.target);
+      const runs=isWf?`<a href="#" onclick="filterRunsByWf('${esc(s.target)}');return false" class="mono" style="font-size:12px">${esc(s.target.replace(/^workflows\//,''))}</a>${s.bundle?`<div class="muted" style="font-size:10px">${esc(s.bundle)}</div>`:''}`:`<span class="muted mono" style="font-size:12px">${esc(s.target||'—')}</span>`;
+      const status=s.running?'<span class="pill running">running</span>'
+        :s.loaded?((s.lastExit===0||s.lastExit==null)?'<span class="pill" style="background:rgba(63,185,80,.12);color:var(--green)">loaded</span>':`<span class="pill failed">exit ${s.lastExit}</span>`)
+        :'<span class="pill unknown">not loaded</span>';
+      const lr=s.lastRun?`${fmtTime(s.lastRun.created_at_ms)} ${pill(s.lastRun.status)}`:'<span class="muted">—</span>';
+      return `<tr><td class="mono" style="font-size:12px">${esc(s.label)}</td><td>${runs}</td><td class="muted">${esc(s.schedule)}</td><td>${status}</td><td class="muted" style="font-size:12px">${lr}</td></tr>`;
+    }).join("")+`</tbody></table>`;
+}
+function filterRunsByWf(wf){ const stem=String(wf).replace(/^workflows\//,'').replace(/\.jsx$/,''); switchTab('runs'); filter=stem; const s=document.getElementById('search'); if(s)s.value=stem; renderRuns(); }
+
+// ── Directives (steer the self-improvement loops) ────────────────────────────
+let _directives=null;
+async function loadDirectives(){
+  const el=document.getElementById("directives");
+  try{
+    const [d,sig,fx]=await Promise.all([api("/api/directives"),api("/api/signal").catch(()=>null),api("/api/fixtures").catch(()=>null)]);
+    _directives=d; const sp=d.systemPrompts||{};
+    const ta=(id,val,h,min)=>`<label class="fld" style="margin-top:10px">${h}<textarea id="${id}" spellcheck="false" style="min-height:${min||60}px;font-size:13px;font-family:ui-monospace,monospace">${esc(val||"")}</textarea></label>`;
+    el.innerHTML=`<div class="row"><h2 style="flex:1">Directives</h2><span class="meta">${d._updated?'updated '+esc(d._updated)+(d._updatedBy?' by '+esc(d._updatedBy):''):''}</span></div>
+      <div class="muted">Steer the self-improvement loops. <b>Experiments directives</b> shape the arena's breeding (reflective mutation) and scoring (judge). <b>System prompts</b> are injected into every workflow's agent calls (all + per-role). Empty = no effect. Applies on the next run.</div>
+      <div class="card">
+        ${ta('dir-exp',d.experiments,'Experiments directives — priorities, what to test/optimize, how creative to breed',130)}
+        <div class="grid2">
+          <label class="fld">Creativity<input id="dir-crea" value="${esc(d.creativity||'')}" placeholder="low | moderate | high"></label>
+          <label class="fld">Priorities (comma)<input id="dir-prio" value="${esc((d.priorities||[]).join(', '))}" placeholder="draft, summarize, classify"></label>
+        </div>
+        ${ta('dir-sp-all',sp.all,'System prompt · ALL workflow agents (house style / guardrails injected everywhere)',60)}
+        <div class="grid2">
+          ${ta('dir-sp-draft',sp.draft,'System prompt · draft role',60)}
+          ${ta('dir-sp-judge',sp.judge,'System prompt · judge role',60)}
+        </div>
+        <div class="row" style="margin-top:10px"><span class="muted" id="dir-status" style="flex:1;font-size:12px"></span><button class="primary" onclick="saveDirectives()">Save directives</button></div>
+      </div>
+      <h3>live run signal — what to review &amp; improve next</h3>
+      ${signalPanel(sig)}
+      <h3>arena fixtures — what candidates are scored against</h3>
+      ${fixturesPanel(fx)}`;
+  }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
+}
+function fixturesPanel(fx){
+  if(!fx) return '<div class="muted">no fixtures</div>';
+  const st=fx.static||[], hv=fx.harvested||[];
+  return `<div class="muted" style="font-size:11px">${st.length} static (curated) + <b style="color:var(--green)">${hv.length} harvested</b> (real run inputs) — candidates are scored against all of them each run</div>
+    ${hv.length?hv.map(f=>`<div class="card" style="padding:6px 10px;margin:6px 0"><span class="pill" style="background:rgba(88,166,255,.15);color:var(--blue);font-size:10px">${esc(f.taskKind)}</span> <span class="muted" style="font-size:10px">live · from ${esc(f.source||'')}</span><div style="font-size:12px;white-space:pre-wrap;margin-top:3px">${esc(String(f.input).slice(0,220))}${String(f.input).length>220?'…':''}</div></div>`).join(""):'<div class="muted" style="margin-top:4px">none harvested yet — needs real run inputs (email-ladder messages, fusion prompts, log samples, triaged issues)</div>'}`;
+}
+function signalPanel(sig){
+  if(!sig) return '<div class="muted">no signal available</div>';
+  const fc=sig.errorClusters||[],ls=sig.lowScorers||[],sr=sig.staleRuns||[],fr=sig.failedRuns||[];
+  return `<div class="muted" style="font-size:11px">scanned ${sig.scannedDbs} DBs · ${fr.length} failed · ${sr.length} stale · ${ls.length} low scorers — this digest is fed into the arena's reflective mutation each run</div>
+    ${fc.length?`<h3 style="margin-top:10px">failure clusters</h3>${fc.map(e=>`<div style="font-size:12px;margin:2px 0"><span class="pill failed">${e.count}×</span> <span class="mono">${esc(e.error)}</span></div>`).join("")}`:''}
+    ${ls.length?`<h3 style="margin-top:10px">lowest-scoring candidates</h3>${ls.slice(0,8).map(l=>`<div style="font-size:12px;margin:2px 0"><b class="mono">${esc(l.task)}</b> on ${esc(l.model)} = <b style="color:var(--red)">${l.score}</b> <span class="muted">${esc(l.why||'')}</span></div>`).join("")}`:''}
+    ${sr.length?`<h3 style="margin-top:10px">stale non-terminal runs</h3>${sr.slice(0,8).map(r=>`<div style="font-size:12px;margin:2px 0"><a href="#" onclick="switchTab('runs');selectRun('${esc(r.runId)}');return false">${esc((r.runId||'').slice(0,8))}</a> ${esc(r.workflow||'')} · ${pill(r.status)} <span class="muted">(${esc(r.db)})</span></div>`).join("")}`:''}
+    ${fr.length?`<details style="margin-top:10px"><summary class="muted">recent failed runs (${fr.length})</summary>${fr.map(r=>`<div style="font-size:11px;margin:2px 0"><a href="#" onclick="switchTab('runs');selectRun('${esc(r.runId)}');return false">${esc((r.runId||'').slice(0,8))}</a> ${esc(r.workflow||'')}: <span class="err">${esc(r.error||'')}</span></div>`).join("")}</details>`:''}
+    ${!fc.length&&!ls.length&&!sr.length&&!fr.length?'<div class="muted">clean — nothing flagged in the window</div>':''}`;
+}
+async function saveDirectives(){
+  const v=(id)=>{const e=document.getElementById(id);return e?e.value:"";};
+  const d={...(_directives||{})};
+  d.experiments=v('dir-exp'); d.creativity=v('dir-crea').trim();
+  d.priorities=v('dir-prio').split(',').map(s=>s.trim()).filter(Boolean);
+  d.systemPrompts={...(d.systemPrompts||{}),all:v('dir-sp-all'),draft:v('dir-sp-draft'),judge:v('dir-sp-judge')};
+  const st=document.getElementById("dir-status"); st.style.color="var(--muted)"; st.textContent="saving…";
+  try{ await post("/api/directives",d); st.style.color="var(--green)"; st.textContent="✓ saved — applies on the next run"; _directives=d; }
+  catch(e){ st.style.color="var(--red)"; st.textContent="failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":""); }
+}
 
 const spark=(scores)=>{ const b="▁▂▃▄▅▆▇█"; return (scores||[]).map(s=>b[Math.min(7,Math.max(0,Math.round((Number(s)||0)*7)))]).join("")||"—"; };
 // rough inference-cost rank (cheaper = lower) for downgrade recommendations
@@ -479,23 +769,47 @@ async function loadExperiments(){
       <h3>run outcomes — all workflows</h3>
       <div class="row" style="gap:10px;flex-wrap:wrap">${Object.entries(outc).sort((a,b)=>b[1]-a[1]).map(([s,n])=>`${pill(s)}&nbsp;<b>${n}</b>`).join("")||'<span class=muted>no runs</span>'}</div>`;
     // efficiency: tokens by workflow + downgrade savings + already-cheap profiles
-    const fmtTok=(n)=>n>=1000?(n/1000).toFixed(1)+"k":String(n||0);
-    const effBars=eff&&eff.byWorkflow?Object.entries(eff.byWorkflow).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([w,v])=>({label:String(w).replace(/^chad-/,""),value:v,color:"var(--blue)"})):[];
+    const fmtTok=(n)=>n>=1e6?(n/1e6).toFixed(2)+"M":n>=1000?(n/1000).toFixed(1)+"k":String(n||0);
+    const usd=(n)=>{n=Number(n)||0;return n>=1000?'$'+(n/1000).toFixed(1)+'k':'$'+n.toFixed(2);};
+    const C=eff&&eff.cost?eff.cost:null;
+    const costBar=(label,val,max,color)=>{const w=Math.max(1.5,Math.min(100,(max>0?val/max:0)*100));return `<div style="margin:4px 0"><div class="row" style="justify-content:space-between;font-size:11px"><span class="muted">${esc(label)}</span><span style="color:${color}">${usd(val)}</span></div><div style="height:7px;background:#0b0f14;border-radius:4px;overflow:hidden"><div style="height:100%;width:${w}%;background:${color}"></div></div></div>`;};
+    // HERO — money & tokens saved vs running everything on a frontier model.
+    const heroHtml=C?`<div class="card" style="background:linear-gradient(135deg,#0c2a1b 0%,#0d1b2e 100%);border-color:#1f6f43">
+      <div class="row" style="align-items:center;flex-wrap:wrap;gap:24px">
+        <div style="flex:1;min-width:230px">
+          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.06em">saved vs frontier models</div>
+          <div style="font-size:44px;font-weight:800;color:var(--green);line-height:1.05">${usd(C.saved)}</div>
+          <div class="muted" style="font-size:12.5px;margin-top:2px"><b style="color:var(--fg)">${fmtTok(eff.totalTokens)}</b> tokens — would cost <b style="color:var(--red)">${usd(C.frontierCost)}</b> on ${esc(C.frontierLabel)}, run <b style="color:var(--green)">free</b> on Nemotron</div>
+        </div>
+        <div style="flex:1;min-width:230px">
+          ${costBar("if every token → "+C.frontierLabel,C.frontierCost,C.frontierCost,'var(--red)')}
+          ${costBar("at market rates (models used)",C.listCost,C.frontierCost,'var(--yellow)')}
+          ${costBar("actually paid (Nemotron free)",C.actualCost,C.frontierCost,'var(--green)')}
+          <div class="muted" style="font-size:10.5px;margin-top:5px">${fmtTok(eff.inputTokens)} in · ${fmtTok(eff.outputTokens)} out · rough estimates, tunable in state/model-costs.json</div>
+        </div>
+      </div></div>`:"";
+    const mcRows=C&&C.byModel?Object.entries(C.byModel).filter(([m,b])=>b.tokens>0&&m!=='unknown').sort((a,b)=>b[1].frontierCost-a[1].frontierCost).slice(0,8):[];
+    const modelCostHtml=mcRows.length?`<h3>cost by model — what each burned</h3>
+      <div style="overflow:auto"><table><thead><tr><th>model</th><th>tokens</th><th>on frontier</th><th>at market</th></tr></thead><tbody>
+      ${mcRows.map(([m,b])=>`<tr><td class="mono" style="font-size:12px">${esc(short(m))}</td><td class="muted">${fmtTok(b.tokens)}</td><td style="color:var(--red)">${usd(b.frontierCost)}</td><td class="muted">${usd(b.estCost)}</td></tr>`).join("")}
+      </tbody></table></div>`:"";
+    const effBars=eff&&eff.byWorkflow?Object.entries(eff.byWorkflow).filter(([,v])=>v&&v.tokens>0).sort((a,b)=>b[1].tokens-a[1].tokens).slice(0,8).map(([w,v])=>({label:String(w).replace(/^chad-/,""),value:v.tokens,color:"var(--blue)"})):[];
     const maxTok=effBars.length?Math.max(...effBars.map(b=>b.value)):1;
     const effHtml=eff?`
-      <h3>efficiency — ${fmtTok(eff.totalTokens)} tokens across all runs</h3>
       <div class="row" style="gap:24px;flex-wrap:wrap;align-items:flex-start">
-        <div style="flex:1;min-width:280px"><div class="muted" style="font-size:11px;margin-bottom:4px">tokens by workflow</div>${effBars.length?svgBars(effBars,{max:maxTok}):'<div class=muted>no token data yet</div>'}</div>
-        <div style="flex:1;min-width:280px"><div class="muted" style="font-size:11px;margin-bottom:4px">downgrade savings</div>
-          ${eff.downgrades&&eff.downgrades.length?eff.downgrades.map(d=>`<div style="font-size:12px">${esc(d.task)}: <b>${esc(short(d.from))}→${esc(short(d.to))}</b> <span style="color:var(--green)">~${d.savingsPct}% cheaper tier</span></div>`).join(""):'<div class=muted>none — tasks already on the cheapest within tolerance</div>'}
+        <div style="flex:1;min-width:280px"><h3>tokens by workflow</h3>${effBars.length?svgBars(effBars,{max:maxTok}):'<div class=muted>no token data yet</div>'}</div>
+        <div style="flex:1;min-width:280px"><h3>downgrade savings</h3>
+          ${eff.downgrades&&eff.downgrades.length?eff.downgrades.map(d=>`<div style="font-size:12px;margin:2px 0">${esc(d.task)}: <b>${esc(short(d.from))}→${esc(short(d.to))}</b> <span style="color:var(--green)">~${d.savingsPct}% cheaper${d.savedPer1M?` · ~$${d.savedPer1M}/1M tok`:''}</span></div>`).join(""):'<div class=muted>none — tasks already on the cheapest within tolerance</div>'}
           <div class="muted" style="font-size:11px;margin-top:6px">✓ ${(eff.applied||[]).length} task-profile(s) already on a cheap (super/nano) tier</div>
         </div>
       </div>`:"";
     el.innerHTML=`<div class="row"><h2 style="flex:1">Experiments — evolutionary arena</h2>
         <span class="meta">🏆 ${by.champion} champions · ${by.active} active · 🪦 ${by.retired} retired</span></div>
+      ${heroHtml}
+      ${effHtml}
+      ${modelCostHtml}
       ${matrixHtml}
       ${chartsHtml}
-      ${effHtml}
       <h3>nightly runs (${nights.length})</h3>
       ${nights.length?`<table><thead><tr><th>night</th><th>status</th><th>dur</th><th>run</th></tr></thead><tbody>${
         nights.map(r=>`<tr class="run" style="cursor:pointer" onclick="switchTab('runs');selectRun('${esc(r.run_id)}')">
@@ -516,10 +830,13 @@ async function loadExperiments(){
 
 function switchTab(tab){
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.tab===tab));
-  for(const v of ["runs","workflows","approvals","experiments"]) document.getElementById("view-"+v).style.display = v===tab ? (v==="runs"?"grid":"block") : "none";
+  for(const v of ["runs","workflows","approvals","chains","schedules","experiments","directives"]) document.getElementById("view-"+v).style.display = v===tab ? (v==="runs"?"grid":"block") : "none";
   if(tab==="workflows") loadWorkflows();
   if(tab==="approvals") loadApprovals();
+  if(tab==="chains") loadChains();
+  if(tab==="schedules") loadSchedules();
   if(tab==="experiments") loadExperiments();
+  if(tab==="directives") loadDirectives();
 }
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>switchTab(t.dataset.tab));
 
@@ -528,6 +845,7 @@ updateBell();
 enableNotifications(); // ask once for desktop approval notifications
 document.addEventListener("click", enableNotifications, { once: true }); // fallback: some browsers need a gesture
 setInterval(()=>{ if(document.getElementById("view-runs").style.display!=="none") loadRuns(); }, 5000);
+setInterval(()=>{ if(document.getElementById("view-chains").style.display!=="none") refreshChainList(); }, 5000);
 setInterval(loadApprovalsBadge, 15000);
 </script>
 </body>
