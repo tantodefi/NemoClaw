@@ -16,13 +16,17 @@ fork a run, or check the evolutionary leaderboard.
 ## The two surfaces
 
 - **Web IDE** (operators): `https://runs.supachad.com` behind Cloudflare Access.
-  Tabs: Runs (live + history, task tree with **per-node token counts** + a
+  Seven tabs: **Runs** (live + history, task tree with **per-node token counts** + a
   **"reasoning hidden" badge** so a terse final answer reads as intentional not
   broken, event log, agent trace, diff, fused/report output rendered inline),
-  Workflows (**full catalog incl. scaffolds with run counts**; edit `.jsx` w/
+  **Workflows** (**full catalog incl. scaffolds with run counts**; edit `.jsx` w/
   syntax highlighting, visual DAG, **Launch settings drawer**: input JSON +
   reasoning / timeouts / max-output-tokens / backend / dry-run / fusion-panel,
-  plus **Re-run ⟳** on a finished run), Approvals, Experiments. Per-launch settings
+  plus **Re-run ⟳** on a finished run), **Approvals** (pending gates + notify-channel
+  config), **Chains** (compose workflows into a pipeline; resume/rerun a failed
+  step), **Schedules** (launchd timers + live status), **Experiments** (evolutionary
+  leaderboard + cost-savings), and **Directives** (operator free-text + DB-signal
+  digest + arena fixtures that steer the self-improvement loop). Per-launch settings
   post to `/api/launch` as an **allowlisted** env map (CHAD_*/DRY_RUN only); the
   drawer shows each model's output/context ceiling (`/api/model-limits`) and
   **preflights** settings (`/api/preflight` blocks output > context window, warns +
@@ -36,24 +40,63 @@ Auth + endpoint resolve from `credentials.json` automatically:
 - Pod: set `CHAD_RUNS_URL=https://runs.supachad.com`; it adds the Cloudflare
   Access service token (`CF_ACCESS_CLIENT_ID/SECRET`) to pass Access + the key.
 
+`chad-runs` mirrors **every** `serve-runs.js` endpoint (run it with no args for
+grouped help). Output is JSON — pipe to `jq`.
+
 ```sh
+# Runs + inspect
 chad-runs health                      # {ok, dbs}
-chad-runs workflows                   # launchable *.jsx
 chad-runs runs                        # all runs (live + history), newest first
-chad-runs get <runId>                 # run detail: tasks, states, outputs
+chad-runs get <runId>                 # run detail: tasks, states, outputs, telemetry
 chad-runs logs <runId> [--limit N]    # event stream (NodeStarted/Finished…)
 chad-runs chat <runId>                # agent chat output for the run
 chad-runs trace <runId> <node>        # one task's reasoning/tool trace
+chad-runs diff <runId> <node>         # unified diff for a code-editing node
+
+# Lifecycle
+chad-runs launch <wf> [--input '<json>'] [--env '<json>']  # detached; appears live
+chad-runs preflight <wf> [--env '<json>']  # advisory: is this launch safe? (no run)
+chad-runs cancel <runId>
+chad-runs resume <runId>              # resume a stalled/crashed run from checkpoint
+chad-runs fork <runId> [--frame N --reset-node X]   # time-travel branch
+
+# Autonomy gates
+chad-runs approvals                   # pending gates across all DBs
+chad-runs approve <runId> [--node N --iteration I]
+chad-runs deny <runId> [--node N --iteration I]
+
+# Workflows + catalog
+chad-runs workflows                   # launchable *.jsx
+chad-runs catalog                     # every workflow + matched DB + run count (incl. 0-run scaffolds)
 chad-runs graph <wf>                  # workflow structure (DAG json)
 chad-runs cat <wf>                    # read a workflow's source
 chad-runs save <wf> <localfile>       # write/replace a workflow's source
-chad-runs launch <wf> [--input '<json>']   # run detached; appears live under Runs
-chad-runs cancel <runId>
-chad-runs fork <runId> [--frame N --reset-node X]   # time-travel branch
-chad-runs approve <runId> [--node N --iteration I]  # resolve an autonomy gate
-chad-runs deny <runId> [--node N --iteration I]
-chad-runs approvals                   # pending gates
+
+# Models + cost
+chad-runs models                      # live model roster (catalog ∩ liveness)
+chad-runs model-limits                # per-model output/context ceilings
+chad-runs model-matrix                # best model per task-kind (performance grid)
+chad-runs efficiency                  # tokens by workflow + downgrade savings
+chad-runs schedules                   # scheduled jobs (launchd timers) + live status
+
+# Self-improvement loop  →  see "Steering the loop" below
 chad-runs experiments                 # evolutionary leaderboard + report
+chad-runs signal [--days N]           # review-worthy runs (failed/stale/low-quality)
+chad-runs fixtures                    # arena fixture set (static + harvested)
+chad-runs directives                  # read the operator directives steering the loop
+chad-runs set-directives <file.json>  # write them (Access-gated mutation)
+
+# Approval-notify channels
+chad-runs notify-config               # which channels the server pushes gates on
+chad-runs set-notify webui,email      # set them (webui,email,telegram,moshi)
+
+# Workflow chaining  →  see "Driving a chain" below
+chad-runs chains                      # list chains (live + history)
+chad-runs chain <id>                  # one chain's step states
+chad-runs chain-create <file.json>    # start a chain: {steps:[{workflow,input,env}], passOutput}
+chad-runs chain-cancel <id>
+chad-runs chain-resume <id>           # re-run the step a failed chain stopped on
+chad-runs chain-rerun <id> --index N  # re-run from step N (resets N..end)
 ```
 
 ### Worked examples
@@ -81,6 +124,31 @@ chad-runs graph workflows/mcp-health-probe.jsx     # validate it parses
 chad-runs launch workflows/mcp-health-probe.jsx
 ```
 
+**Steering the self-improvement loop.** The arena's breeding/scoring and every
+agent's system prompt read `state/directives.json`; `signal` is the trace-grounded
+DB scan (failed/stale/low-quality runs) that feeds the next generation. Read the
+signal, then steer:
+```sh
+chad-runs signal --days 7 | jq '{failed:.failedRuns|length, low:.lowScorers|length}'
+chad-runs directives > /tmp/d.json
+#   …edit /tmp/d.json (e.g. set experiments: "favor terse, cite-grounded drafts")…
+chad-runs set-directives /tmp/d.json     # lands in the next arena run + agent prompts
+```
+
+**Driving a chain.** String workflows into a pipeline; each step launches when the
+prior reaches `finished`, optionally feeding its output forward (`passOutput`). A
+step that pauses at a gate HOLDS the chain until you `approve` it.
+```sh
+cat > /tmp/chain.json <<'JSON'
+{ "passOutput": true, "steps": [
+  { "workflow": "issue-triage.jsx" },
+  { "workflow": "content-pipeline.jsx" } ] }
+JSON
+chad-runs chain-create /tmp/chain.json
+chad-runs chains | jq '.chains[0] | {id, status, current}'
+#   if a step fails:  chad-runs chain-resume <id>   (or chain-rerun <id> --index 0)
+```
+
 ## Model routing (agents.js)
 
 Workflows never name a model — they call `pickAgent(role)`. The router
@@ -100,9 +168,12 @@ model can't sink the run. Timeouts: `CHAD_TASK_TIMEOUT_MS` (capable, default
 10min), `CHAD_TASK_TIMEOUT_MS_CHEAP` (2min). Response length:
 `CHAD_MAX_OUTPUT_TOKENS[_CHEAP]` (frugal tier defaults, clamped to the model's
 `model-registry.json` ceiling — those defaults are budgets, not model limits).
-Parse loose model/tool JSON with
-`coerceJson(text, schema)` from `../lib/coerce.js` (strips fences/prose, validates
-a zod schema, returns null on bad output — drop the row instead of burning retries).
+Agent `<Task output={outputs.x}>` results are parsed + zod-validated by Smithers'
+structured-output layer — you do NOT hand-parse a model task's JSON. `coerceJson(text,
+schema)` from `../lib/coerce.js` is for **raw subprocess/tool stdout** you read
+yourself (e.g. `runSpawn` parsing a `chad-spawn` result.json in `lib/spawn.js`):
+it strips fences/prose, validates a zod schema, and returns null on bad output so you
+drop the row instead of throwing.
 
 ## Writing a workflow (the shape)
 
@@ -149,6 +220,23 @@ they would do unless an explicit env flag is set.
 | `token-optimize.jsx` | "Tokenmaxxing": probe whether a cheaper model matches a task's quality → Approval-gated downgrade; on approval+`APPLY=1` writes the cheaper model into `../task-profiles.json` (snapshot-first, dot-path). Runs nightly (shadow); feeds the Experiments **model × task** matrix. | `state/downgrade-candidates.json`, `CHAD_TOKENOPT_BAR/TOLERANCE`, `CHAD_TOKENOPT_APPLY=1` |
 | `bug-report.jsx` | Chad catches his OWN failures (failed runs/nodes across the DBs + host logs) → clusters into distinct bugs → Approval → `gh issue create` (dedups open issues). Shadow unless `CHAD_BUGREPORT_POST=1`. Runs nightly. | `CHAD_BUGREPORT_REPO`, `CHAD_BUGREPORT_POST=1`, `CHAD_BUGREPORT_LABEL` |
 | `skill-improve.jsx` | Chad proposes ENHANCEMENTS to his own workflows/skills (robustness/perf/cost/feature/docs) → Approval → files GitHub enhancement issues (never edits source). Shadow unless `CHAD_SKILLIMPROVE_POST=1`. Runs nightly. | `CHAD_SKILLIMPROVE_REPO`, `CHAD_SKILLIMPROVE_POST=1` |
+| `code-review-loop.jsx` | Iterate a PR review to convergence with the built-in **`<ReviewLoop>`** — producer drafts/refines the review, a distinct reviewer judges `approved`, repeat until clean or max iters. Read-only `gh pr diff`; draft-only (never comments). | `--input '{"repo":"o/r","pr":N}'`, `CHAD_CODEREVIEW_POST=1` |
+| `dependency-update.jsx` | Keep deps current via **`<ScanFixVerify>`** — scanner triages `npm outdated` into safe/review/risky, fixer drafts the bump set, verifier sanity-checks. Proposal only; pins the smithers line at review. | `CHAD_DEPUPDATE_APPLY=1`, `CHAD_DEPUPDATE_POST=1` |
+| `debate.jsx` | Adversarial reasoning via **`<Debate>`** — two models argue for/against across N rounds, a judge rules. The counterpart to fusion (argue-to-consensus vs parallel-synthesize) for contested calls. | `--input '{"topic":"…"}'`, `CHAD_DEBATE_ROUNDS`, `CHAD_DEBATE_POST=1` |
+| `canary-judge.jsx` | Post-deploy verification via **`<Poller>`** — polls a health endpoint (deterministic HTTP check fn) until stably healthy or timeout, then a judge rules promote/hold/rollback. Advisory only. | `--input '{"url":"…/health"}'`, `CHAD_CANARY_POST=1` |
+| `changelog.jsx` | Draft a changelog entry from recent git log → Approval → note. A plain Sequence (linear shape; no composite forced). | `CHAD_CHANGELOG_SINCE`, `CHAD_CHANGELOG_POST=1` |
+| `pr-shepherd.jsx` | Keep open PRs moving: fetch → **deterministic** per-PR action (`lib/pr.js#prAction`, no LLM) → one cheap-tier digest of "what's blocked on whom". Read-only `gh pr list`; advisory. | `CHAD_PRSHEP_REPO`, `CHAD_PRSHEP_STALE_DAYS`, `CHAD_PRSHEP_POST=1` |
+| `coverage-loop.jsx` | Raise test coverage toward a target via **`<Loop>`** — measure (read-only) → draft focused tests → re-measure, until target or max iters. Draft-only unless `APPLY=1` (exits after one pass in shadow). | `CHAD_COVERAGE_CMD/TARGET/DIR`, `CHAD_COVERAGE_APPLY=1` |
+
+The composite-based rows (added with the Smithers 0.26 upgrade) lean on Smithers'
+**built-in composite components** — `ReviewLoop`, `ScanFixVerify`, `Debate`, `Poller`,
+`Loop` — imported directly from `smithers-orchestrator` (they are top-level exports,
+NOT part of the `createSmithers()` return, which only carries the primitives). Prefer
+a composite when the shape matches (review/scan-fix/debate/poll/iterate-to-target);
+use a plain `Sequence` when it doesn't (changelog), and keep routing **deterministic**
+where you can (`pr-shepherd`'s `lib/pr.js`, `issue-triage`'s `scoreIssue`) so the model
+is spent on the summary, not the decision. Fan-outs (`fusion`, `token-optimize`) cap
+concurrency with `<Parallel maxConcurrency={N}>` so a big panel can't hammer the API.
 
 ## chad-spawn bridge (lib/spawn.js)
 

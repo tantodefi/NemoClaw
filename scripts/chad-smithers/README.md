@@ -14,14 +14,18 @@ resume guarantees to hold.
 | File | Role |
 |---|---|
 | `agents.js` | Model router + resilience helpers. `pickAgent(role)` auto-detects a backend by tier; `pickFallback(role)` gives a different-backend fallback; `taskOpts(role,{continueOnFail})` returns tier-aware `{timeoutMs,retries}` to spread on a `<Task>`. |
-| `lib/population.js` | Evolutionary selection engine (pure, unit-tested): start wide → score → rank → retire losers. |
-| `lib/population.test.js` | `node --test lib/population.test.js` — 6 tests, all green. |
+| `lib/population.js` | Evolutionary selection engine (pure, unit-tested): start wide → score → rank → Pareto (quality↑ vs cost↓) → retire losers. |
+| `lib/population.test.js` | `node --test lib/population.test.js` — 9 tests, all green. |
 | `lib/spawn.js` | The chad-spawn ⇄ Smithers bridge: `runSpawn()` (offload a step to chad-spawn, reconcile its `result.json`), `route()` (chad-route ported), `scoreIssue()`. Never throws. |
 | `lib/spawn.test.js` | `bun test lib/spawn.test.js` — 8 tests, all green. |
-| `lib/coerce.js` | Tolerant JSON extraction: `coerceJson(text,schema)` strips fences/prose, validates a zod schema, returns null on bad output (the schemaFailFast idea). |
+| `lib/coerce.js` | Tolerant JSON extraction for **raw subprocess/tool stdout** (agent-task output is parsed by Smithers itself): `coerceJson(text,schema)` strips fences/prose, validates a zod schema, returns null on bad output (the schemaFailFast idea). Used by `lib/spawn.js` on `chad-spawn` result.json. |
 | `lib/coerce.test.js` | `node --test lib/coerce.test.js` — 8 tests, all green. |
 | `lib/model-limits.js` | Per-model ceilings (context / maxOutputTokens) from `../model-registry.json`: `limitsFor()` / `clampOutput()` / `preflight()`. The NVIDIA API exposes no limits, so the registry is the curated record (+ conservative `unknownModel` fallback). |
 | `lib/model-limits.test.js` | `node --test lib/model-limits.test.js` — 8 tests, all green. |
+| `lib/pr.js` | Deterministic PR triage for `pr-shepherd.jsx`: `prAction()` picks the one next action (draft/conflicts/checks-failing/changes-requested/merge-ready/stale-nudge/needs-review/waiting) from a `gh pr list --json` row — no LLM. `shepherdSummary()`, `checksFailing()`. |
+| `lib/pr.test.js` | `node --test lib/pr.test.js` — 12 tests, all green. |
+| `lib/coverage.js` | Deterministic coverage parsing for `coverage-loop.jsx`: `parseCoverage()` (total % from a report tail, tolerant of missing tooling), `uncoveredLines()`. |
+| `lib/coverage.test.js` | `node --test lib/coverage.test.js` — 6 tests, all green. |
 | `experiments.jsx` | The nightly evolutionary workflow (Smithers). |
 | `workflows/*.jsx` | Ported chad-spawn / cron features (issue-triage, content-pipeline, self-improve, memory-curator, log-digest) + email-ladder, fusion, mcp-health-probe, fail-only-report. All graph-validate; side-effecting ones are shadow-safe by default. |
 | `state/seed-candidates.json` | Tracked. Initial variant pool to seed the arena wide. |
@@ -280,7 +284,7 @@ smithers up experiments.jsx --resume <runId> --force   # resume a crashed/stalle
   capable-tier only. Measure with a streaming probe (look at `reasoning_content` +
   `finish_reason`), not just wall time.
 - **What stays on Ultra after the cheap→Super flip:** every `judge`-role call
-  (capable tier — evaluation/moderation/scoring/proposals across 8 workflows). The
+  (capable tier — evaluation/moderation/scoring/proposals across the capable-tier workflows). The
   only cheap-tier draft that's operator-facing, `email-ladder`'s reply, is pinned
   back to Ultra via `CHAD_EMAIL_DRAFT_MODEL` (gated + not latency-critical, 300s
   task timeout for the slow model). fusion/token-optimize `draft` pin their own
