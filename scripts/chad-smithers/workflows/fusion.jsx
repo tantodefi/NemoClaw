@@ -30,6 +30,10 @@ import { loadPopulation, champions, activeCandidates } from "../lib/population.j
 
 const DB = process.env.CHAD_FUSION_DB || "./fusion.db";
 const MAX_PANEL = Number(process.env.CHAD_FUSION_MAX || 6);
+// Throttle how many panelists call the API at once. The panel is count-capped by
+// MAX_PANEL, but without a concurrency cap all of them fire simultaneously — fine
+// at 6, a rate-limit risk if the roster grows. Default 4 in flight at a time.
+const PANEL_CONCURRENCY = Number(process.env.CHAD_FUSION_CONCURRENCY || 4);
 const dedupe = (a) => [...new Set(a)];
 
 // Winning MODEL candidates from the nightly arena, best (champion) first. Empty
@@ -88,8 +92,11 @@ export default smithers((ctx) => {
   // Fan out: the same prompt to every model, each its own durable task. No
   // fallbackAgent here — we want THAT model's answer or none (continueOnFail
   // drops a failed panelist so the fusion still completes with the survivors).
-  const candidates = MODELS.map((m) => (
-    <Task key={m} id={`gen-${safe(m)}`} output={outputs.response}
+  // Index-prefix the node id so two model ids that slug to the same string
+  // (e.g. "org/model.x" and "org-model-x" both → "org-model-x") can't collide on
+  // the node id — a distinct-model panel must stay distinct in the run DAG.
+  const candidates = MODELS.map((m, i) => (
+    <Task key={m} id={`gen-${i}-${safe(m)}`} output={outputs.response}
       agent={pickAgent("draft", { backend: "nemotron", model: m })}
       {...taskOpts("draft", { backend: "nemotron", continueOnFail: true })}>
       {`${prompt}\n\nRespond directly. Then return JSON { model: "${m}", text: "<your answer>" }.`}
@@ -99,7 +106,7 @@ export default smithers((ctx) => {
   return (
     <Workflow name="chad-fusion">
       <Sequence>
-        <Parallel>{candidates}</Parallel>
+        <Parallel maxConcurrency={PANEL_CONCURRENCY}>{candidates}</Parallel>
 
         {/* Judge: structured analysis of the panel (not yet the final answer). */}
         <Task id="judge" output={outputs.judgment}

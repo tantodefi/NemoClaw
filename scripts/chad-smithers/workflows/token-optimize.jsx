@@ -28,6 +28,9 @@ const CAND_PATH = process.env.CHAD_TOKENOPT_CANDIDATES || new URL("../state/down
 const BAR = Number(process.env.CHAD_TOKENOPT_BAR || 75);          // min cheaper score to consider a downgrade
 const TOLERANCE = Number(process.env.CHAD_TOKENOPT_TOLERANCE || 6); // cheaper may be at most this far below current
 const APPLY = process.env.CHAD_TOKENOPT_APPLY === "1";            // shadow unless set
+// Cap concurrent model calls in the produce fan-out (2 tiers × N candidates can
+// balloon). Default 4 in flight; raise/lower with CHAD_TOKENOPT_CONCURRENCY.
+const PROBE_CONCURRENCY = Number(process.env.CHAD_TOKENOPT_CONCURRENCY || 4);
 const TASK_PROFILES = new URL("../../task-profiles.json", import.meta.url).pathname; // scripts/task-profiles.json
 
 const DEFAULT_CANDIDATES = [
@@ -102,7 +105,7 @@ export default smithers((ctx) => {
   return (
     <Workflow name="chad-token-optimize">
       <Sequence>
-        <Parallel>{produce}</Parallel>
+        <Parallel maxConcurrency={PROBE_CONCURRENCY}>{produce}</Parallel>
 
         {/* Single capable judge scores EVERY produced answer (the fan-in pattern,
             like fusion's judge) — avoids dynamic fan-out after a phase. */}
