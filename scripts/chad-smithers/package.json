@@ -14,11 +14,11 @@
   "dependencies": {
     "@ai-sdk/anthropic": "latest",
     "@ai-sdk/openai-compatible": "latest",
-    "@smithers-orchestrator/agents": "latest",
+    "@smithers-orchestrator/agents": "^0.26.1",
     "ai": "latest",
     "react": "19",
     "react-dom": "19",
-    "smithers-orchestrator": "latest",
+    "smithers-orchestrator": "^0.26.1",
     "zod": "^4.4.3"
   }
 }
