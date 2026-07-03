@@ -622,6 +622,7 @@ function chainCardHtml(ch){
       ${acts}</div>`;
   }).join('<span class="muted" style="margin:0 1px">→</span>');
   const ctrls=`${failed?`<button class="primary" onclick="resumeChain('${esc(ch.id)}')" title="Re-run the step it stopped on and continue">Resume chain ▶</button>`:''}
+    <button onclick="forkChain('${esc(ch.id)}')" title="Copy this chain into a fresh run from step 1 (leaves this one untouched)">Fork ⑂</button>
     ${ch.status==="running"?`<button class="danger" onclick="cancelChain('${esc(ch.id)}')">Cancel</button>`:''}`;
   const done=ch.steps.filter(s=>String(s.status).toLowerCase()==='finished').length;
   return `<div class="card" id="chaincard-${esc(ch.id)}"><div class="row"><b class="mono" style="flex:1">${esc(ch.id)}</b>${pill(ch.status)} ${ctrls}</div>
@@ -631,6 +632,7 @@ function chainCardHtml(ch){
 async function cancelChain(id){ if(!confirm("Cancel this chain (and its running step)?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/cancel"); refreshChainList(); }catch(e){ alert("cancel failed: "+e.message); } }
 async function resumeChain(id){ if(!confirm("Resume this chain from the step it stopped on?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/resume"); refreshChainList(); }catch(e){ alert("resume failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
 async function rerunChainStep(id,index){ if(!confirm("Re-run the chain from step "+(index+1)+"? Resets this and all later steps."))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/rerun-step",{index}); refreshChainList(); }catch(e){ alert("rerun failed: "+e.message); } }
+async function forkChain(id){ if(!confirm("Fork this chain into a fresh run from step 1? The original is left untouched."))return; try{ const r=await post("/api/chains/"+encodeURIComponent(id)+"/fork"); refreshChainList(); if(r&&r.id) alert("Forked → "+r.id); }catch(e){ alert("fork failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
 // Jump from a run's chain badge to its card in the Chains tab.
 function gotoChain(id){ switchTab('chains'); setTimeout(()=>{ const el=document.getElementById('chaincard-'+id); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); el.style.outline='2px solid var(--accent)'; setTimeout(()=>el.style.outline='',1600); } },400); }
 

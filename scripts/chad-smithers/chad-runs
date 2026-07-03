@@ -15,20 +15,20 @@
 //   • Writes authorize with SMITHERS_RUNS_API_KEY (x-smithers-key).
 // All three come from host credentials.json (or env overrides).
 //
-// Usage:
-//   chad-runs health
-//   chad-runs runs                       # all runs (live + history)
-//   chad-runs get <runId>                # run detail (tasks + outputs)
-//   chad-runs logs <runId> [--limit N]   # event stream
-//   chad-runs trace <runId> <node>       # per-task agent trace
-//   chad-runs workflows                  # launchable workflows
-//   chad-runs graph <workflow>           # workflow structure (no run)
-//   chad-runs launch <workflow> [--input '<json>']
-//   chad-runs cancel <runId>
-//   chad-runs approve <runId> [--node N --iteration I]
-//   chad-runs deny    <runId> [--node N --iteration I]
-//   chad-runs approvals                  # pending gates
-//   chad-runs experiments                # leaderboard + report
+// Usage (mirrors every serve-runs.js endpoint — run `chad-runs` with no args for
+// the grouped help):
+//   Runs/inspect: health · runs · get <id> · logs <id> [--limit N] ·
+//     trace <id> <node> · chat <id> · diff <id> <node>
+//   Lifecycle: launch <wf> [--input JSON] [--env JSON] · preflight <wf> [--env JSON] ·
+//     cancel <id> · resume <id> · fork <id> [--frame N --reset-node X]
+//   Gates: approvals · approve <id> [--node N --iteration I] · deny <id> [...]
+//   Workflows: workflows · catalog · graph <wf> · cat <wf> · save <wf> <file>
+//   Models: models · model-limits · model-matrix · efficiency · schedules
+//   Self-improve: experiments · signal [--days N] · fixtures · directives ·
+//     set-directives <file.json>
+//   Notify: notify-config · set-notify <ch1,ch2>   (webui,email,telegram,moshi)
+//   Chains: chains · chain <id> · chain-create <file.json> · chain-fork <id> ·
+//     chain-cancel <id> · chain-resume <id> · chain-rerun <id> --index N
 //
 // Output is JSON (pipe to jq). Exit 1 on API error, 2 on usage.
 
@@ -75,7 +75,9 @@ const pos = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].
       case "graph": out = await req("GET", "/api/workflow-graph?name=" + encodeURIComponent(pos[0])); break;
       case "cat": out = await req("GET", "/api/workflow-file?name=" + encodeURIComponent(pos[0])); break;
       case "save": out = await req("POST", "/api/workflow-file", { name: pos[0], content: readFileSync(pos[1], "utf8") }); break;
-      case "launch": out = await req("POST", "/api/launch", { workflow: pos[0], input: flag("input") ? JSON.parse(flag("input")) : undefined }); break;
+      case "launch": out = await req("POST", "/api/launch", { workflow: pos[0], input: flag("input") ? JSON.parse(flag("input")) : undefined, env: flag("env") ? JSON.parse(flag("env")) : undefined }); break;
+      case "preflight": out = await req("POST", "/api/preflight", { workflow: pos[0], env: flag("env") ? JSON.parse(flag("env")) : {} }); break;
+      case "resume": out = await req("POST", `/api/runs/${encodeURIComponent(pos[0])}/resume`); break;
       case "cancel": out = await req("POST", `/api/runs/${encodeURIComponent(pos[0])}/cancel`); break;
       case "fork": out = await req("POST", `/api/runs/${encodeURIComponent(pos[0])}/fork`, { frame: flag("frame") != null ? Number(flag("frame")) : undefined, resetNode: flag("reset-node") }); break;
       case "chat": out = await req("GET", `/api/runs/${encodeURIComponent(pos[0])}/chat`); break;
@@ -84,8 +86,46 @@ const pos = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].
       case "deny": out = await req("POST", `/api/runs/${encodeURIComponent(pos[0])}/deny`, { node: flag("node"), iteration: Number(flag("iteration", "0")) }); break;
       case "approvals": out = await req("GET", "/api/approvals"); break;
       case "experiments": out = await req("GET", "/api/experiments"); break;
+      // ── Catalog / models / efficiency (read-only) ──────────────────────────
+      case "catalog": out = await req("GET", "/api/catalog"); break;
+      case "models": out = await req("GET", "/api/models"); break;
+      case "model-limits": out = await req("GET", "/api/model-limits"); break;
+      case "model-matrix": out = await req("GET", "/api/model-matrix"); break;
+      case "efficiency": out = await req("GET", "/api/efficiency"); break;
+      case "schedules": out = await req("GET", "/api/schedules"); break;
+      // ── Self-improvement loop: directives (steer) + signal + fixtures ──────
+      case "signal": out = await req("GET", "/api/signal?days=" + encodeURIComponent(flag("days", "14"))); break;
+      case "fixtures": out = await req("GET", "/api/fixtures"); break;
+      case "directives": out = await req("GET", "/api/directives"); break;
+      case "set-directives": out = await req("POST", "/api/directives", JSON.parse(readFileSync(pos[0], "utf8"))); break;
+      // ── Approval-notify channel config ─────────────────────────────────────
+      case "notify-config": out = await req("GET", "/api/notify-config"); break;
+      case "set-notify": out = await req("POST", "/api/notify-config", { channels: (pos[0] || "").split(",").map((s) => s.trim()).filter(Boolean) }); break;
+      // ── Workflow chaining ──────────────────────────────────────────────────
+      case "chains": out = await req("GET", "/api/chains"); break;
+      case "chain": out = await req("GET", "/api/chains/" + encodeURIComponent(pos[0])); break;
+      case "chain-create": out = await req("POST", "/api/chains", JSON.parse(readFileSync(pos[0], "utf8"))); break;
+      case "chain-fork": out = await req("POST", `/api/chains/${encodeURIComponent(pos[0])}/fork`, flag("pass-output") != null ? { passOutput: flag("pass-output") !== "false" } : {}); break;
+      case "chain-cancel": out = await req("POST", `/api/chains/${encodeURIComponent(pos[0])}/cancel`); break;
+      case "chain-resume": out = await req("POST", `/api/chains/${encodeURIComponent(pos[0])}/resume`); break;
+      case "chain-rerun": out = await req("POST", `/api/chains/${encodeURIComponent(pos[0])}/rerun-step`, { index: Number(flag("index", "0")) }); break;
       default:
-        console.error("usage: chad-runs <health|runs|get <id>|logs <id>|trace <id> <node>|chat <id>|diff <id> <node>|workflows|graph <wf>|cat <wf>|save <wf> <file>|launch <wf> [--input JSON]|cancel <id>|fork <id> [--frame N --reset-node X]|approve <id> [--node N --iteration I]|deny ...|approvals|experiments>");
+        console.error([
+          "usage: chad-runs <command> [args]   (output is JSON; pipe to jq)",
+          "  runs                       runs | get <id> | logs <id> [--limit N] | trace <id> <node>",
+          "  inspect                    chat <id> | diff <id> <node> | get <id>",
+          "  lifecycle                  launch <wf> [--input JSON] [--env JSON] | preflight <wf> [--env JSON]",
+          "                             cancel <id> | resume <id> | fork <id> [--frame N --reset-node X]",
+          "  gates                      approvals | approve <id> [--node N --iteration I] | deny <id> [...]",
+          "  workflows                  workflows | catalog | graph <wf> | cat <wf> | save <wf> <file>",
+          "  models                     models | model-limits | model-matrix | efficiency | schedules",
+          "  self-improve               experiments | signal [--days N] | fixtures |",
+          "                             directives | set-directives <file.json>",
+          "  notify                     notify-config | set-notify <ch1,ch2>   (webui,email,telegram,moshi)",
+          "  chains                     chains | chain <id> | chain-create <file.json> |",
+          "                             chain-fork <id> [--pass-output true|false] (copy+re-run) |",
+          "                             chain-cancel <id> | chain-resume <id> | chain-rerun <id> --index N",
+        ].join("\n"));
         process.exit(2);
     }
     console.log(JSON.stringify(out, null, 2));

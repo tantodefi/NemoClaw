@@ -63,11 +63,20 @@ const LIVENESS_FILE = process.env.CHAD_LIVENESS_FILE || join(dirname(HOST_CREDS)
 // pod here; `telegram` needs an openclaw channel (advertised, not yet wired).
 const NOTIFY_DEFAULT = (process.env.CHAD_APPROVAL_NOTIFY || "").split(",").map((s) => s.trim()).filter(Boolean);
 const NOTIFY_CFG_PATH = join(HERE, "state", "notify-config.json");
+// telegram/moshi dispatch via operator-supplied pod command templates (the
+// transport is environment-specific — an openclaw channel for telegram, an
+// iPhone-paired notify path for moshi — so it can't be hardcoded). The template
+// is a shell command run on the pod with {text} substituted for the message; when
+// set, the channel goes `ready` and the notifier actually dispatches it (no longer
+// silently dropped). E.g. CHAD_TELEGRAM_NOTIFY_CMD='openclaw channels send --to telegram --text {text}'.
+const POD_TELEGRAM_CMD = process.env.CHAD_TELEGRAM_NOTIFY_CMD || "";
+const POD_MOSHI_CMD = process.env.CHAD_MOSHI_NOTIFY_CMD || "";
 const AVAILABLE_CHANNELS = [
   { id: "browser", label: "Browser push", ready: true, note: "desktop/PWA notification — enable per-browser via the 🔔 bell" },
   { id: "webui", label: "OpenWebUI note", ready: true, note: "posts a note via the pod chad-webui" },
   { id: "email", label: "Email", ready: true, note: "emails the operator via chad-mail-send" },
-  { id: "telegram", label: "Telegram / WhatsApp", ready: false, note: "needs an openclaw channel configured on the pod" },
+  { id: "telegram", label: "Telegram / WhatsApp", ready: !!POD_TELEGRAM_CMD, note: POD_TELEGRAM_CMD ? "dispatches via CHAD_TELEGRAM_NOTIFY_CMD" : "set CHAD_TELEGRAM_NOTIFY_CMD (openclaw channel send) to enable" },
+  { id: "moshi", label: "Moshi (voice/phone)", ready: !!POD_MOSHI_CMD, note: POD_MOSHI_CMD ? "dispatches via CHAD_MOSHI_NOTIFY_CMD" : "set CHAD_MOSHI_NOTIFY_CMD (needs iPhone pairing) to enable" },
 ];
 function liveNotifyChannels() {
   try { const s = JSON.parse(readFileSync(NOTIFY_CFG_PATH, "utf8")).channels; if (Array.isArray(s)) return s; } catch { /* */ }
@@ -300,7 +309,7 @@ function modelMatrix() {
             // candidates and gpt-4 / "unknown" placeholder models out of the matrix.
             if (!/^[a-z0-9][a-z0-9-]*$/.test(String(s.candidate)) || !String(s.model).includes("/")) continue;
             tasks.add(s.candidate); models.add(s.model);
-            const k = `${s.candidate} ${s.model}`;
+            const k = `${s.candidate}::${s.model}`;
             (cell[k] ??= { sum: 0, n: 0 }); cell[k].sum += s.scorePct; cell[k].n += 1;
           }
         }
@@ -312,7 +321,7 @@ function modelMatrix() {
   for (const t of taskList) {
     matrix[t] = {}; let bm = null, bs = -1;
     for (const m of modelList) {
-      const c = cell[`${t} ${m}`];
+      const c = cell[`${t}::${m}`];
       const mean = c ? Math.round(c.sum / c.n) : null;
       matrix[t][m] = c ? { mean, n: c.n } : null;
       if (mean != null && mean > bs) { bs = mean; bm = m; }
@@ -633,10 +642,23 @@ function graphToDag(xml) {
       parents.forEach((p) => edges.push({ from: p, to: id }));
       return [id];
     }
+    // Fan groups: children all branch off the same parents (concurrent / conditional).
     if (tag === "parallel" || tag === "branch") {
       let outs = []; for (const k of kids) outs = outs.concat(walk(k, parents, tag)); return outs.length ? outs : parents;
     }
-    // sequence / workflow / wrapper: chain children
+    // Sequential containers that carry a visible group badge. `loop` also draws a
+    // back-edge (last child → first) so the repeat is visible; `saga` (compensating
+    // steps) and a nested `subworkflow` chain children under their own tag.
+    if (tag === "loop" || tag === "saga" || tag === "subworkflow") {
+      const firstBefore = nodes.length;
+      let prev = parents; for (const k of kids) prev = walk(k, prev, tag);
+      if (tag === "loop" && nodes.length > firstBefore && prev.length) {
+        const firstId = nodes[firstBefore]?.id;
+        if (firstId) prev.forEach((p) => edges.push({ from: p, to: firstId, loop: true }));
+      }
+      return prev;
+    }
+    // sequence / workflow / wrapper: chain children, inherit group
     let prev = parents; for (const k of kids) prev = walk(k, prev, group); return prev;
   }
   walk(xml, [], null);
@@ -989,20 +1011,43 @@ function chainTick() {
 
 app.get("/api/chains", (c) => c.json({ chains: loadChains() }));
 app.get("/api/chains/:id", (c) => { const ch = loadChains().find((x) => x.id === c.req.param("id")); return ch ? c.json(ch) : c.json({ error: "not found" }, 404); });
+// Build a fresh, runnable chain record from a step list. Steps are reduced to the
+// launch-safe shape (workflow + input + allowlisted env) with all run state reset,
+// so this is reused for both create and fork/clone — a forked chain is just a new
+// run built from another chain's step definitions, leaving the source untouched.
+function buildChain(op, steps, passOutput, extra = {}) {
+  return {
+    id: `chain-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    createdAt: Date.now(), createdBy: op, status: "running", passOutput: !!passOutput, current: 0,
+    ...extra,
+    steps: steps.map((s) => ({ workflow: s.workflow, input: s.input || null, env: pickLaunchEnv(s.env), status: "pending" })),
+  };
+}
 app.post("/api/chains", async (c) => {
   const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
   const body = await c.req.json().catch(() => ({}));
   const steps = Array.isArray(body.steps) ? body.steps : [];
   if (steps.length < 2) return c.json({ error: "a chain needs at least 2 steps" }, 400);
   for (const s of steps) if (!resolveWorkflow(s.workflow || "")) return c.json({ error: `unknown workflow: ${s.workflow}` }, 400);
-  const ch = {
-    id: `chain-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-    createdAt: Date.now(), createdBy: op, status: "running", passOutput: !!body.passOutput, current: 0,
-    steps: steps.map((s) => ({ workflow: s.workflow, input: s.input || null, env: pickLaunchEnv(s.env), status: "pending" })),
-  };
+  const ch = buildChain(op, steps, body.passOutput);
   saveChain(ch);
   console.error(`chain start: ${ch.id} by ${op} (${steps.map((s) => s.workflow).join(" → ")})`);
   return c.json({ ok: true, id: ch.id, chain: ch });
+});
+// Fork/clone: spin up a NEW chain run from an existing chain's step definitions —
+// the source (running or finished) is left exactly as-is. The whole pipeline re-runs
+// from step 0; pass {passOutput} to override the source's setting. This is the
+// "copy + re-run a chain" primitive (the chain-level analogue of forking a run).
+app.post("/api/chains/:id/fork", async (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const src = loadChains().find((x) => x.id === c.req.param("id"));
+  if (!src) return c.json({ error: "not found" }, 404);
+  const body = await c.req.json().catch(() => ({}));
+  for (const s of src.steps) if (!resolveWorkflow(s.workflow || "")) return c.json({ error: `unknown workflow in source: ${s.workflow}` }, 400);
+  const ch = buildChain(op, src.steps, body.passOutput ?? src.passOutput, { forkedFrom: src.id });
+  saveChain(ch);
+  console.error(`chain fork: ${ch.id} from ${src.id} by ${op}`);
+  return c.json({ ok: true, id: ch.id, forkedFrom: src.id, chain: ch });
 });
 app.post("/api/chains/:id/cancel", (c) => {
   const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
@@ -1051,12 +1096,20 @@ app.get("/index.html", (c) => c.html(readFileSync(join(HERE, "public/index.html"
 // ── Approval notifier (best-effort push for pending gates) ───────────────────
 // Polls for new pending/requested approvals and pushes via the configured
 // pod-side channels. Deduped per (run,node,iteration). Browser push is separate
-// (client-side). Telegram/WhatsApp/Moshi need the openclaw channel / moshi notify
-// path wired (see docs) — not dispatched here yet.
+// (client-side). webui/email dispatch via fixed pod binaries; telegram/moshi
+// dispatch via the operator-supplied command templates above (when configured).
 const _notifiedApprovals = new Set();
 const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 function podRun(cmd) {
   try { const c = spawn("ssh", ["-n", "-o", "ConnectTimeout=15", POD_SSH, cmd], { stdio: "ignore" }); c.on("error", () => {}); c.unref(); } catch { /* */ }
+}
+// Run an operator-supplied template on the pod, substituting {text} (shell-quoted)
+// for the message. {text} unset → append the quoted text so a bare command still works.
+function podRunTemplate(tmpl, text) {
+  if (!tmpl) return;
+  const q = shq(text);
+  const cmd = tmpl.includes("{text}") ? tmpl.replaceAll("{text}", q) : `${tmpl} ${q}`;
+  podRun(`${cmd} 2>/dev/null || true`);
 }
 function dispatchApproval(p) {
   const channels = liveNotifyChannels();
@@ -1064,6 +1117,8 @@ function dispatchApproval(p) {
   const body = `${p.db} · ${p.node_id} (run ${String(p.run_id).slice(0, 8)}) — approve at ${RUNS_PUBLIC_URL}`;
   if (channels.includes("webui")) podRun(`${POD_WEBUI} notes create --title ${shq(title)} --content ${shq(body)} --tags chad-approvals 2>/dev/null || true`);
   if (channels.includes("email")) podRun(`chad-mail-send --to ${shq(OPERATOR_EMAIL)} --subject ${shq(title)} --body ${shq(body)} 2>/dev/null || true`);
+  if (channels.includes("telegram")) podRunTemplate(POD_TELEGRAM_CMD, `${title}: ${body}`);
+  if (channels.includes("moshi")) podRunTemplate(POD_MOSHI_CMD, `${title}: ${body}`);
 }
 function approvalNotifier() {
   // Always poll — the dispatch channel set is live-editable from the Approvals tab,
