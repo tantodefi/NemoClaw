@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   rollingMean, recordScore, select, needsExpansion, addCandidate,
-  activeCandidates, champions, POLICY,
+  activeCandidates, champions, paretoFront, POLICY,
 } from "./population.js";
 
 function freshPop() {
@@ -76,4 +76,38 @@ test("retired candidates are never silently deleted (no re-exploration)", () => 
   select(pop);
   assert.equal(pop.candidates.length, 1, "record retained");
   assert.equal(pop.candidates[0].status, "retired");
+});
+
+test("paretoFront is empty without cost data (scalar fallback)", () => {
+  const pop = freshPop();
+  const a = addCandidate(pop, { kind: "p", spec: {} });
+  const b = addCandidate(pop, { kind: "p", spec: {} });
+  recordScore(pop, a, 0.9);
+  recordScore(pop, b, 0.6);
+  assert.deepEqual(paretoFront(pop.candidates), []);
+});
+
+test("paretoFront keeps non-dominated trade-offs and drops dominated points", () => {
+  const pop = freshPop();
+  const strong = addCandidate(pop, { kind: "p", spec: { label: "strong" } }); // high quality, costly
+  const lean = addCandidate(pop, { kind: "p", spec: { label: "lean" } });     // lower quality, cheap
+  const dominated = addCandidate(pop, { kind: "p", spec: { label: "dom" } }); // worse on both
+  recordScore(pop, strong, 0.9, undefined, 0.8);
+  recordScore(pop, lean, 0.6, undefined, 0.1);
+  recordScore(pop, dominated, 0.5, undefined, 0.9);
+  const front = paretoFront(pop.candidates).map((c) => c.id).sort();
+  assert.deepEqual(front, [strong, lean].sort());
+});
+
+test("a cost-efficient front member is protected from quality retirement", () => {
+  const pop = freshPop();
+  const strong = addCandidate(pop, { kind: "p", spec: { label: "strong" } });
+  const lean = addCandidate(pop, { kind: "p", spec: { label: "lean" } }); // below retireBelow but cheapest
+  for (let i = 0; i < POLICY.minTrials; i++) {
+    recordScore(pop, strong, 0.9, undefined, 0.9);
+    recordScore(pop, lean, 0.3, undefined, 0.05); // quality < retireBelow, but on the front
+  }
+  const { retired } = select(pop);
+  assert.ok(!retired.includes(lean), "lean front member survives despite low quality");
+  assert.notEqual(pop.candidates.find((c) => c.id === lean).status, "retired");
 });

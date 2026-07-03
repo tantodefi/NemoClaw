@@ -87,6 +87,9 @@ const schemas = {
   evaluation: z.object({
     candidateId: z.string(),
     scorePct: z.number().min(0).max(100),
+    // Leanness/cost axis (0..100, LOWER = leaner) — powers Pareto selection
+    // (quality↑ vs cost↓). Optional so older judges/rows still parse.
+    costPct: z.number().min(0).max(100).optional(),
     rationale: z.string(),
   }),
   selection: z.object({
@@ -176,7 +179,9 @@ export const workflow = smithers((ctx) => {
               // a failed candidate out, and a malformed judge row must not poison
               // the rolling mean (the schemaFailFast discipline at the fan-in).
               if (!e || typeof e.scorePct !== "number" || Number.isNaN(e.scorePct)) continue;
-              recordScore(pop, e.candidateId, e.scorePct / 100);
+              // Pass the leanness axis through when the judge supplied it (→ Pareto).
+              const cost = typeof e.costPct === "number" && !Number.isNaN(e.costPct) ? e.costPct / 100 : null;
+              recordScore(pop, e.candidateId, e.scorePct / 100, undefined, cost);
             }
             const { champions, retired } = select(pop, POLICY);
             if (!DRY_RUN) savePopulation(POP_PATH, pop);
@@ -254,7 +259,11 @@ function judgePrompt(candidate, fixtures, directives = {}) {
     fixtures.length
       ? `Evaluate it against these fixtures:\n${JSON.stringify(fixtures, null, 2)}`
       : "No fixtures provided; score on intrinsic quality of the spec.",
-    "Return JSON: { candidateId, scorePct (0-100 integer), rationale (one sentence) }.",
+    "Also rate the candidate's LEANNESS as costPct (0-100 integer, LOWER = leaner):",
+    "  how verbose/expensive its output tends to be — a tight, high-signal answer is",
+    "  low cost; a padded, rambling one is high. This lets the arena keep variants that",
+    "  are nearly as good but cheaper (quality vs cost trade-off), not just the top score.",
+    "Return JSON: { candidateId, scorePct (0-100 integer), costPct (0-100 integer), rationale (one sentence) }.",
     `candidateId MUST be "${candidate.id}".`,
   ].filter(Boolean).join("\n\n");
 }

@@ -60,16 +60,40 @@ export function rollingMean(scores, windowSize = POLICY.windowSize) {
 
 /**
  * recordScore — append one trial result to a candidate and recompute its mean.
- * score is a normalized 0..1 quality measure from the workflow's scorer.
+ * `score` is a normalized 0..1 quality measure from the workflow's scorer.
+ * `cost` (optional) is a normalized 0..1 cost/leanness measure (LOWER is better —
+ * e.g. relative tokens/verbosity). When present it powers Pareto selection
+ * (quality↑ vs cost↓); when absent, selection stays purely scalar (back-compat).
  */
-export function recordScore(pop, id, score, ts = new Date().toISOString()) {
+export function recordScore(pop, id, score, ts = new Date().toISOString(), cost = null) {
   const c = pop.candidates.find((x) => x.id === id);
   if (!c) throw new Error(`population: unknown candidate ${id}`);
   c.scores = (c.scores ?? []).concat(score).slice(-POLICY.windowSize * 2);
   c.trials = (c.trials ?? 0) + 1;
   c.lastEvaluated = ts;
   c.rollingMean = rollingMean(c.scores);
+  if (typeof cost === "number" && !Number.isNaN(cost)) {
+    c.costs = (c.costs ?? []).concat(cost).slice(-POLICY.windowSize * 2);
+    c.rollingCost = rollingMean(c.costs);
+  }
   return c;
+}
+
+/**
+ * paretoFront — the non-dominated set on (quality↑, cost↓). Candidate A dominates B
+ * when A is no worse on both axes and strictly better on at least one. This is the
+ * trade-off frontier the GEPA pattern preserves: a lean-but-slightly-weaker variant
+ * and a strong-but-costly one can BOTH survive. Only engages when ≥2 candidates have
+ * a `rollingCost`; otherwise returns [] (caller falls back to scalar ranking).
+ */
+export function paretoFront(cands) {
+  const withCost = cands.filter((c) => typeof c.rollingCost === "number");
+  if (withCost.length < 2) return [];
+  const q = (c) => c.rollingMean ?? 0;        // higher is better
+  const k = (c) => c.rollingCost;             // lower is better
+  const dominates = (a, b) =>
+    q(a) >= q(b) && k(a) <= k(b) && (q(a) > q(b) || k(a) < k(b));
+  return withCost.filter((c) => !withCost.some((o) => o !== c && dominates(o, c)));
 }
 
 /**
@@ -80,12 +104,17 @@ export function recordScore(pop, id, score, ts = new Date().toISOString()) {
  * Returns { champions, retired } id lists for reporting.
  */
 export function select(pop, policy = POLICY) {
-  const ranked = activeCandidates(pop).sort(
+  const active = activeCandidates(pop);
+  const ranked = active.sort(
     (a, b) => (b.rollingMean ?? 0) - (a.rollingMean ?? 0),
   );
+  // The Pareto front (quality↑ vs cost↓) is protected from retirement: a lean
+  // variant that's cost-efficient survives even below the quality bar, so the
+  // arena keeps the whole trade-off frontier, not just the single best.
+  const frontIds = new Set(paretoFront(active).map((c) => c.id));
   const retired = [];
   for (const c of ranked) {
-    if ((c.trials ?? 0) >= policy.minTrials && (c.rollingMean ?? 0) < policy.retireBelow) {
+    if ((c.trials ?? 0) >= policy.minTrials && (c.rollingMean ?? 0) < policy.retireBelow && !frontIds.has(c.id)) {
       c.status = "retired";
       c.note = `retired: rollingMean ${c.rollingMean.toFixed(3)} < ${policy.retireBelow} after ${c.trials} trials`;
       retired.push(c.id);
