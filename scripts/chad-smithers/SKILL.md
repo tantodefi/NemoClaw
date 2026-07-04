@@ -220,7 +220,7 @@ they would do unless an explicit env flag is set.
 | `token-optimize.jsx` | "Tokenmaxxing": probe whether a cheaper model matches a task's quality → Approval-gated downgrade; on approval+`APPLY=1` writes the cheaper model into `../task-profiles.json` (snapshot-first, dot-path). Runs nightly (shadow); feeds the Experiments **model × task** matrix. | `state/downgrade-candidates.json`, `CHAD_TOKENOPT_BAR/TOLERANCE`, `CHAD_TOKENOPT_APPLY=1` |
 | `bug-report.jsx` | Chad catches his OWN failures (failed runs/nodes across the DBs + host logs) → clusters into distinct bugs → Approval → `gh issue create` (dedups open issues). Shadow unless `CHAD_BUGREPORT_POST=1`. Runs nightly. | `CHAD_BUGREPORT_REPO`, `CHAD_BUGREPORT_POST=1`, `CHAD_BUGREPORT_LABEL` |
 | `skill-improve.jsx` | Chad proposes ENHANCEMENTS to his own workflows/skills (robustness/perf/cost/feature/docs) → Approval → files GitHub enhancement issues (never edits source). Shadow unless `CHAD_SKILLIMPROVE_POST=1`. Runs nightly. | `CHAD_SKILLIMPROVE_REPO`, `CHAD_SKILLIMPROVE_POST=1` |
-| `code-review-loop.jsx` | Iterate a PR review to convergence with the built-in **`<ReviewLoop>`** — producer drafts/refines the review, a distinct reviewer judges `approved`, repeat until clean or max iters. Read-only `gh pr diff`; draft-only (never comments). | `--input '{"repo":"o/r","pr":N}'`, `CHAD_CODEREVIEW_POST=1` |
+| `code-review-loop.jsx` | Iterate a PR review to convergence with the **`<Loop>`** primitive + EXPLICIT ctx.outputs threading — producer drafts/refines, a distinct judge decides `approved` (drives `until`), repeat until clean or max iters. (NOT the `<ReviewLoop>` composite — it doesn't inject the produced work into the reviewer's prompt; see below.) Read-only `gh pr diff`; draft-only. | `--input '{"repo":"o/r","pr":N}'`, `CHAD_CODEREVIEW_POST=1` |
 | `dependency-update.jsx` | Keep deps current via **`<ScanFixVerify>`** — scanner triages `npm outdated` into safe/review/risky, fixer drafts the bump set, verifier sanity-checks. Proposal only; pins the smithers line at review. | `CHAD_DEPUPDATE_APPLY=1`, `CHAD_DEPUPDATE_POST=1` |
 | `debate.jsx` | Adversarial reasoning via **`<Debate>`** — two models argue for/against across N rounds, a judge rules. The counterpart to fusion (argue-to-consensus vs parallel-synthesize) for contested calls. | `--input '{"topic":"…"}'`, `CHAD_DEBATE_ROUNDS`, `CHAD_DEBATE_POST=1` |
 | `canary-judge.jsx` | Post-deploy verification via **`<Poller>`** — polls a health endpoint (deterministic HTTP check fn) until stably healthy or timeout, then a judge rules promote/hold/rollback. Advisory only. | `--input '{"url":"…/health"}'`, `CHAD_CANARY_POST=1` |
@@ -229,11 +229,18 @@ they would do unless an explicit env flag is set.
 | `coverage-loop.jsx` | Raise test coverage toward a target via **`<Loop>`** — measure (read-only) → draft focused tests → re-measure, until target or max iters. Draft-only unless `APPLY=1` (exits after one pass in shadow). | `CHAD_COVERAGE_CMD/TARGET/DIR`, `CHAD_COVERAGE_APPLY=1` |
 
 The composite-based rows (added with the Smithers 0.26 upgrade) lean on Smithers'
-**built-in composite components** — `ReviewLoop`, `ScanFixVerify`, `Debate`, `Poller`,
-`Loop` — imported directly from `smithers-orchestrator` (they are top-level exports,
-NOT part of the `createSmithers()` return, which only carries the primitives). Prefer
-a composite when the shape matches (review/scan-fix/debate/poll/iterate-to-target);
-use a plain `Sequence` when it doesn't (changelog), and keep routing **deterministic**
+**built-in composite components** — `ScanFixVerify`, `Debate`, `Poller`, `Loop` —
+imported directly from `smithers-orchestrator` (they are top-level exports, NOT part
+of the `createSmithers()` return, which only carries the primitives). **Caveat on
+`<ReviewLoop>`:** it hardcodes the reviewer's prompt and only wires the produced work
+via `needs`, which is NOT injected into an agent's prompt — so the reviewer never sees
+the work ("no work provided") and its `until` is hardcoded false (can't converge on
+`approved`). `code-review-loop` therefore uses the raw `<Loop>` with EXPLICIT
+`ctx.outputs` threading instead (produced review → judge prompt, prior feedback →
+producer prompt) — verified against a live PR. Prefer a composite when the shape
+matches (scan-fix/debate/poll/iterate-to-target); hand-roll over `<Loop>` when a
+composite can't thread the context you need; use a plain `Sequence` when it doesn't
+loop (changelog); and keep routing **deterministic**
 where you can (`pr-shepherd`'s `lib/pr.js`, `issue-triage`'s `scoreIssue`) so the model
 is spent on the summary, not the decision. Fan-outs (`fusion`, `token-optimize`) cap
 concurrency with `<Parallel maxConcurrency={N}>` so a big panel can't hammer the API.

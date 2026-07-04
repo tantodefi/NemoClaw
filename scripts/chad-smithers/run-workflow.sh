@@ -31,11 +31,25 @@ export CHAD_DISABLE_CLI_AGENTS="${CHAD_DISABLE_CLI_AGENTS:-1}"
 # CHAD_NEMOTRON_MODEL here only to pin a different cheap model for ops workflows.
 
 LOCK="/tmp/chad-wf-$(basename "$WF" .jsx).lock.d"
+PIDF="$LOCK/pid"
 if ! mkdir "$LOCK" 2>/dev/null; then
-  echo "run-workflow: $WF already running; exiting" >&2
-  exit 0
+  # Lock held — but is the holder still alive? A SIGKILL'd run (or a crash) leaves
+  # the dir behind and the EXIT trap never fires, which would silently block every
+  # future run. Steal a stale lock whose recorded PID is gone; bail if it's live.
+  HOLDER="$(cat "$PIDF" 2>/dev/null || true)"
+  if [ -n "$HOLDER" ] && kill -0 "$HOLDER" 2>/dev/null; then
+    echo "run-workflow: $WF already running (pid $HOLDER); exiting" >&2
+    exit 0
+  fi
+  echo "run-workflow: clearing stale lock for $WF (holder ${HOLDER:-unknown} gone)" >&2
+  rm -rf "$LOCK"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "run-workflow: $WF lock re-acquire race; exiting" >&2
+    exit 0
+  fi
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+echo "$$" > "$PIDF"
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT
 
 echo "run-workflow: $WF @ $(date -u +%FT%TZ)" >&2
 exec "$SMITHERS" up "$WF"
