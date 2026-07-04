@@ -118,6 +118,7 @@ if(window.mermaid){ try{ mermaid.initialize({startOnLoad:false,theme:"dark",secu
 function keyHdr(){ const k=new URLSearchParams(location.search).get("key"); return k?{"x-smithers-key":k}:{}; }
 async function api(p){ const r=await fetch(p,{headers:keyHdr()}); if(!r.ok) throw new Error(p+" "+r.status); return r.json(); }
 async function post(p,body){ const r=await fetch(p,{method:"POST",headers:{"content-type":"application/json",...keyHdr()},body:JSON.stringify(body||{})}); const j=await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||("HTTP "+r.status)); return j; }
+async function del(p){ const r=await fetch(p,{method:"DELETE",headers:keyHdr()}); const j=await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||("HTTP "+r.status)); return j; }
 
 // minimal markdown (headings, bold, code, pipe-tables) for report rendering
 function md(src){
@@ -621,19 +622,28 @@ function chainCardHtml(ch){
       ${s.startedAt?`<div class="muted" style="font-size:10px">${fmtDur(s.startedAt,s.finishedAt)}</div>`:''}
       ${acts}</div>`;
   }).join('<span class="muted" style="margin:0 1px">→</span>');
-  const ctrls=`${failed?`<button class="primary" onclick="resumeChain('${esc(ch.id)}')" title="Re-run the step it stopped on and continue">Resume chain ▶</button>`:''}
-    <button onclick="forkChain('${esc(ch.id)}')" title="Copy this chain into a fresh run from step 1 (leaves this one untouched)">Fork ⑂</button>
-    ${(ch.status==="running"||ch.status==="stalled")?`<button class="danger" onclick="cancelChain('${esc(ch.id)}')">Cancel</button>`:''}`;
+  const running=ch.status==="running";
+  const failedOrStalled=ch.status==="failed"||ch.status==="stalled";
+  const terminal=["finished","failed","cancelled","stalled"].includes(ch.status);
+  const ctrls=`${failedOrStalled?`<button class="primary" onclick="resumeChain('${esc(ch.id)}')" title="Continue from the step it stopped on (re-runs that step fresh)">Resume ▶</button>`:''}
+    ${terminal?`<button onclick="runAgainChain('${esc(ch.id)}')" title="Re-run the WHOLE chain from step 1, in place (same record)">Run again ⟳</button>`:''}
+    <button onclick="forkChain('${esc(ch.id)}')" title="Copy this chain into a NEW run from step 1 (leaves this one untouched)">Fork ⑂</button>
+    ${(running||ch.status==="stalled")?`<button class="danger" onclick="cancelChain('${esc(ch.id)}')">Cancel</button>`:''}
+    ${terminal?`<button class="danger" style="opacity:.75" onclick="deleteChain('${esc(ch.id)}')" title="Remove this chain from the list">Delete 🗑</button>`:''}`;
   const done=ch.steps.filter(s=>String(s.status).toLowerCase()==='finished').length;
+  const curStep=ch.steps[ch.current];
+  const liveNote=running?` · <span style="color:var(--accent)">▶ step ${ch.current+1}/${ch.steps.length}: ${esc((curStep?.workflow||'').replace(/^workflows\//,''))} (${esc(curStep?.status||'…')})</span>`:'';
   return `<div class="card" id="chaincard-${esc(ch.id)}"><div class="row"><b class="mono" style="flex:1">${esc(ch.id)}</b>${pill(ch.status)} ${ctrls}</div>
-    <div class="muted" style="font-size:11px">by ${esc(ch.createdBy||'?')} · ${fmtTime(ch.createdAt)} · ${done}/${ch.steps.length} done${ch.finishedAt?` · took ${fmtDur(ch.createdAt,ch.finishedAt)}`:''}${ch.passOutput?' · passes output →':''}</div>
-    ${ch.stallReason?`<div style="color:var(--yellow);font-size:11px;margin-top:3px">⚠ stalled — ${esc(ch.stallReason)}. Resume re-runs the stuck step fresh, or cancel.</div>`:''}
+    <div class="muted" style="font-size:11px">by ${esc(ch.createdBy||'?')} · ${fmtTime(ch.createdAt)} · ${done}/${ch.steps.length} done${ch.finishedAt?` · took ${fmtDur(ch.createdAt,ch.finishedAt)}`:''}${ch.passOutput?' · passes output →':''}${liveNote}</div>
+    ${ch.stallReason?`<div style="color:var(--yellow);font-size:11px;margin-top:3px">⚠ stalled — ${esc(ch.stallReason)}. <b>Resume</b> continues the stuck step, <b>Run again</b> restarts the chain, or <b>Delete</b>.</div>`:''}
     <div style="margin-top:8px">${flow}</div></div>`;
 }
 async function cancelChain(id){ if(!confirm("Cancel this chain (and its running step)?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/cancel"); refreshChainList(); }catch(e){ alert("cancel failed: "+e.message); } }
 async function resumeChain(id){ if(!confirm("Resume this chain from the step it stopped on?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/resume"); refreshChainList(); }catch(e){ alert("resume failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
 async function rerunChainStep(id,index){ if(!confirm("Re-run the chain from step "+(index+1)+"? Resets this and all later steps."))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/rerun-step",{index}); refreshChainList(); }catch(e){ alert("rerun failed: "+e.message); } }
 async function forkChain(id){ if(!confirm("Fork this chain into a fresh run from step 1? The original is left untouched."))return; try{ const r=await post("/api/chains/"+encodeURIComponent(id)+"/fork"); refreshChainList(); if(r&&r.id) alert("Forked → "+r.id); }catch(e){ alert("fork failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
+async function runAgainChain(id){ if(!confirm("Re-run this whole chain from step 1 (in place)?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/run-again"); switchTab('chains'); refreshChainList(); }catch(e){ alert("run-again failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
+async function deleteChain(id){ if(!confirm("Delete chain "+id+" from the list? This removes its record."))return; try{ await del("/api/chains/"+encodeURIComponent(id)); refreshChainList(); }catch(e){ alert("delete failed: "+e.message+(String(e.message).includes("forbidden")?" (needs Access login or ?key=)":"")); } }
 // Jump from a run's chain badge to its card in the Chains tab.
 function gotoChain(id){ switchTab('chains'); setTimeout(()=>{ const el=document.getElementById('chaincard-'+id); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); el.style.outline='2px solid var(--accent)'; setTimeout(()=>el.style.outline='',1600); } },400); }
 
