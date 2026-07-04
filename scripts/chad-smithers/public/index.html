@@ -601,7 +601,7 @@ async function refreshChainList(){
   }catch{ /* keep prior render */ }
 }
 function chainCardHtml(ch){
-  const failed=ch.status==="failed"||ch.status==="cancelled";
+  const failed=ch.status==="failed"||ch.status==="cancelled"||ch.status==="stalled";
   const sbtn="font-size:11px;padding:2px 7px";
   const flow=ch.steps.map((s,i)=>{
     const cur=i===ch.current&&ch.status==="running";
@@ -623,10 +623,11 @@ function chainCardHtml(ch){
   }).join('<span class="muted" style="margin:0 1px">→</span>');
   const ctrls=`${failed?`<button class="primary" onclick="resumeChain('${esc(ch.id)}')" title="Re-run the step it stopped on and continue">Resume chain ▶</button>`:''}
     <button onclick="forkChain('${esc(ch.id)}')" title="Copy this chain into a fresh run from step 1 (leaves this one untouched)">Fork ⑂</button>
-    ${ch.status==="running"?`<button class="danger" onclick="cancelChain('${esc(ch.id)}')">Cancel</button>`:''}`;
+    ${(ch.status==="running"||ch.status==="stalled")?`<button class="danger" onclick="cancelChain('${esc(ch.id)}')">Cancel</button>`:''}`;
   const done=ch.steps.filter(s=>String(s.status).toLowerCase()==='finished').length;
   return `<div class="card" id="chaincard-${esc(ch.id)}"><div class="row"><b class="mono" style="flex:1">${esc(ch.id)}</b>${pill(ch.status)} ${ctrls}</div>
     <div class="muted" style="font-size:11px">by ${esc(ch.createdBy||'?')} · ${fmtTime(ch.createdAt)} · ${done}/${ch.steps.length} done${ch.finishedAt?` · took ${fmtDur(ch.createdAt,ch.finishedAt)}`:''}${ch.passOutput?' · passes output →':''}</div>
+    ${ch.stallReason?`<div style="color:var(--yellow);font-size:11px;margin-top:3px">⚠ stalled — ${esc(ch.stallReason)}. Resume re-runs the stuck step fresh, or cancel.</div>`:''}
     <div style="margin-top:8px">${flow}</div></div>`;
 }
 async function cancelChain(id){ if(!confirm("Cancel this chain (and its running step)?"))return; try{ await post("/api/chains/"+encodeURIComponent(id)+"/cancel"); refreshChainList(); }catch(e){ alert("cancel failed: "+e.message); } }

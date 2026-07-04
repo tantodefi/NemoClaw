@@ -945,10 +945,33 @@ function findStepRun(name, sinceMs) {
   } catch { return null; }
 }
 function findRunStatus(runId) {
+  const r = findRunRow(runId);
+  return r ? r.status : null;
+}
+// Full row (status + timing) so the chain runner can tell a live hold from a dead
+// one: a run parked at an approval gate keeps its heartbeat via the supervisor,
+// whereas a crashed/killed run stops beating (or never did) and its status is
+// frozen forever. We use that to detect a wedged step instead of polling it for eternity.
+function findRunRow(runId) {
   for (const p of listDbs()) {
-    try { const r = withDb(p, (d) => tableExists(d, "_smithers_runs") ? d.query("SELECT status FROM _smithers_runs WHERE run_id=?").get(runId) : null); if (r) return r.status; } catch { /* */ }
+    try {
+      const r = withDb(p, (d) => tableExists(d, "_smithers_runs")
+        ? d.query("SELECT status, created_at_ms, heartbeat_at_ms FROM _smithers_runs WHERE run_id=?").get(runId) : null);
+      if (r) return r;
+    } catch { /* */ }
   }
   return null;
+}
+// A held step is "stalled" (dead process) when it's in a non-terminal RUNNING state
+// with no fresh heartbeat. waiting-approval is EXCLUDED — that's a legitimate,
+// indefinite human hold and must never be auto-stalled. Threshold via env.
+const CHAIN_STALL_MS = Number(process.env.CHAD_CHAIN_STALL_MS || 30 * 60 * 1000); // 30 min
+function stepIsStalled(row) {
+  if (!row) return false;
+  const s = String(row.status || "").toLowerCase();
+  if (s !== "running" && s !== "waiting-event") return false; // terminal & waiting-approval are not stalls
+  const beat = row.heartbeat_at_ms || row.created_at_ms || 0;   // never-beat → age from creation
+  return beat > 0 && (Date.now() - beat) > CHAIN_STALL_MS;
 }
 // Primary output of a finished run, to feed the next step as input. Prefer a
 // report/result/synthesize/fusion table, else the last output table's last row.
@@ -989,7 +1012,8 @@ function advanceChain(ch) {
     if (r) { step.runId = r.run_id; step.status = r.status; return true; }
     return false;                                             // not visible yet; next tick
   }
-  const status = findRunStatus(step.runId);
+  const row = findRunRow(step.runId);
+  const status = row ? row.status : null;
   let changed = false;
   if (status && status !== step.status) { step.status = status; changed = true; }
   const s = String(step.status || "").toLowerCase();
@@ -1000,7 +1024,17 @@ function advanceChain(ch) {
     changed = true;
   } else if (s === "failed" || s === "cancelled" || s === "denied" || s === "errored") {
     ch.status = "failed"; ch.finishedAt = Date.now(); changed = true;   // a failed step stops the chain
-  } // running / waiting-approval / waiting-event → keep polling (chain held)
+  } else if (stepIsStalled(row)) {
+    // The held run's process is dead (running/waiting-event, heartbeat gone stale) —
+    // it will never transition, so stop polling it forever. Mark the chain "stalled"
+    // (distinct from failed) so the frontend stops showing a false "running" and the
+    // operator can chain-resume (re-run the step fresh) or chain-cancel.
+    step.status = "stalled"; ch.status = "stalled"; ch.stalledAt = Date.now();
+    ch.stallReason = `step ${ch.current} (${step.workflow}) run ${String(step.runId).slice(0, 8)} `
+      + `stuck in ${s} with no heartbeat > ${Math.round(CHAIN_STALL_MS / 60000)}min`;
+    console.error(`chain stalled: ${ch.id} — ${ch.stallReason}`);
+    changed = true;
+  } // waiting-approval (live human hold) → keep polling (chain held)
   return changed;
 }
 function chainTick() {
