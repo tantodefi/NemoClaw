@@ -94,10 +94,18 @@ chad-runs set-notify webui,email      # set them (webui,email,telegram,moshi)
 chad-runs chains                      # list chains (live + history)
 chad-runs chain <id>                  # one chain's step states
 chad-runs chain-create <file.json>    # start a chain: {steps:[{workflow,input,env}], passOutput}
-chad-runs chain-cancel <id>
-chad-runs chain-resume <id>           # re-run the step a failed chain stopped on
+chad-runs chain-again <id>            # re-run the WHOLE chain in place (finished/failed/stalled → from step 0)
+chad-runs chain-resume <id>           # continue a FAILED/STALLED chain from the step it stopped on
 chad-runs chain-rerun <id> --index N  # re-run from step N (resets N..end)
+chad-runs chain-fork <id>             # copy into a NEW chain run (source untouched)
+chad-runs chain-cancel <id>           # cancel a running/stalled chain
+chad-runs chain-delete <id>           # remove a terminal chain from the list
 ```
+Chain lifecycle at a glance: **again** (whole chain, same record) vs **resume**
+(continue the stuck step) vs **fork** (copy → new record) vs **rerun --index N**
+(from a chosen step). A chain whose current step's run dies (crashed / killed —
+no heartbeat > `CHAD_CHAIN_STALL_MS`, default 30min) is auto-marked **`stalled`**
+(not left falsely "running"); `waiting-approval` is never auto-stalled.
 
 ### Worked examples
 

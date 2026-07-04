@@ -26,6 +26,8 @@ resume guarantees to hold.
 | `lib/pr.test.js` | `node --test lib/pr.test.js` — 12 tests, all green. |
 | `lib/coverage.js` | Deterministic coverage parsing for `coverage-loop.jsx`: `parseCoverage()` (total % from a report tail, tolerant of missing tooling), `uncoveredLines()`. |
 | `lib/coverage.test.js` | `node --test lib/coverage.test.js` — 6 tests, all green. |
+| `lib/models.js` | Model-id hygiene for the experiments matrix: `canonicalModelId()` (collapse `nvidia/nvidia/…` → `nvidia/…`), `isKnownModel()` / `rosterSet()` (validate against the live roster so mangled/derostered ids don't become phantom matrix columns). |
+| `lib/models.test.js` | `node --test lib/models.test.js` — 8 tests, all green. |
 | `experiments.jsx` | The nightly evolutionary workflow (Smithers). |
 | `workflows/*.jsx` | Ported chad-spawn / cron features (issue-triage, content-pipeline, self-improve, memory-curator, log-digest) + email-ladder, fusion, mcp-health-probe, fail-only-report. All graph-validate; side-effecting ones are shadow-safe by default. |
 | `state/seed-candidates.json` | Tracked. Initial variant pool to seed the arena wide. |
