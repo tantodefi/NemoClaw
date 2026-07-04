@@ -54,11 +54,24 @@ export CHAD_SIGNAL_SSH="${CHAD_SIGNAL_SSH:-openshell-chad}"
 # Portable atomic lock (mkdir succeeds for exactly one racer). flock is absent
 # on macOS, where this runner lives; Smithers' own resume already dedupes the
 # actual work, so this only guards against two scheduler fires colliding.
+PIDF="$LOCK/pid"
 if ! mkdir "$LOCK" 2>/dev/null; then
-  echo "run-experiments: another run holds the lock; exiting" >&2
-  exit 0
+  # Steal a stale lock whose holder died (a SIGKILL'd run leaves the dir + the
+  # EXIT trap never fires, which would block every future scheduler fire).
+  HOLDER="$(cat "$PIDF" 2>/dev/null || true)"
+  if [ -n "$HOLDER" ] && kill -0 "$HOLDER" 2>/dev/null; then
+    echo "run-experiments: another run holds the lock (pid $HOLDER); exiting" >&2
+    exit 0
+  fi
+  echo "run-experiments: clearing stale lock (holder ${HOLDER:-unknown} gone)" >&2
+  rm -rf "$LOCK"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "run-experiments: lock re-acquire race; exiting" >&2
+    exit 0
+  fi
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+echo "$$" > "$PIDF"
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT
 
 if [ "$DRY" = "--dry-run" ]; then
   DRY_RUN=1 "$SMITHERS" up experiments.jsx
