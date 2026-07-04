@@ -34,6 +34,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { preflight, listLimits } from "./lib/model-limits.js";
 import { scanSignal } from "./lib/signal.js";
 import { harvestFixtures } from "./lib/fixtures.js";
+import { canonicalModelId, isKnownModel, rosterSet } from "./lib/models.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.CHAD_RUNS_PORT || 7331);
@@ -295,6 +296,10 @@ function liveModels() {
 // task. This is the data the Experiments dashboard heatmap renders.
 function modelMatrix() {
   const cell = {}; const tasks = new Set(), models = new Set();
+  // Validate model ids against the live roster so hallucinated/mangled ids the
+  // judge echoed (nvidia/nvidia/…, …-a1b-a12b) don't become phantom columns.
+  let roster = new Set();
+  try { roster = rosterSet(JSON.parse(readFileSync(join(HERE, "state/models.json"), "utf8"))); } catch { /* no roster → isKnownModel falls back to structural check */ }
   for (const path of listDbs()) {
     try {
       withDb(path, (db) => {
@@ -304,12 +309,13 @@ function modelMatrix() {
           if (!Array.isArray(arr)) continue;
           for (const s of arr) {
             if (!s || typeof s.scorePct !== "number" || !s.candidate || !s.model) continue;
-            // Drop junk from early test runs: real task-kinds are lowercase slugs
-            // and real models are namespaced ids ("/"). Filters the "Chad"/prose
-            // candidates and gpt-4 / "unknown" placeholder models out of the matrix.
-            if (!/^[a-z0-9][a-z0-9-]*$/.test(String(s.candidate)) || !String(s.model).includes("/")) continue;
-            tasks.add(s.candidate); models.add(s.model);
-            const k = `${s.candidate}::${s.model}`;
+            // Real task-kinds are lowercase slugs; real models are namespaced ids.
+            // Filters "Chad"/prose candidates and placeholder models from the matrix.
+            if (!/^[a-z0-9][a-z0-9-]*$/.test(String(s.candidate))) continue;
+            const model = canonicalModelId(s.model);           // nvidia/nvidia/x → nvidia/x
+            if (!isKnownModel(model, roster)) continue;         // drop mangled/derostered ids
+            tasks.add(s.candidate); models.add(model);
+            const k = `${s.candidate}::${model}`;
             (cell[k] ??= { sum: 0, n: 0 }); cell[k].sum += s.scorePct; cell[k].n += 1;
           }
         }
@@ -1096,15 +1102,26 @@ app.post("/api/chains/:id/cancel", (c) => {
 // Resume a failed/cancelled chain: re-run the step it stopped on (fresh) and let
 // the runner carry on. A step that merely paused at an approval gate is handled by
 // the normal approve→resume flow, so this is for the failed/cancelled case.
+// Reset a chain to re-run from step `idx` onward: clear those steps' run state and
+// point the runner at idx. Steps before idx keep their finished runs (so `resume`
+// continues, `run-again` with idx=0 re-runs everything).
+function resetChainSteps(ch, idx) {
+  for (let i = idx; i < ch.steps.length; i++) {
+    const s = ch.steps[i];
+    s.runId = null; s.startedAt = null; s.finishedAt = null; s.status = "pending"; delete s.error;
+  }
+  ch.current = idx; ch.status = "running"; delete ch.finishedAt;
+}
+// Resume a FAILED/STALLED chain from the first non-finished step and carry on.
+// (For a fully finished chain use run-again — resume has nothing to continue.)
 app.post("/api/chains/:id/resume", (c) => {
   const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
   const ch = loadChains().find((x) => x.id === c.req.param("id"));
   if (!ch) return c.json({ error: "not found" }, 404);
-  const i = ch.steps.findIndex((s) => !["finished"].includes(String(s.status || "").toLowerCase()));
-  const idx = i === -1 ? ch.steps.length - 1 : i;
-  const step = ch.steps[idx];
-  step.runId = null; step.startedAt = null; step.finishedAt = null; step.status = "pending"; delete step.error;
-  ch.current = idx; ch.status = "running"; delete ch.finishedAt;
+  const idx = ch.steps.findIndex((s) => !["finished"].includes(String(s.status || "").toLowerCase()));
+  if (idx === -1) return c.json({ error: "chain is fully finished — use run-again to re-run it" }, 400);
+  resetChainSteps(ch, idx);
+  delete ch.stalledAt; delete ch.stallReason;
   saveChain(ch);
   console.error(`chain resume: ${ch.id} from step ${idx} by ${op}`);
   return c.json({ ok: true, resumedFrom: idx });
@@ -1116,11 +1133,35 @@ app.post("/api/chains/:id/rerun-step", async (c) => {
   if (!ch) return c.json({ error: "not found" }, 404);
   const body = await c.req.json().catch(() => ({}));
   const idx = Math.max(0, Math.min(ch.steps.length - 1, Number(body.index) || 0));
-  for (let i = idx; i < ch.steps.length; i++) { const s = ch.steps[i]; s.runId = null; s.startedAt = null; s.finishedAt = null; s.status = "pending"; delete s.error; }
-  ch.current = idx; ch.status = "running"; delete ch.finishedAt;
+  resetChainSteps(ch, idx);
   saveChain(ch);
   console.error(`chain rerun-step: ${ch.id} from step ${idx} by ${op}`);
   return c.json({ ok: true, rerunFrom: idx });
+});
+// Run the WHOLE chain again in place (reset every step → re-run from 0). This is
+// the intuitive "run again" for a finished/failed/stalled chain — distinct from
+// resume (continue the stuck step) and fork (copy to a NEW chain). Same record.
+app.post("/api/chains/:id/run-again", (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const ch = loadChains().find((x) => x.id === c.req.param("id"));
+  if (!ch) return c.json({ error: "not found" }, 404);
+  resetChainSteps(ch, 0);
+  delete ch.stalledAt; delete ch.stallReason;
+  saveChain(ch);
+  console.error(`chain run-again: ${ch.id} by ${op}`);
+  return c.json({ ok: true, id: ch.id });
+});
+// Delete a chain record from the list. Guarded to terminal states so an operator
+// can't yank a live chain's record out from under the runner mid-flight.
+app.delete("/api/chains/:id", (c) => {
+  const op = operator(c); if (!op) return c.json({ error: "forbidden (Cloudflare Access required)" }, 403);
+  const ch = loadChains().find((x) => x.id === c.req.param("id"));
+  if (!ch) return c.json({ error: "not found" }, 404);
+  if (ch.status === "running") return c.json({ error: "cancel the chain before deleting a running one" }, 400);
+  try { unlinkSync(join(CHAINS_DIR, ch.id + ".json")); }
+  catch (e) { return c.json({ error: "delete failed: " + e.message }, 500); }
+  console.error(`chain delete: ${ch.id} (${ch.status}) by ${op}`);
+  return c.json({ ok: true, deleted: ch.id });
 });
 
 // Static dashboard.
