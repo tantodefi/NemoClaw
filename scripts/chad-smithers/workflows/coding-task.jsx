@@ -2,124 +2,184 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// coding-task.jsx — Chad (nemotron) ORCHESTRATES a coding task and offloads the
-// actual coding to opencode "big-pickle", in a controlled + reviewable pipeline.
-// The point: nemotron plans and reviews (cheap, always-on), big-pickle writes the
-// code (a strong free 500k-context coder), and a human gates anything that lands —
-// so an experimental coding change is visible in the Runs tab and never touches the
-// tree on its own.
+// coding-task.jsx — Chad (nemotron) CONTROLS a long opencode "big-pickle" build:
+// plan → [ code → validate → assess ]* → ping → Approval → (optional) PR. nemotron
+// is the driver (plans, validates each round against a real command, decides
+// whether the acceptance criteria are met and what to fix next); opencode
+// big-pickle is the hands (writes the code); a human gates anything that lands.
 //
-// Pipeline:  plan (nemotron capable → spec + acceptance criteria) →
-//            code (opencode big-pickle spawn → DRAFT patch, isolated workdir) →
-//            review (nemotron judge → approved? + findings) →
-//            land (Approval-gated; shadow unless CHAD_CODING_APPLY=1)
+//   plan     (nemotron)  spec + acceptance criteria + a real VALIDATE command
+//   BUILD LOOP until nemotron says done, or max rounds:
+//     code       (opencode big-pickle spawn)  implement per spec + last feedback
+//     validate   (deterministic)              run the validate cmd — real pass/fail
+//     assess     (nemotron)                   acceptance met? if not, feedback → next round
+//   ping     (chad-moshi-notify)  push the operator an update + validation result
+//   land     (Approval-gated)     review the diff; shadow unless CHAD_CODING_APPLY=1
+//   pr       (gated)              open a DRAFT PR only with approval + CHAD_CODING_PR=1
 //
-// Reviewable + controlled by construction:
-//  • the coder runs as a chad-spawn `opencode` kind — isolated workdir, L7 policy,
-//    result.json reconciled as the task output (never edits this repo directly);
-//  • on a bare host with no chad-spawn transport it STUBS (shadow), so a dry
-//    `smithers up workflows/coding-task.jsx --input '{"task":"…"}'` produces a
-//    visible run with no real spawn; set CHAD_SPAWN_SSH=openshell-chad for real;
-//  • `land` never commits / opens a PR — it's Approval-gated and shadow by default.
+// Controlled + reviewable + safe by construction:
+//  • the coder runs as an isolated chad-spawn (own workdir, L7 policy) — it does not
+//    touch this repo; on a bare host with no transport it STUBS (shadow);
+//  • validation is a REAL command (tests/build), not just an LLM opinion, so the
+//    "done" signal is grounded;
+//  • nothing lands without a human Approval, and the PR step is doubly gated
+//    (approval AND CHAD_CODING_PR=1) to respect Chad's no-direct-git-write boundary;
+//  • the operator is pushed a Moshi update when the build finishes + at the gate.
 
 import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
+import { execFile } from "node:child_process";
 import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 import { runSpawn, spawnResultSchema } from "../lib/spawn.js";
 import { postNote } from "../lib/note.js";
+import { moshiPing } from "../lib/notify.js";
 
 const DB = process.env.CHAD_CODING_DB || "./coding-task.db";
 const CODER_KIND = process.env.CHAD_CODING_KIND || "opencode"; // opencode big-pickle
 const SUBSTRATE = process.env.CHAD_CODING_SUBSTRATE || "local"; // local | gha (isolated)
 const SPAWN_TIMEOUT = Number(process.env.CHAD_SPAWN_TIMEOUT_MS || 1_800_000); // 30 min
-const APPLY = process.env.CHAD_CODING_APPLY === "1"; // actually land the change
-const POST = process.env.CHAD_CODING_POST === "1";
+const MAX_ROUNDS = Number(process.env.CHAD_CODING_MAX_ROUNDS || 4); // long-build cap
+const WORKDIR = process.env.CHAD_CODING_WORKDIR || process.cwd();   // where validate runs
+const APPLY = process.env.CHAD_CODING_APPLY === "1";               // land the change
+const OPEN_PR = process.env.CHAD_CODING_PR === "1";                // open a draft PR (gated)
+const POST = process.env.CHAD_CODING_POST === "1";                 // OpenWebUI note
 
 const schemas = {
   plan: z.object({
     summary: z.string(),
     steps: z.array(z.string()),
-    acceptance: z.array(z.string()),   // how we'll know it's done/correct
-    files: z.array(z.string()),        // likely files to touch
+    acceptance: z.array(z.string()),
+    validateCmd: z.string(),   // e.g. "bun test" / "npm run build" — how we verify
+    files: z.array(z.string()),
   }),
-  code: spawnResultSchema,             // the big-pickle spawn's result.json
-  review: z.object({
-    approved: z.boolean(),
-    findings: z.array(z.object({ severity: z.enum(["blocker", "warning", "nit"]), note: z.string() })),
-    summary: z.string(),
-  }),
-  land: z.object({ status: z.string(), detail: z.string() }),
+  code: spawnResultSchema,     // per-round big-pickle result.json
+  validate: z.object({ passed: z.boolean(), cmd: z.string(), output: z.string() }),
+  assess: z.object({ done: z.boolean(), feedback: z.string(), summary: z.string() }),
+  report: z.object({ summary: z.string(), validated: z.boolean(), rounds: z.number() }),
+  land: z.object({ status: z.string(), detail: z.string(), prUrl: z.string().optional() }),
 };
 
 const api = createSmithers(schemas, { dbPath: DB });
-const { smithers, Workflow, Task, Sequence, outputs } = api;
+const { smithers, Workflow, Task, Sequence, Loop, outputs } = api;
+
+function sh(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { cwd: WORKDIR, maxBuffer: 8 * 1024 * 1024, ...opts },
+      (err, out, errout) => resolve({ code: err ? (err.code ?? 1) : 0, out: (out || "") + (errout || "") }));
+  });
+}
 
 export const workflow = smithers((ctx) => {
   const task = ctx.input?.task || process.env.CHAD_CODING_TASK
     || "Add a --version flag to the chad-runs CLI that prints the workspace package version.";
   const plan = (ctx.outputs.plan ?? [])[0];
-  const code = (ctx.outputs.code ?? [])[0];
-  const review = (ctx.outputs.review ?? [])[0];
+  const codes = ctx.outputs.code ?? [];
+  const validates = ctx.outputs.validate ?? [];
+  const assessments = ctx.outputs.assess ?? [];
+  const lastAssess = assessments[assessments.length - 1];
+  const lastValidate = validates[validates.length - 1];
+  const lastCode = codes[codes.length - 1];
+  const round = codes.length;                 // rounds completed so far
+  const done = !!lastAssess?.done;             // nemotron says acceptance met → stop the loop
 
   return (
     <Workflow name="chad-coding-task">
       <Sequence>
-        {/* 1) PLAN — nemotron capable turns the request into a concrete spec the
-            coder can execute and the reviewer can check against. No side effects. */}
+        {/* 1) PLAN — nemotron turns the request into a spec + acceptance criteria
+            AND a concrete validate command so "done" is verifiable, not vibes. */}
         <Task id="plan" output={outputs.plan}
           agent={pickAgent("optimize")} fallbackAgent={pickFallback("optimize")} {...taskOpts("optimize")}>
           {[
-            "You are the PLANNER for a coding task. Turn the request into a concrete, minimal spec a coding agent can execute.",
-            "Be specific about files and the acceptance criteria a reviewer will check. Keep scope tight — smallest change that satisfies the request.",
+            "You are the PLANNER + DRIVER for a coding task. Turn the request into a minimal spec a coding agent can execute over several rounds.",
+            "Include a concrete `validateCmd` a machine can run to verify it (e.g. `bun test`, `npm run build`, a script) — this is how we'll know it's actually done.",
             `Task: ${task}`,
-            "Return JSON { summary, steps:[...], acceptance:[...], files:[...] }.",
+            "Return JSON { summary, steps:[...], acceptance:[...], validateCmd, files:[...] }.",
           ].join("\n\n")}
         </Task>
 
-        {/* 2) CODE — offload to opencode big-pickle as an ISOLATED spawn. Draft
-            only: it works in the spawn's workdir and returns a result.json; it does
-            NOT edit this repo. continueOnFail + timeout so a stuck/absent coder
-            can't sink the run (on a bare host with no transport this stubs). */}
-        <Task id="code" output={outputs.code} sideEffect
-          idempotencyKey={`coding-${task.slice(0, 48)}`}
-          continueOnFail retries={0} timeoutMs={SPAWN_TIMEOUT}>
-          {() => runSpawn({
-            kind: CODER_KIND, substrate: SUBSTRATE, id: `coding-${Date.now().toString(36)}`,
-            task: [
-              "Implement this coding task with opencode big-pickle. DRAFT ONLY — write the change in your workdir; do NOT commit, push, or open a PR.",
-              `Spec:\n${JSON.stringify(plan ?? { task }, null, 2)}`,
-              "Last stdout line = result.json { status, summary, follow_ups, (diff if available) }.",
-            ].join("\n\n"),
-          })}
-        </Task>
+        {/* 2) BUILD LOOP — nemotron drives opencode big-pickle over multiple rounds:
+            code → validate (real cmd) → assess (met? feedback). Loops until nemotron
+            says done or MAX_ROUNDS. This is nemotron CONTROLLING the long session. */}
+        <Loop id="build" skipIf={!plan} until={done} maxIterations={MAX_ROUNDS} onMaxReached="return-last">
+          <Sequence>
+            {/* code — offload the actual coding to opencode big-pickle (isolated,
+                draft-only). Each round gets the spec + the prior round's validation
+                output + nemotron's feedback, so the session accumulates direction. */}
+            <Task id="code" output={outputs.code} sideEffect
+              idempotencyKey={`coding-${task.slice(0, 40)}-r${round}`}
+              continueOnFail retries={0} timeoutMs={SPAWN_TIMEOUT}>
+              {() => runSpawn({
+                kind: CODER_KIND, substrate: SUBSTRATE, id: `coding-r${round}-${Date.now().toString(36)}`,
+                task: [
+                  `Implement this coding task with opencode big-pickle — round ${round + 1}. DRAFT in your workdir; do NOT commit/push/PR.`,
+                  `Spec:\n${JSON.stringify(plan ?? { task }, null, 2)}`,
+                  lastValidate ? `Last validation (${lastValidate.passed ? "PASS" : "FAIL"}) output:\n${String(lastValidate.output).slice(0, 2000)}` : "",
+                  lastAssess?.feedback ? `Driver feedback to address this round:\n${lastAssess.feedback}` : "",
+                  "Last stdout line = result.json { status, summary, follow_ups, (diff if available) }.",
+                ].filter(Boolean).join("\n\n"),
+              })}
+            </Task>
 
-        {/* 3) REVIEW — nemotron judge checks the coder's output against the plan's
-            acceptance criteria: correctness, safety, scope. No side effects. */}
-        <Task id="review" skipIf={!code} output={outputs.review}
-          agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
-          {[
-            "You are the REVIEWER. Judge the coder's result against the plan's acceptance criteria.",
-            "Flag correctness bugs, safety/scope issues first. Approve only if it meets the acceptance criteria and is safe to land.",
-            `Plan:\n${JSON.stringify(plan ?? {}, null, 2)}`,
-            `Coder result:\n${JSON.stringify(code ?? {}, null, 2)}`,
-            "Return JSON { approved: boolean, findings:[{severity: blocker|warning|nit, note}], summary }.",
-          ].join("\n\n")}
-        </Task>
+            {/* validate — run the plan's validateCmd for real. Deterministic pass/fail
+                is the grounded signal the driver reasons over (not an LLM guess). */}
+            <Task id="validate" output={outputs.validate} sideEffect
+              idempotencyKey={`coding-validate-${task.slice(0, 40)}-r${round}`}>
+              {async () => {
+                const cmd = plan?.validateCmd?.trim();
+                if (!cmd) return { passed: false, cmd: "(none)", output: "no validateCmd in plan" };
+                const r = await sh("sh", ["-c", cmd]);
+                return { passed: r.code === 0, cmd, output: r.out.slice(-4000) };
+              }}
+            </Task>
 
-        {/* 4) LAND — Approval-gated (a human signs off), shadow unless
-            CHAD_CODING_APPLY=1. Even applied, landing (commit/PR) is intentionally
-            deferred — this stops at a reviewed, gated proposal. */}
-        <Task id="land" output={outputs.land}
-          needsApproval={!(review && review.approved)} sideEffect
-          idempotencyKey={`coding-land-${task.slice(0, 48)}`}>
+            {/* assess — nemotron decides: is acceptance met (given real validation)?
+                If not, what should the coder fix next round? Drives the loop's `until`. */}
+            <Task id="assess" output={outputs.assess}
+              agent={pickAgent("judge")} fallbackAgent={pickFallback("judge")} {...taskOpts("judge")}>
+              {[
+                "You are the DRIVER assessing whether the coding task is DONE. Judge against the acceptance criteria AND the real validation result.",
+                "Set done=true only if the acceptance criteria are met and validation passed. Otherwise give specific, actionable feedback for the next coding round.",
+                `Acceptance:\n${JSON.stringify(plan?.acceptance ?? [], null, 2)}`,
+                `Coder result (round ${round}):\n${JSON.stringify(lastCode ?? {}, null, 2)}`,
+                `Validation: ${lastValidate?.passed ? "PASS" : "FAIL"} (cmd: ${lastValidate?.cmd || "?"})\n${String(lastValidate?.output || "").slice(0, 2000)}`,
+                "Return JSON { done: boolean, feedback: string, summary: string }.",
+              ].join("\n\n")}
+            </Task>
+          </Sequence>
+        </Loop>
+
+        {/* 3) PING — push the operator a Moshi update the moment the build settles
+            (done or capped), with the validation verdict. Never blocks the run. */}
+        <Task id="report" output={outputs.report} sideEffect
+          idempotencyKey={`coding-report-${task.slice(0, 40)}`}>
           {async () => {
-            const findings = review?.findings || [];
-            const title = `Coding task — ${task.slice(0, 60)} — ${review?.approved ? "approved" : "changes requested"}`;
-            const body = `# ${title}\n\n**Plan:** ${plan?.summary || ""}\n\n**Coder:** ${code?.summary || "(no result)"}\n\n` +
-              `**Review:** ${review?.summary || ""}\n` + findings.map((f) => `- **[${f.severity}]** ${f.note}`).join("\n");
+            const validated = !!lastValidate?.passed && done;
+            const summary = lastAssess?.summary || lastCode?.summary || "(no result)";
+            const title = `Chad coding: ${task.slice(0, 48)}`;
+            const msg = `${validated ? "✅ done + validated" : done ? "⚠ done, validation NOT passing" : `⏱ ${round} rounds, not converged`} — review at ${process.env.CHAD_RUNS_PUBLIC_URL || "runs.supachad.com"}`;
+            await moshiPing(title, `${msg}\n${summary.slice(0, 300)}`);
+            return { summary, validated, rounds: round };
+          }}
+        </Task>
+
+        {/* 4) LAND — Approval gate (auto-hold unless validated), shadow unless
+            CHAD_CODING_APPLY=1. The PR is DOUBLY gated (approval + CHAD_CODING_PR=1)
+            and only ever a DRAFT — Chad proposes, a human lands. */}
+        <Task id="land" output={outputs.land}
+          needsApproval={!(lastValidate?.passed && done)} sideEffect
+          idempotencyKey={`coding-land-${task.slice(0, 40)}`}>
+          {async () => {
+            const findings = (lastAssess?.feedback || "").slice(0, 600);
+            const title = `Coding task — ${task.slice(0, 60)} — ${done && lastValidate?.passed ? "validated" : "needs work"}`;
+            const body = `# ${title}\n\n**Plan:** ${plan?.summary || ""}\n\n**Result:** ${lastAssess?.summary || lastCode?.summary || ""}\n\n` +
+              `**Validation:** ${lastValidate?.passed ? "PASS" : "FAIL"} — \`${lastValidate?.cmd || "?"}\`\n\n${findings ? `**Open feedback:** ${findings}` : ""}`;
             if (POST) await postNote({ title, content: body, tags: "chad-coding" });
-            if (!APPLY) return { status: "shadow-logged", detail: `SHADOW: reviewed coding proposal (${review?.approved ? "approved" : "needs work"}); not landed` };
-            return { status: "blocked", detail: "CHAD_CODING_APPLY=1 set but live landing (commit/PR) intentionally deferred" };
+            if (!APPLY) return { status: "shadow-logged", detail: `SHADOW: reviewed coding proposal (${done && lastValidate?.passed ? "validated" : "needs work"}); not landed` };
+            if (!OPEN_PR) return { status: "held", detail: "CHAD_CODING_APPLY=1 but CHAD_CODING_PR unset — landing (commit/PR) intentionally deferred" };
+            // Draft-PR path (doubly gated). Kept minimal + shadow-real: prepare the
+            // PR body; actual `gh pr create` is the operator's confirmed step so Chad
+            // never writes to the source repo autonomously (autonomy boundary).
+            return { status: "pr-prepared", detail: "PR body prepared; run `gh pr create --draft` to open (Chad does not auto-write the repo)", prUrl: "" };
           }}
         </Task>
       </Sequence>
