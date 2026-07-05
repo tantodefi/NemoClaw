@@ -250,6 +250,7 @@ they would do unless an explicit env flag is set.
 | `changelog.jsx` | Draft a changelog entry from recent git log → Approval → note. A plain Sequence (linear shape; no composite forced). | `CHAD_CHANGELOG_SINCE`, `CHAD_CHANGELOG_POST=1` |
 | `pr-shepherd.jsx` | Keep open PRs moving: fetch → **deterministic** per-PR action (`lib/pr.js#prAction`, no LLM) → one cheap-tier digest of "what's blocked on whom". Read-only `gh pr list`; advisory. | `CHAD_PRSHEP_REPO`, `CHAD_PRSHEP_STALE_DAYS`, `CHAD_PRSHEP_POST=1` |
 | `coverage-loop.jsx` | Raise test coverage toward a target via **`<Loop>`** — measure (read-only) → draft focused tests → re-measure, until target or max iters. Draft-only unless `APPLY=1` (exits after one pass in shadow). | `CHAD_COVERAGE_CMD/TARGET/DIR`, `CHAD_COVERAGE_APPLY=1` |
+| `coding-task.jsx` | Chad (nemotron) orchestrates a coding task, offloading the coding to **opencode big-pickle** (isolated spawn, draft-only): plan → code (spawn) → review (nemotron judge) → `Approval`. Never edits the repo / commits; stubs on a bare host. | `--input '{"task":"…"}'`, `CHAD_CODING_SUBSTRATE=gha`, `CHAD_SPAWN_SSH`, `CHAD_CODING_APPLY=1` |
 
 The composite-based rows (added with the Smithers 0.26 upgrade) lean on Smithers'
 **built-in composite components** — `ScanFixVerify`, `Debate`, `Poller`, `Loop` —
