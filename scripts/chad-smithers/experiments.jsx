@@ -41,13 +41,14 @@ import {
 } from "./lib/population.js";
 import { scanSignal, signalText } from "./lib/signal.js";
 import { harvestFixtures } from "./lib/fixtures.js";
+import { resolveDirectives, creativityKnob, inScope } from "./lib/directives.js";
 
 const DB_PATH = process.env.CHAD_SMITHERS_DB || "./experiments.db";
 const POP_PATH = process.env.CHAD_POPULATION || "./state/population.json";
 const SEED_PATH = process.env.CHAD_SEED_FILE || "./state/seed-candidates.json";
 const FIXTURES_PATH = process.env.CHAD_FIXTURES || "./state/fixtures.json";
 const REPORT_PATH = process.env.CHAD_EXPERIMENT_REPORT || "./state/last-report.md";
-const DIRECTIVES_PATH = process.env.CHAD_DIRECTIVES || "./state/directives.json";
+// (directives are resolved via lib/directives.js — global file + per-run override)
 const SIGNAL_DIR = process.env.CHAD_RUNS_DB_DIR || ".";
 const DRY_RUN = process.env.DRY_RUN === "1";
 
@@ -118,9 +119,17 @@ const { smithers, Workflow, Task, Sequence, Parallel, outputs } = api;
 
 export const workflow = smithers((ctx) => {
   const pop = loadPopulation(POP_PATH);
+  // Directives steer breeding/scoring. Resolved through lib/directives.js so a
+  // per-run override (CHAD_DIRECTIVES_JSON) or global-off (CHAD_DIRECTIVES_OFF)
+  // takes effect — this is what lets a run experiment ON the directives themselves.
+  const directives = resolveDirectives(process.env);
+  const priorities = Array.isArray(directives.priorities) ? directives.priorities : [];
   // Static curated fixtures + REAL harvested ones (live cases from the run DBs).
-  const fixtures = [...loadJson(FIXTURES_PATH, []), ...harvestedFixtures()];
-  const directives = loadJson(DIRECTIVES_PATH, {});
+  // `priorities` scopes scoring to the operator's task-kinds when set (fall back to
+  // the full set if nothing matches, so a stray priority can't empty the arena).
+  const allFixtures = [...loadJson(FIXTURES_PATH, []), ...harvestedFixtures()];
+  const scoped = priorities.length ? allFixtures.filter((f) => inScope(f.taskKind, priorities)) : allFixtures;
+  const fixtures = scoped.length ? scoped : allFixtures;
 
   // ── seed: keep the arena wide ──────────────────────────────────────────────
   const want = needsExpansion(pop);
@@ -278,9 +287,13 @@ function mutatePrompt(pop, directives = {}, signal = "") {
     .sort((a, b) => (b.rollingMean || 0) - (a.rollingMean || 0));
   const top = ranked.slice(0, 2).map((c) => ({ label: c.spec.label, system: c.spec.system, score: Number((c.rollingMean || 0).toFixed(3)), trials: c.trials || 0 }));
   const weak = ranked.filter((c) => (c.trials || 0) > 0).slice(-1).map((c) => ({ label: c.spec.label, system: c.spec.system, score: Number((c.rollingMean || 0).toFixed(3)) }));
+  const crea = creativityKnob(directives.creativity);
+  const prio = Array.isArray(directives.priorities) ? directives.priorities : [];
   return [
     "You are the reflective-mutation step of Chad's evolutionary arena. BREED one new drafter-prompt by reasoning about WHY the leaders win and the laggard lags — not random mutation.",
     directives.experiments ? `Operator directives — breed toward these:\n${directives.experiments}` : "",
+    crea.hint ? `Creativity dial (${directives.creativity}): ${crea.hint}` : "",
+    prio.length ? `Operator priorities — focus on these task-kinds: ${prio.join(", ")}.` : "",
     signal ? `Recent run signal (real failures + low scorers from the live system — address these, don't just chase the synthetic fixtures):\n${signal}` : "",
     `Top drafter-prompt(s) by rolling score:\n${JSON.stringify(top, null, 2)}`,
     weak.length ? `A weaker variant:\n${JSON.stringify(weak, null, 2)}` : "",

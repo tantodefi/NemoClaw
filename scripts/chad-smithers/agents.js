@@ -72,6 +72,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { clampOutput } from "./lib/model-limits.js";
+import { resolveDirectives, directiveSystemFor } from "./lib/directives.js";
 
 // ── Optional imports (don't hard-fail if a package/CLI isn't present) ────────
 let ToolLoopAgent, createOpenAICompatible, createAnthropic, ClaudeCodeAgent, CodexAgent, OpenCodeAgent;
@@ -188,17 +189,13 @@ function championSystem() {
   try { const s = JSON.parse(readFileSync(new URL("./state/champion-prompt.json", import.meta.url), "utf8")).system; return s || undefined; } catch { return undefined; }
 }
 
-// directiveSystem — operator-configured system-prompt additions from
-// state/directives.json (systemPrompts: { all, <role> }), injected into EVERY
-// pickAgent call. The in-app Directives tab edits this file; empty strings inject
-// nothing (opt-in). Lets the operator enforce house style / guardrails / focus
-// across all workflows without touching code.
+// directiveSystem — operator-configured system-prompt additions injected into
+// EVERY pickAgent call. Resolves through lib/directives.js so a run's per-run
+// override / global-off env (CHAD_DIRECTIVES_JSON / CHAD_DIRECTIVES_OFF) is honored
+// exactly like the global Directives tab file. Empty strings inject nothing (opt-in).
 function directiveSystem(role) {
-  try {
-    const sp = JSON.parse(readFileSync(new URL("./state/directives.json", import.meta.url), "utf8")).systemPrompts || {};
-    const s = [sp.all, sp[role]].filter((x) => x && String(x).trim()).join("\n\n");
-    return s || undefined;
-  } catch { return undefined; }
+  try { return directiveSystemFor(resolveDirectives(process.env), role); }
+  catch { return undefined; }
 }
 
 // ── Backend constructors ─────────────────────────────────────────────────────
