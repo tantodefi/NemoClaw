@@ -541,7 +541,10 @@ function nvidiaEnv() {
 // _SECRET/API_KEY), trust boundaries (_ALLOWLIST/_OPERATOR), or process internals
 // (PATH/HOME/NODE_/LD_). Note _TOKEN(_|$) deliberately does NOT match _TOKENS, so
 // CHAD_MAX_OUTPUT_TOKENS is allowed.
-const ENV_DENY = /(^|_)(SSH|BIN|CREDS?|SECRET|PASSWORD|COOKIE|PATH|HOME|NODE|LD)(_|$)|_KEY(_|$)|_TOKEN(_|$)|_URL(_|$)|BASE_URL|ALLOWLIST|OPERATOR|API_?KEY/;
+// Also deny the bare CHAD_DIRECTIVES (a directives-FILE PATH) from launch — a run
+// may steer directives via CHAD_DIRECTIVES_JSON (inline override) / CHAD_DIRECTIVES_OFF
+// (disable global), but must not redirect the file path to read arbitrary JSON.
+const ENV_DENY = /(^|_)(SSH|BIN|CREDS?|SECRET|PASSWORD|COOKIE|PATH|HOME|NODE|LD)(_|$)|_KEY(_|$)|_TOKEN(_|$)|_URL(_|$)|BASE_URL|ALLOWLIST|OPERATOR|API_?KEY|^CHAD_DIRECTIVES$/;
 function isAllowedEnvKey(k) {
   return /^(CHAD_[A-Z0-9_]+|DRY_RUN)$/.test(k) && !ENV_DENY.test(k);
 }

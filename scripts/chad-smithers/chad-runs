@@ -75,7 +75,15 @@ const pos = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].
       case "graph": out = await req("GET", "/api/workflow-graph?name=" + encodeURIComponent(pos[0])); break;
       case "cat": out = await req("GET", "/api/workflow-file?name=" + encodeURIComponent(pos[0])); break;
       case "save": out = await req("POST", "/api/workflow-file", { name: pos[0], content: readFileSync(pos[1], "utf8") }); break;
-      case "launch": out = await req("POST", "/api/launch", { workflow: pos[0], input: flag("input") ? JSON.parse(flag("input")) : undefined, env: flag("env") ? JSON.parse(flag("env")) : undefined }); break;
+      case "launch": {
+        // Directives: --directives '<json>' sets a per-run override; --no-global
+        // disables the global directives file for this run. Both ride the env map.
+        const env = flag("env") ? JSON.parse(flag("env")) : {};
+        if (flag("directives") != null) env.CHAD_DIRECTIVES_JSON = flag("directives");
+        if (args.includes("--no-global")) env.CHAD_DIRECTIVES_OFF = "1";
+        out = await req("POST", "/api/launch", { workflow: pos[0], input: flag("input") ? JSON.parse(flag("input")) : undefined, env: Object.keys(env).length ? env : undefined });
+        break;
+      }
       case "preflight": out = await req("POST", "/api/preflight", { workflow: pos[0], env: flag("env") ? JSON.parse(flag("env")) : {} }); break;
       case "resume": out = await req("POST", `/api/runs/${encodeURIComponent(pos[0])}/resume`); break;
       case "cancel": out = await req("POST", `/api/runs/${encodeURIComponent(pos[0])}/cancel`); break;
@@ -116,7 +124,7 @@ const pos = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].
           "usage: chad-runs <command> [args]   (output is JSON; pipe to jq)",
           "  runs                       runs | get <id> | logs <id> [--limit N] | trace <id> <node>",
           "  inspect                    chat <id> | diff <id> <node> | get <id>",
-          "  lifecycle                  launch <wf> [--input JSON] [--env JSON] | preflight <wf> [--env JSON]",
+          "  lifecycle                  launch <wf> [--input JSON] [--env JSON] [--directives JSON] [--no-global] | preflight <wf> [--env JSON]",
           "                             cancel <id> | resume <id> | fork <id> [--frame N --reset-node X]",
           "  gates                      approvals | approve <id> [--node N --iteration I] | deny <id> [...]",
           "  workflows                  workflows | catalog | graph <wf> | cat <wf> | save <wf> <file>",
