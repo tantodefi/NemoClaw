@@ -1,0 +1,53 @@
+#!/usr/bin/env node
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// chad-moshi-notify — push a one-way notification to the operator's Moshi app via
+// the device-token webhook API. This is the GENERIC Chad→phone push path: it does
+// NOT depend on the `claude` CLI lifecycle hooks (moshi-hook), so it works from
+// nemotron sessions, cron, and Smithers workflows — the gap that left nemotron-only
+// Chad unable to reach Moshi. Interactive approve/deny is NOT offered by this API
+// (that stays on the moshi-hook path); for approvals Chad pushes a one-way
+// "approval needed → approve at <url>" ping, same contract as the webui/email
+// notify channels.
+//
+// Token resolves from MOSHI_DEVICE_TOKEN env, else credentials.json (host).
+// NEVER commit the token; credentials.json lives outside the repo.
+//
+// Usage:
+//   chad-moshi-notify "<title>" "<message>" [--unified]
+//   echo "<message>" | chad-moshi-notify "<title>"        # message on stdin
+// Exit 0 on success, 1 on send failure, 2 on usage/misconfig.
+
+import { moshiPing, moshiToken } from "./lib/notify.js";
+
+const args = process.argv.slice(2);
+const unified = args.includes("--unified");
+const pos = args.filter((a) => a !== "--unified");
+const title = pos[0];
+let message = pos[1];
+
+if (!title) { console.error('usage: chad-moshi-notify "<title>" "<message>" [--unified]'); process.exit(2); }
+
+async function readStdin() {
+  if (process.stdin.isTTY) return "";
+  const chunks = []; for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8").trim();
+}
+
+(async () => {
+  const tok = token();
+  if (!tok) { console.error("chad-moshi-notify: no MOSHI_DEVICE_TOKEN (env or credentials.json)"); process.exit(2); }
+  if (message == null) message = await readStdin();
+  const body = { token: tok, title: String(title).slice(0, 200), message: String(message || "").slice(0, 2000) };
+  if (unified) body.unified = true;
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 15000);
+    const r = await fetch(ENDPOINT, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: ac.signal });
+    clearTimeout(t);
+    const txt = (await r.text()).slice(0, 300);
+    if (!r.ok) { console.error(`chad-moshi-notify: HTTP ${r.status}: ${txt}`); process.exit(1); }
+    console.log(`moshi: sent "${body.title}"${unified ? " (unified)" : ""}`);
+  } catch (e) { console.error("chad-moshi-notify: send failed:", e.message); process.exit(1); }
+})();

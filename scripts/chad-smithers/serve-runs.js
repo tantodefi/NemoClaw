@@ -71,13 +71,22 @@ const NOTIFY_CFG_PATH = join(HERE, "state", "notify-config.json");
 // set, the channel goes `ready` and the notifier actually dispatches it (no longer
 // silently dropped). E.g. CHAD_TELEGRAM_NOTIFY_CMD='openclaw channels send --to telegram --text {text}'.
 const POD_TELEGRAM_CMD = process.env.CHAD_TELEGRAM_NOTIFY_CMD || "";
-const POD_MOSHI_CMD = process.env.CHAD_MOSHI_NOTIFY_CMD || "";
+// Moshi push: the device-token webhook (chad-moshi-notify) — a host-side, one-way
+// push that works without Pro or the claude-hook path. Ready when the token is set
+// (env or credentials.json). Approve/deny buttons aren't offered by this API, so
+// like webui/email this pushes an "approval needed → approve at <url>" ping.
+const MOSHI_NOTIFY_BIN = join(HERE, "chad-moshi-notify");
+function moshiTokenPresent() {
+  if (process.env.MOSHI_DEVICE_TOKEN) return true;
+  try { return !!JSON.parse(readFileSync(process.env.CHAD_HOST_CREDS || "/Users/r/.nemoclaw/credentials.json", "utf8")).MOSHI_DEVICE_TOKEN; } catch { return false; }
+}
+const MOSHI_READY = moshiTokenPresent();
 const AVAILABLE_CHANNELS = [
   { id: "browser", label: "Browser push", ready: true, note: "desktop/PWA notification — enable per-browser via the 🔔 bell" },
   { id: "webui", label: "OpenWebUI note", ready: true, note: "posts a note via the pod chad-webui" },
   { id: "email", label: "Email", ready: true, note: "emails the operator via chad-mail-send" },
   { id: "telegram", label: "Telegram / WhatsApp", ready: !!POD_TELEGRAM_CMD, note: POD_TELEGRAM_CMD ? "dispatches via CHAD_TELEGRAM_NOTIFY_CMD" : "set CHAD_TELEGRAM_NOTIFY_CMD (openclaw channel send) to enable" },
-  { id: "moshi", label: "Moshi (voice/phone)", ready: !!POD_MOSHI_CMD, note: POD_MOSHI_CMD ? "dispatches via CHAD_MOSHI_NOTIFY_CMD" : "set CHAD_MOSHI_NOTIFY_CMD (needs iPhone pairing) to enable" },
+  { id: "moshi", label: "Moshi (phone push)", ready: MOSHI_READY, note: MOSHI_READY ? "pushes via chad-moshi-notify (device-token webhook)" : "set MOSHI_DEVICE_TOKEN in credentials.json to enable" },
 ];
 function liveNotifyChannels() {
   try { const s = JSON.parse(readFileSync(NOTIFY_CFG_PATH, "utf8")).channels; if (Array.isArray(s)) return s; } catch { /* */ }
@@ -1196,7 +1205,11 @@ function dispatchApproval(p) {
   if (channels.includes("webui")) podRun(`${POD_WEBUI} notes create --title ${shq(title)} --content ${shq(body)} --tags chad-approvals 2>/dev/null || true`);
   if (channels.includes("email")) podRun(`chad-mail-send --to ${shq(OPERATOR_EMAIL)} --subject ${shq(title)} --body ${shq(body)} 2>/dev/null || true`);
   if (channels.includes("telegram")) podRunTemplate(POD_TELEGRAM_CMD, `${title}: ${body}`);
-  if (channels.includes("moshi")) podRunTemplate(POD_MOSHI_CMD, `${title}: ${body}`);
+  // Moshi: host-side device-token push (no pod round-trip needed — serve-runs runs
+  // on the host and has the token). One-way ping; the operator approves at the URL.
+  if (channels.includes("moshi") && MOSHI_READY) {
+    try { const c = spawn(process.execPath, [MOSHI_NOTIFY_BIN, title, body], { stdio: "ignore" }); c.on("error", () => {}); c.unref(); } catch { /* */ }
+  }
 }
 function approvalNotifier() {
   // Always poll — the dispatch channel set is live-editable from the Approvals tab,
