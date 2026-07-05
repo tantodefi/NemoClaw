@@ -132,15 +132,30 @@ chad-runs graph workflows/mcp-health-probe.jsx     # validate it parses
 chad-runs launch workflows/mcp-health-probe.jsx
 ```
 
-**Steering the self-improvement loop.** The arena's breeding/scoring and every
-agent's system prompt read `state/directives.json`; `signal` is the trace-grounded
-DB scan (failed/stale/low-quality runs) that feeds the next generation. Read the
-signal, then steer:
+**Steering the self-improvement loop.** Directives are the **global** default
+(`state/directives.json`) resolved through `lib/directives.js` and consumed by the
+arena (breeding + scoring) and every agent's system prompt. All four fields are
+live: `experiments` (free-text steer), `creativity` (low|moderate|high → how boldly
+the mutate step explores), `priorities` (task-kinds → scopes which fixtures score),
+`systemPrompts.{all,<role>}` (injected into agent calls). `signal` is the
+trace-grounded DB scan that feeds the next generation. Read the signal, then steer:
 ```sh
 chad-runs signal --days 7 | jq '{failed:.failedRuns|length, low:.lowScorers|length}'
 chad-runs directives > /tmp/d.json
-#   …edit /tmp/d.json (e.g. set experiments: "favor terse, cite-grounded drafts")…
-chad-runs set-directives /tmp/d.json     # lands in the next arena run + agent prompts
+#   …edit /tmp/d.json (experiments/creativity/priorities/systemPrompts)…
+chad-runs set-directives /tmp/d.json     # global — lands in the next arena run + agent prompts
+```
+
+**Experiment ON the directives (per-run override).** A run can disable the global
+set and/or supply its own directives, so you can A/B a directive. Resolution:
+`CHAD_DIRECTIVES_OFF=1` ignores the global file; `CHAD_DIRECTIVES_JSON='{…}'` is a
+per-run override (merges over global; used alone when global is off). Both ride the
+allowlisted launch env (drawer: Workflows → Launch → Directives):
+```sh
+# breed the arena under a bolder directive for ONE run, without touching the global:
+chad-runs launch experiments.jsx --directives '{"creativity":"high","experiments":"try a radically terser voice"}'
+# or test a directive in isolation (ignore the global set):
+chad-runs launch experiments.jsx --no-global --directives '{"experiments":"…"}'
 ```
 
 **Driving a chain.** String workflows into a pipeline; each step launches when the

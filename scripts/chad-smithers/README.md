@@ -28,6 +28,8 @@ resume guarantees to hold.
 | `lib/coverage.test.js` | `node --test lib/coverage.test.js` — 6 tests, all green. |
 | `lib/models.js` | Model-id hygiene for the experiments matrix: `canonicalModelId()` (collapse `nvidia/nvidia/…` → `nvidia/…`), `isKnownModel()` / `rosterSet()` (validate against the live roster so mangled/derostered ids don't become phantom matrix columns). |
 | `lib/models.test.js` | `node --test lib/models.test.js` — 8 tests, all green. |
+| `lib/directives.js` | Directive resolution: `resolveDirectives(env)` merges the global `state/directives.json` with a per-run override (`CHAD_DIRECTIVES_JSON`) under a global gate (`CHAD_DIRECTIVES_OFF`) so runs can experiment ON the directives. `creativityKnob()`, `inScope()`, `directiveSystemFor()`. |
+| `lib/directives.test.js` | `node --test lib/directives.test.js` — 9 tests, all green. |
 | `experiments.jsx` | The nightly evolutionary workflow (Smithers). |
 | `workflows/*.jsx` | Ported chad-spawn / cron features (issue-triage, content-pipeline, self-improve, memory-curator, log-digest) + email-ladder, fusion, mcp-health-probe, fail-only-report. All graph-validate; side-effecting ones are shadow-safe by default. |
 | `state/seed-candidates.json` | Tracked. Initial variant pool to seed the arena wide. |
