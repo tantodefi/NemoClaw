@@ -31,12 +31,17 @@ import { z } from "zod";
 import { execFile } from "node:child_process";
 import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 import { runSpawn, spawnResultSchema } from "../lib/spawn.js";
+import { runOpencodeDirect } from "../lib/opencode.js";
 import { postNote } from "../lib/note.js";
 import { moshiPing } from "../lib/notify.js";
 
 const DB = process.env.CHAD_CODING_DB || "./coding-task.db";
 const CODER_KIND = process.env.CHAD_CODING_KIND || "opencode"; // opencode big-pickle
 const SUBSTRATE = process.env.CHAD_CODING_SUBSTRATE || "local"; // local | gha (isolated)
+// Coder path: "spawn" (DEFAULT — isolated chad-spawn on the pod/GHA; the controlled
+// substrate) or "direct" (host opencode in a temp workdir — for hosts where opencode
+// is authed and there's no spawn transport). Pod spawn is default per operator.
+const CODER = process.env.CHAD_CODING_CODER || "spawn";
 const SPAWN_TIMEOUT = Number(process.env.CHAD_SPAWN_TIMEOUT_MS || 1_800_000); // 30 min
 const MAX_ROUNDS = Number(process.env.CHAD_CODING_MAX_ROUNDS || 4); // long-build cap
 const WORKDIR = process.env.CHAD_CODING_WORKDIR || process.cwd();   // where validate runs
@@ -108,16 +113,20 @@ export const workflow = smithers((ctx) => {
             <Task id="code" output={outputs.code} sideEffect
               idempotencyKey={`coding-${task.slice(0, 40)}-r${round}`}
               continueOnFail retries={0} timeoutMs={SPAWN_TIMEOUT}>
-              {() => runSpawn({
-                kind: CODER_KIND, substrate: SUBSTRATE, id: `coding-r${round}-${Date.now().toString(36)}`,
-                task: [
+              {() => {
+                const coderTask = [
                   `Implement this coding task with opencode big-pickle — round ${round + 1}. DRAFT in your workdir; do NOT commit/push/PR.`,
                   `Spec:\n${JSON.stringify(plan ?? { task }, null, 2)}`,
                   lastValidate ? `Last validation (${lastValidate.passed ? "PASS" : "FAIL"}) output:\n${String(lastValidate.output).slice(0, 2000)}` : "",
                   lastAssess?.feedback ? `Driver feedback to address this round:\n${lastAssess.feedback}` : "",
                   "Last stdout line = result.json { status, summary, follow_ups, (diff if available) }.",
-                ].filter(Boolean).join("\n\n"),
-              })}
+                ].filter(Boolean).join("\n\n");
+                const cid = `coding-r${round}-${Date.now().toString(36)}`;
+                // Default: isolated pod/GHA spawn. Opt-in: direct host opencode.
+                return CODER === "direct"
+                  ? runOpencodeDirect({ task: coderTask, id: cid, workdir: WORKDIR !== process.cwd() ? WORKDIR : undefined, timeoutMs: SPAWN_TIMEOUT })
+                  : runSpawn({ kind: CODER_KIND, substrate: SUBSTRATE, id: cid, task: coderTask });
+              }}
             </Task>
 
             {/* validate — run the plan's validateCmd for real. Deterministic pass/fail
