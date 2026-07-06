@@ -30,6 +30,11 @@ resume guarantees to hold.
 | `lib/models.test.js` | `node --test lib/models.test.js` — 8 tests, all green. |
 | `lib/directives.js` | Directive resolution: `resolveDirectives(env)` merges the global `state/directives.json` with a per-run override (`CHAD_DIRECTIVES_JSON`) under a global gate (`CHAD_DIRECTIVES_OFF`) so runs can experiment ON the directives. `creativityKnob()`, `inScope()`, `directiveSystemFor()`. |
 | `lib/directives.test.js` | `node --test lib/directives.test.js` — 9 tests, all green. |
+| `lib/opencode.js` | `runOpencodeDirect()` — host opencode big-pickle coder (the `direct` coder path for coding-task/landing-lab). Runs under a shell with stdout→file (opencode only uses tools that way) + `--pure`; isolated `/tmp` workdir; never throws. |
+| `lib/notify.js` | `moshiPing(title,message)` — one-way phone push via the Moshi device-token webhook (`MOSHI_DEVICE_TOKEN` from `credentials.json`). No Pro / no claude-hook; works from nemotron/cron/workflows. Never throws. |
+| `chad-moshi-notify` | CLI wrapper over `moshiPing` (`chad-moshi-notify "<title>" "<message>"`). |
+| `chad-claude` | Launch Claude inside a routable tmux so Moshi approve/deny **buttons** work (`context.kind=tmux`). |
+| `chad-moshi-hook-refresh.sh` + `dev.nemoclaw.moshi-hook-refresh.plist` | launchd guard that re-installs the Moshi claude hooks when they go stale after a moshi-hook update. |
 | `experiments.jsx` | The nightly evolutionary workflow (Smithers). |
 | `workflows/*.jsx` | Ported chad-spawn / cron features (issue-triage, content-pipeline, self-improve, memory-curator, log-digest) + email-ladder, fusion, mcp-health-probe, fail-only-report. All graph-validate; side-effecting ones are shadow-safe by default. |
 | `state/seed-candidates.json` | Tracked. Initial variant pool to seed the arena wide. |

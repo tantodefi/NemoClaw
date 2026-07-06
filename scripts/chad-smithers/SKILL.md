@@ -250,7 +250,8 @@ they would do unless an explicit env flag is set.
 | `changelog.jsx` | Draft a changelog entry from recent git log → Approval → note. A plain Sequence (linear shape; no composite forced). | `CHAD_CHANGELOG_SINCE`, `CHAD_CHANGELOG_POST=1` |
 | `pr-shepherd.jsx` | Keep open PRs moving: fetch → **deterministic** per-PR action (`lib/pr.js#prAction`, no LLM) → one cheap-tier digest of "what's blocked on whom". Read-only `gh pr list`; advisory. | `CHAD_PRSHEP_REPO`, `CHAD_PRSHEP_STALE_DAYS`, `CHAD_PRSHEP_POST=1` |
 | `coverage-loop.jsx` | Raise test coverage toward a target via **`<Loop>`** — measure (read-only) → draft focused tests → re-measure, until target or max iters. Draft-only unless `APPLY=1` (exits after one pass in shadow). | `CHAD_COVERAGE_CMD/TARGET/DIR`, `CHAD_COVERAGE_APPLY=1` |
-| `coding-task.jsx` | Chad (nemotron) orchestrates a coding task, offloading the coding to **opencode big-pickle** (isolated spawn, draft-only): plan → code (spawn) → review (nemotron judge) → `Approval`. Never edits the repo / commits; stubs on a bare host. | `--input '{"task":"…"}'`, `CHAD_CODING_SUBSTRATE=gha`, `CHAD_SPAWN_SSH`, `CHAD_CODING_APPLY=1` |
+| `coding-task.jsx` | Chad (nemotron) DRIVES a long, validated **opencode big-pickle** build: plan (spec + a real `validateCmd`) → **[ code → validate (run the cmd) → assess ]** looped until done/maxRounds → Moshi ping → `Approval` → optional draft PR (doubly gated). Coder path via `CHAD_CODING_CODER`: **spawn** (default — isolated pod/GHA) or **direct** (host opencode). Never edits the live repo; draft-only. | `--input '{"task":"…"}'`, `CHAD_CODING_CODER=direct`, `CHAD_SPAWN_SSH`, `CHAD_CODING_APPLY=1`, `CHAD_CODING_PR=1` |
+| `landing-lab.jsx` | GROUNDED marketing-copy lab: nemotron distills the real docs (README + supachad docs) into a fact sheet (claim → source) → opencode big-pickle writes **N distinct landing pages** (per angle) using ONLY those facts → nemotron **compares** + **flags any unbacked/hallucinated claim**. Never touches the live landing repo; Moshi ping + `Approval`. | `CHAD_LAB_ANGLES="dev|founder"`, `CHAD_LAB_SOURCES`, `CHAD_LAB_WORKDIR`, `CHAD_LAB_POST=1` |
 
 The composite-based rows (added with the Smithers 0.26 upgrade) lean on Smithers'
 **built-in composite components** — `ScanFixVerify`, `Debate`, `Poller`, `Loop` —
@@ -268,6 +269,35 @@ loop (changelog); and keep routing **deterministic**
 where you can (`pr-shepherd`'s `lib/pr.js`, `issue-triage`'s `scoreIssue`) so the model
 is spent on the summary, not the decision. Fan-outs (`fusion`, `token-optimize`) cap
 concurrency with `<Parallel maxConcurrency={N}>` so a big panel can't hammer the API.
+
+## Coding with opencode big-pickle (lib/opencode.js)
+
+`coding-task` + `landing-lab` offload the actual coding to **opencode big-pickle**.
+Two coder paths: **spawn** (default — `runSpawn`, isolated pod/GHA workdir + L7 policy;
+stubs on a bare host with no transport) and **direct** (`CHAD_CODING_CODER=direct` →
+`lib/opencode.js#runOpencodeDirect`, host opencode in an isolated `/tmp` workdir, for
+authed hosts). Hard-won gotchas baked into `runOpencodeDirect`:
+- **Launch under a shell with stdout→file.** opencode `run` only engages its full
+  tool-using loop that way; a direct `execFile`/`spawn` pipe runs it degraded and it
+  **writes nothing**. It runs `sh -c 'opencode run "$OC_TASK" … >log 2>&1'` (task via
+  env var → no escaping; stdin `/dev/null` → no hang).
+- **`--pure` by default** (no external plugins): autonomous (no per-write Moshi
+  approval blocking a long build) and no Moshi agent-session clutter. `CHAD_CODING_INTERACTIVE=1`
+  keeps the plugin (per-action phone approve/deny).
+- **`--pure` rejects reading dirs outside cwd** — so ground via the PROMPT (a fact
+  sheet), not opencode file reads; each variant only writes in its own empty workdir.
+
+## Notifying the operator (lib/notify.js + chad-moshi-notify)
+
+`moshiPing(title, message)` / the `chad-moshi-notify` CLI push a one-way notification
+to the operator's phone via the Moshi **device-token webhook** (token in
+`credentials.json` as `MOSHI_DEVICE_TOKEN`, never committed). Works from nemotron
+sessions / cron / workflows — no Moshi Pro, no `claude`-hook dependency. It's the
+`moshi` approval-notify channel in serve-runs and the "ping me" step in `coding-task`
+/ `landing-lab`. Interactive approve/deny **buttons** are separate: they need the
+Claude/opencode session to be **routable** (running inside tmux → `moshi-hook context`
+reports `kind=tmux`); launch Claude via `chad-claude` (a routable-tmux wrapper) to get
+them. Notifications self-heal via the `dev.nemoclaw.moshi-hook-refresh` launchd guard.
 
 ## chad-spawn bridge (lib/spawn.js)
 
