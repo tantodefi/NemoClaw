@@ -11,16 +11,24 @@
 
 import { execFile } from "node:child_process";
 import { mkdtempSync, existsSync, readdirSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// Base for the isolated coder workdir. Default /tmp (not macOS $TMPDIR/var/folders):
+// opencode's write tool operates reliably under /tmp but was observed to no-op in a
+// bare $TMPDIR dir. Override with CHAD_CODING_TMPBASE.
+const TMP_BASE = process.env.CHAD_CODING_TMPBASE || "/tmp";
 
 const OPENCODE_BIN = process.env.CHAD_OPENCODE_BIN || "opencode";
 const MODEL = process.env.CHAD_OPENCODE_MODEL || "opencode/big-pickle";
 
 function exec(cmd, args, opts = {}) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { maxBuffer: 16 * 1024 * 1024, ...opts },
+    const cp = execFile(cmd, args, { maxBuffer: 16 * 1024 * 1024, ...opts },
       (err, out, errout) => resolve({ code: err ? (err.code ?? 1) : 0, out: (out || "").toString() + (errout || "").toString() }));
+    // CRITICAL: close the child's stdin. execFile leaves it an OPEN pipe, and
+    // `opencode run` blocks waiting on stdin — it only proceeds on EOF. Without
+    // this the coder hangs until the timeout (the demo-build wedge).
+    try { cp.stdin && cp.stdin.end(); } catch { /* */ }
   });
 }
 
@@ -48,7 +56,7 @@ export async function runOpencodeDirect({ task = "", id, workdir, timeoutMs } = 
   const okBin = await exec(OPENCODE_BIN, ["--version"]);
   if (okBin.code !== 0) return shape({ status: "failed", exit_code: 2, summary: `opencode not runnable (${okBin.out.slice(0, 120)}) — use the spawn coder or install opencode` });
 
-  const dir = workdir || mkdtempSync(join(tmpdir(), "chad-coding-"));
+  const dir = workdir || mkdtempSync(join(TMP_BASE, "chad-coding-"));
   const t = Number(timeoutMs || process.env.CHAD_SPAWN_TIMEOUT_MS || 1_800_000);
   const r = await exec(OPENCODE_BIN, ["run", task, "-m", MODEL, "--print-logs"], { cwd: dir, timeout: t });
   const files = existsSync(dir) ? listFiles(dir) : [];
