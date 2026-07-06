@@ -21,7 +21,7 @@
 
 import { createSmithers } from "smithers-orchestrator";
 import { z } from "zod";
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 import { runOpencodeDirect } from "../lib/opencode.js";
@@ -122,7 +122,12 @@ export const workflow = smithers((ctx) => {
             "Compare these Supachad landing-page variants. Score each 0-100 on: accuracy-to-facts (claims backed by the fact sheet), clarity, appeal.",
             "CRUCIAL: list any claim a variant makes that is NOT supported by the fact sheet (hallucinated/unbacked).",
             `Grounded fact sheet:\n${JSON.stringify(facts ?? {}, null, 2)}`,
-            `Variants:\n${JSON.stringify(variants.map((v) => ({ angle: v.angle, status: v.status, summary: v.summary })), null, 2)}`,
+            // Judge the ACTUAL page copy (visible text), not the build log. Strip
+            // tags/style so the model reviews the marketing claims themselves.
+            "Variants (angle + the page's visible copy):\n" + variants.map((v) => {
+              let copy = ""; try { if (existsSync(v.file)) copy = readFileSync(v.file, "utf8").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 3000); } catch { /* */ }
+              return `\n--- ANGLE: ${v.angle} (${v.status}) ---\n${copy || "(no page produced)"}`;
+            }).join("\n"),
             "Return JSON { ranking:[{angle, score, why}], unbacked_claims:[...], recommendation }.",
           ].join("\n\n")}
         </Task>
