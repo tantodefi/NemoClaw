@@ -20,6 +20,12 @@ const TMP_BASE = process.env.CHAD_CODING_TMPBASE || "/tmp";
 
 const OPENCODE_BIN = process.env.CHAD_OPENCODE_BIN || "opencode";
 const MODEL = process.env.CHAD_OPENCODE_MODEL || "opencode/big-pickle";
+// Default `--pure` (no external plugins): the coder runs AUTONOMOUSLY — it doesn't
+// register a Moshi agent session (no per-run "WORKING" card clutter) and doesn't
+// route each write to a per-action phone approval that would block a long unattended
+// build. Human review happens once, at the workflow's Approval gate. Set
+// CHAD_CODING_INTERACTIVE=1 to keep plugins (per-action Moshi approve/deny buttons).
+const PURE = process.env.CHAD_CODING_INTERACTIVE !== "1";
 
 function exec(cmd, args, opts = {}) {
   return new Promise((resolve) => {
@@ -58,7 +64,9 @@ export async function runOpencodeDirect({ task = "", id, workdir, timeoutMs } = 
 
   const dir = workdir || mkdtempSync(join(TMP_BASE, "chad-coding-"));
   const t = Number(timeoutMs || process.env.CHAD_SPAWN_TIMEOUT_MS || 1_800_000);
-  const r = await exec(OPENCODE_BIN, ["run", task, "-m", MODEL, "--print-logs"], { cwd: dir, timeout: t });
+  const runArgs = ["run", task, "-m", MODEL, "--print-logs"];
+  if (PURE) runArgs.push("--pure");
+  const r = await exec(OPENCODE_BIN, runArgs, { cwd: dir, timeout: t });
   const files = existsSync(dir) ? listFiles(dir) : [];
   const tail = r.out.slice(-1500);
   return shape({
