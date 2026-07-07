@@ -115,8 +115,14 @@ fi
 # (CHAD_TOKENOPT_APPLY stays unset); any downgrade it proposes waits for operator
 # approval in the dashboard. Best-effort: a failure must not mask the run's rc.
 echo "run-experiments: running model benchmark (token-optimize, shadow)…" >&2
-CHAD_TOKENOPT_APPLY= "$SMITHERS" up workflows/token-optimize.jsx >/dev/null 2>&1 \
-  || echo "run-experiments: token-optimize benchmark non-fatal failure" >&2
+# Smithers exit 3 = the run paused at its Approval gate (the expected outcome for
+# a shadow workflow — see `smithers up` "exit 3 = awaiting a decision, not a
+# failure"). Only a genuine non-zero-non-3 rc is a real failure worth logging.
+CHAD_TOKENOPT_APPLY= "$SMITHERS" up workflows/token-optimize.jsx >/dev/null 2>&1
+trc=$?
+if [ "$trc" -ne 0 ] && [ "$trc" -ne 3 ]; then
+  echo "run-experiments: token-optimize benchmark non-fatal failure (rc=$trc)" >&2
+fi
 
 # Reporting loop — ONCE daily (the 05:00 invocation only) so the benchmark loop
 # above can run 3x/day without spamming the approval queue. bug-report (own
@@ -126,8 +132,12 @@ CHAD_TOKENOPT_APPLY= "$SMITHERS" up workflows/token-optimize.jsx >/dev/null 2>&1
 if [ "$(date +%H)" = "05" ]; then
   for wf in bug-report self-improve skill-improve; do
     echo "run-experiments: running $wf (shadow)…" >&2
-    "$SMITHERS" up "workflows/$wf.jsx" >/dev/null 2>&1 \
-      || echo "run-experiments: $wf non-fatal failure" >&2
+    "$SMITHERS" up "workflows/$wf.jsx" >/dev/null 2>&1
+    wrc=$?
+    # rc 3 = paused at Approval gate (expected for these shadow workflows).
+    if [ "$wrc" -ne 0 ] && [ "$wrc" -ne 3 ]; then
+      echo "run-experiments: $wf non-fatal failure (rc=$wrc)" >&2
+    fi
   done
 fi
 

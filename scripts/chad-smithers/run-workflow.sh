@@ -52,4 +52,9 @@ echo "$$" > "$PIDF"
 trap 'rm -rf "$LOCK" 2>/dev/null' EXIT
 
 echo "run-workflow: $WF @ $(date -u +%FT%TZ)" >&2
-exec "$SMITHERS" up "$WF"
+# NB: run (don't `exec`) so the EXIT trap fires and removes the lock dir.
+# `exec` replaces this shell, discarding the trap — which left a stale lock
+# behind every run and logged "clearing stale lock" on the next fire. Passing
+# the smithers exit code through keeps launchd's last-exit-status meaningful.
+"$SMITHERS" up "$WF"
+exit $?
