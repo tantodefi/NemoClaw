@@ -9,7 +9,12 @@
     "experiments:dry": "DRY_RUN=1 smithers up experiments.jsx",
     "agents:probe": "node agents.js --probe",
     "ps": "smithers ps",
-    "resume": "smithers ps"
+    "resume": "smithers ps",
+    "doctor": "../chad-ops.sh doctor",
+    "recover": "../chad-ops.sh recover",
+    "deploy": "../chad-ops.sh deploy",
+    "gate-sync": "../chad-ops.sh gate-sync",
+    "inbox-prune": "../chad-ops.sh inbox-prune"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "latest",
