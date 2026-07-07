@@ -48,6 +48,13 @@ OPENWEBUI.md
 # Cron jobs. Restoring this file alone is NOT enough — the gateway holds the in-memory
 # list, so chad-restore-from-github also calls chad-cron-reload to re-register entries.
 cron/jobs.json
+# Operator allowlist for the memory-backed `chad` agent (Chad-lite gate). The shim
+# self-reads this file (3rd source in scripts/openwebui/chad-shim.py) so EVERY shim
+# launch path is gated — not just the watchdog, which also refreshes it every tick.
+# Backed up here so cold-start restore repopulates it BEFORE chad-restore relaunches
+# the shim, eliminating the fail-open window. One email per line. NOTE: this puts
+# operator emails in the (private) chad-state backup repo, alongside persona/memory.
+state/operator-allowlist
 # Action gate state: per-channel daily counters and kill-switch.
 auto-actions.json
 # Approved-exec list (chad-action-gate decisions persisted across restarts).

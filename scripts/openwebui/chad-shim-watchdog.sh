@@ -29,6 +29,24 @@ SHIM_FALLBACK="${CHAD_SHIM_FALLBACK:-/usr/local/bin/chad-shim.py}"
 INBOX="${CHAD_AGENT_INBOX:-/sandbox/.openclaw-data/state/agent-inbox.jsonl}"
 LOG="${CHAD_SHIM_WATCHDOG_LOG:-${HOME}/.nemoclaw/openwebui/chad-shim-watchdog.log}"
 
+# Operator allowlist for the memory-backed `chad` agent. Resolved on the HOST
+# (from credentials.json, kept out of the committed repo) and exported into the
+# shim's launch env so it survives pod /sandbox wipes. Empty in both env and
+# creds = the shim allows everyone (fail-open, backward-compatible); populate
+# credentials.json's CHAD_OPERATOR_ALLOWLIST (string or JSON list) to restrict
+# `chad` to operators and serve everyone else Chad Lite. Emails are lowercased
+# by the shim, so case is irrelevant.
+CHAD_HOST_CREDS="${CHAD_HOST_CREDS:-${HOME}/.nemoclaw/credentials.json}"
+# Pod-side file the shim self-reads (3rd resolution source in chad-shim.py). It
+# lives under the backed-up state dir, so it survives a /sandbox wipe via
+# chad-restore AND gates every launch path (backup/restore/setup), not just this
+# watchdog. We (re)write it from host creds on each launch so it self-heals.
+SHIM_ALLOWLIST_FILE="${CHAD_SHIM_ALLOWLIST_FILE:-/sandbox/.openclaw-data/state/operator-allowlist}"
+SHIM_ALLOWLIST="${CHAD_OPERATOR_ALLOWLIST:-}"
+if [ -z "$SHIM_ALLOWLIST" ] && [ -f "$CHAD_HOST_CREDS" ]; then
+  SHIM_ALLOWLIST="$(python3 -c "import json;v=json.load(open('$CHAD_HOST_CREDS')).get('CHAD_OPERATOR_ALLOWLIST','');print(','.join(v) if isinstance(v,list) else v)" 2>/dev/null || true)"
+fi
+
 mkdir -p "$(dirname "$LOG")"
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { printf '[%s] %s\n' "$(ts)" "$*" >> "$LOG"; }
@@ -93,12 +111,18 @@ fi
 # Relaunch under nohup. Prefer the sandbox-writable copy (operator routing v0.2);
 # fall back to image binary.
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" "
+  # Refresh the pod-side allowlist file the shim self-reads (empty host value =>
+  # leave any restored file intact rather than blanking the gate to fail-open).
+  if [ -n '${SHIM_ALLOWLIST}' ]; then
+    mkdir -p \$(dirname '${SHIM_ALLOWLIST_FILE}')
+    printf '%s\n' '${SHIM_ALLOWLIST}' | tr ',' '\n' > '${SHIM_ALLOWLIST_FILE}'
+  fi
   if [ -x '${SHIM_PATCHED}' ]; then
-    HOME=/sandbox nohup '${SHIM_PATCHED}' > /tmp/chad-shim.log 2>&1 < /dev/null &
+    HOME=/sandbox CHAD_OPERATOR_ALLOWLIST='${SHIM_ALLOWLIST}' nohup '${SHIM_PATCHED}' > /tmp/chad-shim.log 2>&1 < /dev/null &
     disown 2>/dev/null || true
     echo started_patched
   elif [ -x '${SHIM_FALLBACK}' ]; then
-    HOME=/sandbox nohup '${SHIM_FALLBACK}' > /tmp/chad-shim.log 2>&1 < /dev/null &
+    HOME=/sandbox CHAD_OPERATOR_ALLOWLIST='${SHIM_ALLOWLIST}' nohup '${SHIM_FALLBACK}' > /tmp/chad-shim.log 2>&1 < /dev/null &
     disown 2>/dev/null || true
     echo started_fallback
   else

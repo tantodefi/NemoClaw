@@ -67,6 +67,16 @@ IDENTITY_MAX_BYTES = int(os.environ.get("CHAD_SHIM_IDENTITY_MAX_BYTES", "8000"))
 # Anonymous callers (no email header — direct API/health tooling) are always
 # allowed.
 def _load_operator_allowlist() -> set:
+    # Resolution order (first non-empty wins). The file source is what makes the
+    # gate durable: it does NOT depend on any launcher exporting an env var, so
+    # every shim launch path (watchdog, backup/restore, setup) is gated alike.
+    # It lives under the backed-up state dir, so chad-restore repopulates it
+    # before the shim comes up after a /sandbox wipe. The watchdog also refreshes
+    # it on each launch. Emails stay out of the committed repo (host creds →
+    # watchdog → this file).
+    #   1. CHAD_OPERATOR_ALLOWLIST env (comma-separated or JSON list), else
+    #   2. CHAD_OPERATOR_ALLOWLIST in credentials.json (string or JSON list), else
+    #   3. CHAD_OPERATOR_ALLOWLIST_FILE (comma/newline-separated emails).
     raw = os.environ.get("CHAD_OPERATOR_ALLOWLIST", "")
     if not raw:
         creds_path = os.environ.get("CHAD_CREDENTIALS", "/sandbox/.nemoclaw/credentials.json")
@@ -74,6 +84,20 @@ def _load_operator_allowlist() -> set:
             with open(creds_path) as fh:
                 raw = json.load(fh).get("CHAD_OPERATOR_ALLOWLIST", "") or ""
         except (OSError, json.JSONDecodeError, ValueError):
+            raw = ""
+    if not raw:
+        allow_file = os.environ.get(
+            "CHAD_OPERATOR_ALLOWLIST_FILE",
+            "/sandbox/.openclaw-data/state/operator-allowlist",
+        )
+        try:
+            with open(allow_file) as fh:
+                # Ignore blank lines and # comments; accept commas or newlines.
+                raw = ",".join(
+                    ln.strip() for ln in fh
+                    if ln.strip() and not ln.lstrip().startswith("#")
+                )
+        except OSError:
             raw = ""
     items = raw if isinstance(raw, list) else str(raw).split(",")
     return {str(e).strip().lower() for e in items if str(e).strip()}
