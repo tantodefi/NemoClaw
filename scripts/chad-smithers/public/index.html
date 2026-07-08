@@ -71,19 +71,66 @@
   .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; margin-top:8px; }
   .fld{ display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
   .fld input,.fld select,.fld textarea{ background:#0b0f14; border:1px solid var(--border); color:var(--fg); border-radius:6px; padding:5px 8px; font:inherit; font-size:13px; }
-  @media(max-width:560px){ .grid2{ grid-template-columns:1fr; } }
+  .mobile-back{ display:none; }
+  /* Nav: inline tab row on desktop; hamburger drawer on mobile (below). */
+  .hamburger{ display:none; font:inherit; background:transparent; border:none; color:var(--fg); font-size:20px; line-height:1; padding:4px 6px; cursor:pointer; }
+  .curtab{ display:none; }
+  #nav{ display:flex; align-items:center; gap:4px; }
+  @media(max-width:760px){
+    header{ position:sticky; }
+    header h1{ display:none; }
+    .hamburger{ display:inline-flex; align-items:center; justify-content:center; }
+    .curtab{ display:inline-block; flex:1; font-weight:600; font-size:14px; }
+    /* Tabs become a full-width dropdown drawer anchored under the header. */
+    #nav{ position:absolute; top:100%; left:0; right:0; flex-direction:column; align-items:stretch; gap:0;
+          display:none; background:var(--panel); border-bottom:1px solid var(--border); box-shadow:0 14px 34px rgba(0,0,0,.55); z-index:40; }
+    #nav.open{ display:flex; }
+    #nav .tab{ padding:14px 18px; border-radius:0; border-bottom:1px solid var(--border); white-space:nowrap; }
+    #nav .tab:last-child{ border-bottom:none; }
+    #nav .tab.active{ background:#21262d; color:var(--fg); }
+    /* Header row: hamburger + current-tab label + bell (drawer anchors below). */
+    header{ gap:8px; padding:10px 12px; }
+    .spacer{ display:none; } .meta{ display:none; }
+    /* Master-detail collapses to one column with a back toggle. */
+    .wrap{ grid-template-columns:1fr !important; height:auto; }
+    .wrap .list{ border-right:none; height:auto; }
+    .wrap .detail{ display:none; padding:12px 14px; }
+    .wrap.show-detail .list{ display:none; }
+    .wrap.show-detail .detail{ display:block; }
+    .pane{ height:auto; padding:14px; }
+    .list, .pane{ min-height:calc(100dvh - 52px); }
+    .mobile-back{ display:inline-flex; align-items:center; gap:6px; margin:0 0 12px; padding:9px 14px;
+                  position:sticky; top:0; z-index:2; background:var(--panel); }
+    /* Buttons wrap; larger touch targets. */
+    .row{ flex-wrap:wrap; }
+    button{ padding:8px 13px; }
+    .list th,.list td{ padding:9px 8px; }
+    th,td{ padding:8px 10px; }
+    /* Wide detail/pane tables scroll horizontally instead of squishing. */
+    .detail table,.pane table{ display:block; overflow-x:auto; white-space:nowrap; -webkit-overflow-scrolling:touch; }
+    /* 16px inputs prevent iOS focus-zoom. */
+    input.search{ padding:10px 12px; font-size:16px; }
+    .fld input,.fld select,.fld textarea{ font-size:16px; }
+    h2{ font-size:15px; } .grid2{ grid-template-columns:1fr; }
+    .CodeMirror{ height:320px; } textarea.editor{ min-height:300px; }
+    .modal{ padding:14px; }
+  }
 </style>
 </head>
 <body>
 <header>
+  <button class="hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
   <h1>Chad · Smithers</h1>
-  <span class="tab active" data-tab="runs">Runs</span>
-  <span class="tab" data-tab="workflows">Workflows</span>
-  <span class="tab" data-tab="approvals">Approvals <span id="apvBadge"></span></span>
-  <span class="tab" data-tab="chains">Chains</span>
-  <span class="tab" data-tab="schedules">Schedules</span>
-  <span class="tab" data-tab="experiments">Experiments</span>
-  <span class="tab" data-tab="directives">Directives</span>
+  <span class="curtab" id="curtab">Runs</span>
+  <nav id="nav">
+    <span class="tab active" data-tab="runs">Runs</span>
+    <span class="tab" data-tab="workflows">Workflows</span>
+    <span class="tab" data-tab="approvals">Approvals <span id="apvBadge"></span></span>
+    <span class="tab" data-tab="chains">Chains</span>
+    <span class="tab" data-tab="schedules">Schedules</span>
+    <span class="tab" data-tab="experiments">Experiments</span>
+    <span class="tab" data-tab="directives">Directives</span>
+  </nav>
   <span class="spacer"></span>
   <span id="bell" title="Approval notifications" style="cursor:pointer;font-size:15px;margin-right:4px" onclick="toggleNotify()">🔔</span>
   <span class="meta" id="meta">loading…</span>
@@ -162,7 +209,8 @@ function renderRuns(){
 }
 document.getElementById("search").oninput=(e)=>{ filter=e.target.value; renderRuns(); };
 
-function selectRun(id){ selected=id; if(detailTimer){clearInterval(detailTimer);detailTimer=null;} loadDetail(id); }
+function selectRun(id){ selected=id; if(detailTimer){clearInterval(detailTimer);detailTimer=null;} document.getElementById("view-runs").classList.add("show-detail"); loadDetail(id); }
+function backToList(){ document.getElementById("view-runs").classList.remove("show-detail"); }
 async function loadDetail(id){
   if(selected!==id) return;
   document.querySelectorAll("tr.run").forEach(tr=>tr.classList.toggle("sel",tr.dataset.id===id));
@@ -206,7 +254,7 @@ async function loadDetail(id){
       return `<details ${open?'open':''}><summary>${esc(t)} (${rows.length})</summary>${body}</details>`;
     }).join("");
     const logHtml=(logs.events||[]).map(ev=>{const ts=ev.timestampMs?new Date(ev.timestampMs).toLocaleTimeString():"";return `<div class="ev t-${esc(ev.type||'')}"><span class="ts">${ts}</span> ${esc(ev.type||ev.raw||'')}${ev.nodeId?' · '+esc(ev.nodeId):''}${ev.message?' · '+esc(ev.message):''}</div>`;}).join("");
-    d.innerHTML=`<div class="row"><h2 style="flex:1">${esc(run.workflow_name||'run')} ${pill(run.status)}${stale?' <span class="stale">⚠ stale</span>':''}</h2>${actions}</div>
+    d.innerHTML=`<button class="mobile-back" onclick="backToList()">← Runs</button><div class="row"><h2 style="flex:1">${esc(run.workflow_name||'run')} ${pill(run.status)}${stale?' <span class="stale">⚠ stale</span>':''}</h2>${actions}</div>
       <div class="muted mono">${esc(run.run_id)} · ${esc(run.db)}${(()=>{const cr=allRuns.find(r=>r.run_id===id);return cr&&cr.chainId?` · <a href="#" onclick="gotoChain('${esc(cr.chainId)}');return false" title="part of a workflow chain">🔗 chain ${esc(cr.chainId)} · step ${cr.chainStep}/${cr.chainSteps}</a>`:'';})()}</div>
       <div class="muted">started ${fmtTime(run.started_at_ms)} · ${live?'<b style="color:var(--blue)">running…</b>':'finished '+fmtTime(run.finished_at_ms)} · ${fmtDur(run.started_at_ms,run.finished_at_ms)}</div>
       ${(()=>{const ff=new Set((attempts||[]).filter(a=>String(a.state).toLowerCase()==='failed').map(a=>a.node_id));return (String(run.status).toLowerCase()==='finished'&&ff.size)?`<div style="color:var(--yellow);font-size:12px;margin-top:2px">✓ finished with ${ff.size} tolerated task failure${ff.size>1?'s':''} (continueOnFail / fallback) — e.g. a slow or unsupported panel model; the run completed with the rest.</div>`:'';})()}
@@ -868,7 +916,11 @@ async function loadExperiments(){
   }catch(e){ el.innerHTML="<div class=err>"+esc(e.message)+"</div>"; }
 }
 
+function toggleNav(){ document.getElementById("nav").classList.toggle("open"); }
 function switchTab(tab){
+  document.getElementById("view-runs").classList.remove("show-detail"); // reset mobile master-detail
+  const nav=document.getElementById("nav"); if(nav) nav.classList.remove("open"); // close mobile drawer
+  const ct=document.getElementById("curtab"); if(ct) ct.textContent=tab.charAt(0).toUpperCase()+tab.slice(1);
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.tab===tab));
   for(const v of ["runs","workflows","approvals","chains","schedules","experiments","directives"]) document.getElementById("view-"+v).style.display = v===tab ? (v==="runs"?"grid":"block") : "none";
   if(tab==="workflows") loadWorkflows();
@@ -879,6 +931,8 @@ function switchTab(tab){
   if(tab==="directives") loadDirectives();
 }
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>switchTab(t.dataset.tab));
+// Close the mobile nav drawer when tapping outside it (but not the hamburger).
+document.addEventListener("click",e=>{ const nav=document.getElementById("nav"); if(nav&&nav.classList.contains("open")&&!nav.contains(e.target)&&!e.target.closest(".hamburger")) nav.classList.remove("open"); });
 
 loadRuns();
 updateBell();
