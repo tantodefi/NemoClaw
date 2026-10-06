@@ -50,6 +50,10 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-sk-no-key-required}"
       DATABASE_ENABLE_SQLITE_WAL: "False"
       ENABLE_FORWARD_USER_INFO_HEADERS: "True"
+      # Credit metering (chad_rate_limit filter → supachad Worker). Secret lives in
+      # .env (gitignored); inert until CHAD_CREDITS_ADMIN_SECRET is set.
+      CHAD_CREDITS_API: "${CHAD_CREDITS_API:-https://supachad.com/api/credits}"
+      CHAD_CREDITS_ADMIN_SECRET: "${CHAD_CREDITS_ADMIN_SECRET:-}"
       ENABLE_WEB_SEARCH: "${ENABLE_WEB_SEARCH:-True}"
       WEB_SEARCH_ENGINE: "${WEB_SEARCH_ENGINE:-searxng}"
       SEARXNG_QUERY_URL: "${SEARXNG_QUERY_URL:-http://searxng:8080/search?q=<query>&format=json}"
