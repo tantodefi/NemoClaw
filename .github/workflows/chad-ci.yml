@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Chad CI — a lean, fork-friendly gate.
+#
+# Upstream's full CI matrix (reviewed-npm trust, native llama.cpp builds, managed
+# images, rootless integration) depends on NVIDIA's private registries, signing
+# artifacts, and runners, so it can NEVER go green on a fork. This workflow runs
+# only the deterministic checks that are meaningful AND pass on a stock
+# ubuntu-latest runner, so chad gets a trustworthy green signal about its own code.
+#
+# Runs on any non-upstream repo (survives the NemoClaw -> supachad rename).
+# Advisory by default: it reports pass/fail but does not block merges until you add
+# it to the branch's required status checks (Settings -> Branches).
+
+name: Chad CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, chad-dev]
+
+concurrency:
+  group: chad-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chad-gate:
+    # Never run on the upstream repo; run on the fork (and on supachad post-rename).
+    if: github.repository != 'NVIDIA/NemoClaw'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for the commitlint range
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install deps (no lifecycle scripts)
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      # Pure tsc over bin/ + scripts/ — deterministic, no infra. 8 GB heap because
+      # the merged tree is large enough to OOM the default 4 GB.
+      - name: Typecheck CLI
+        run: NODE_OPTIONS=--max-old-space-size=8192 npm run typecheck:cli
+
+      # Validates every blueprint / policy / preset / schema (70+ files). This is
+      # the check that actually covers chad's policy + blueprint customizations.
+      - name: Validate configs
+        run: npm run validate:configs
+
+      # Conventional-commits on the PR's own commits only. Advisory for now because
+      # a large catch-up PR spans upstream merge commits that predate chad.
+      - name: Commitlint (PR commits)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          npx commitlint \
+            --from "${{ github.event.pull_request.base.sha }}" \
+            --to "${{ github.event.pull_request.head.sha }}" || true
