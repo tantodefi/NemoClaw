@@ -56,14 +56,14 @@ _CREDITS_API = os.environ.get("CHAD_CREDITS_API", "https://supachad.com/api/cred
 _CREDITS_SECRET = os.environ.get("CHAD_CREDITS_ADMIN_SECRET", "")
 
 
-def _consume_credit(email: str, amount: int = 1) -> str:
-    """Consume `amount` credits for `email` via the Worker. Returns:
-    "ok" (consumed — allow, skip daily cap), "insufficient" (0 balance),
-    "unconfigured" (no secret/email), or "error" (network/other). Any non-"ok"
-    result makes the caller fall through to the free daily cap — so a Worker
-    outage never hard-blocks, it just reverts to free-tier limits."""
+def _consume_credit(email: str, amount: int = 1):
+    """Consume `amount` credits for `email` via the Worker. Returns a tuple
+    (status, balance): status ∈ "ok" (consumed — allow, skip daily cap),
+    "insufficient" (0 balance), "unconfigured" (no secret/email), "error"
+    (network/other). Any non-"ok" makes the caller fall through to the free daily
+    cap — so a Worker outage never hard-blocks, it just reverts to free limits."""
     if not _CREDITS_SECRET or not email or "@" not in email:
-        return "unconfigured"
+        return ("unconfigured", 0)
     import urllib.error
     import urllib.request
 
@@ -77,11 +77,16 @@ def _consume_credit(email: str, amount: int = 1) -> str:
     try:
         with urllib.request.urlopen(req, timeout=3) as resp:
             d = json.loads(resp.read() or b"{}")
-            return "ok" if d.get("ok") else "insufficient"
+            return ("ok", int(d.get("balance", 0))) if d.get("ok") else ("insufficient", int(d.get("balance", 0)))
     except urllib.error.HTTPError as e:
-        return "insufficient" if e.code == 402 else "error"
+        if e.code == 402:
+            try:
+                return ("insufficient", int(json.loads(e.read() or b"{}").get("balance", 0)))
+            except Exception:
+                return ("insufficient", 0)
+        return ("error", 0)
     except Exception:
-        return "error"
+        return ("error", 0)
 
 
 class Filter:
@@ -99,10 +104,13 @@ class Filter:
         upgrade_message: str = Field(
             default=(
                 "You've reached today's free Chad Lite limit ({limit} messages). "
-                "It resets at 00:00 UTC. Upgrade to premium **Chad** for the full "
-                "agent, memory, automations, and no daily cap."
+                "It resets at 00:00 UTC.\n\n"
+                "**Two ways to keep going:**\n"
+                "- **Buy credits** (pay-as-you-go) — each credit = 1 message, no daily cap while in balance.\n"
+                "- **Upgrade to premium Chad** — the full agent, memory, automations, unlimited.\n\n"
+                "Get both at https://supachad.com."
             ),
-            description="Shown when the cap is hit. {limit} and {model} are substituted.",
+            description="Shown when the free cap is hit. {limit} and {model} are substituted.",
         )
 
     def __init__(self):
@@ -113,7 +121,7 @@ class Filter:
         # Match the base id too (OWUI may prefix connection ids).
         return any(model_id == e or model_id.endswith("." + e) or e in model_id.split("/") for e in ids)
 
-    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    async def inlet(self, body: dict, __event_emitter__=None, __user__: Optional[dict] = None) -> dict:
         model_id = str(body.get("model", "") or "")
         if self._exempt(model_id):
             return body
@@ -126,8 +134,18 @@ class Filter:
         # Credit-metered users (bought credits via Square) pay per message and
         # skip the free daily cap while they have a balance. Any non-"ok" result
         # (no credits, or Worker unreachable) falls through to the free cap below.
-        if _CREDITS_SECRET and email and _consume_credit(email) == "ok":
-            return body
+        if _CREDITS_SECRET and email:
+            status, balance = _consume_credit(email)
+            if status == "ok":
+                if __event_emitter__:  # balance display: a small OWUI status line
+                    try:
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {"description": f"💳 {balance} credits remaining", "done": True},
+                        })
+                    except Exception:
+                        pass
+                return body
 
         state = _load()
         day = _today()
