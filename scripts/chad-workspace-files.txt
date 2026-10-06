@@ -1,0 +1,135 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Canonical manifest of state that backup tooling round-trips.
+# Single source of truth for:
+#   - scripts/backup-workspace.sh        (host-driven manual snapshot)
+#   - scripts/chad-backup-to-github.sh   (in-sandbox cron push to chad-state)
+#   - scripts/chad-restore-from-github.sh (cold-boot disaster recovery)
+#
+# Format: a sectioned list. Each line is one of:
+#   - "[section]"               — switches the active section
+#   - "filename" or "dir/"      — relative entry within the active section
+#   - "# comment" or blank line — ignored
+#
+# Sections:
+#   [workspace]    Files relative to /sandbox/.openclaw/workspace/ — persona, memory roots.
+#   [runtime]      Files relative to /sandbox/.openclaw-data/      — orchestration state.
+#   [runtime-dirs] Directories relative to /sandbox/.openclaw-data/ — recursive backup.
+#   [exclude]      Documentation only. NEVER backed up. Lists what we deliberately leave
+#                  out, with rationale, so future contributors don't accidentally add
+#                  sensitive or ephemeral data to the runtime sections.
+#
+# When backup scripts encounter a section they don't understand, they SKIP it (forward-
+# compatible). When restore encounters a section it doesn't understand, same — skip.
+#
+# The memory directory under workspace is handled separately by both backup scripts
+# (recursive, glob-based) and is not listed here.
+#
+# Adding state: append under [runtime] or [runtime-dirs], then re-run scripts/chad-setup.sh
+# (or `install_to_share_chad scripts/chad-workspace-files.txt`). Both backup scripts pick
+# it up on the next invocation; no script edit needed.
+
+[workspace]
+SOUL.md
+USER.md
+IDENTITY.md
+AGENTS.md
+MEMORY.md
+HEARTBEAT.md
+TOOLS.md
+EMAIL-POLICY.md
+# Skill doc: how Chad uses the chad-webui CLI to act on operator content
+# (calendar / notes / automations / memories) via the OpenWebUI REST API.
+# Acts as Chad's reference at runtime; deployed once and edited in place.
+OPENWEBUI.md
+
+[runtime]
+# Cron jobs. Restoring this file alone is NOT enough — the gateway holds the in-memory
+# list, so chad-restore-from-github also calls chad-cron-reload to re-register entries.
+cron/jobs.json
+# Operator allowlist for the memory-backed `chad` agent (Chad-lite gate). The shim
+# self-reads this file (3rd source in scripts/openwebui/chad-shim.py) so EVERY shim
+# launch path is gated — not just the watchdog, which also refreshes it every tick.
+# Backed up here so cold-start restore repopulates it BEFORE chad-restore relaunches
+# the shim, eliminating the fail-open window. One email per line. NOTE: this puts
+# operator emails in the (private) chad-state backup repo, alongside persona/memory.
+state/operator-allowlist
+# Action gate state: per-channel daily counters and kill-switch.
+auto-actions.json
+# Approved-exec list (chad-action-gate decisions persisted across restarts).
+exec-approvals.json
+# Task ledger and budget — already covered by the previous flat manifest, kept here so
+# the runtime section is the single source of truth.
+queue/tasks.jsonl
+queue/budget.json
+# Canonical proposals file: chad-self-improve writes durable-improvement drafts here,
+# chad-budget-audit writes p95-driven timeout/budget recommendations here, and
+# chad-proposal-apply reads from here. Was previously only the workspace-side copy
+# (workspace/memory/feedback-proposals.md), which led to a split-brain where
+# self-improve output went to a file no other wrapper read. Adding both paths keeps
+# the data side as the source of truth while preserving the workspace copy that
+# survives via the workspace-memory recursive backup.
+memory/feedback-proposals.md
+
+[runtime-dirs]
+# Custom agent registrations created via `openclaw agents add`. Lost twice across resets.
+agents/
+# Workflow definitions and hook configs — empty by default but populated as Chad evolves.
+flows/
+hooks/
+# Per-operator persona files prepended by chad-shim to user messages from
+# open-webui. One file per operator slug (local-part of X-OpenWebUI-User-Email),
+# plus default.md for unknown users. See scripts/openwebui/chad-shim.py for
+# the resolution logic.
+identities/
+# Sandbox-writable patched copies of chad CLI tools (chad-issue-triage,
+# chad-issue-triage-cron, etc.). Used so fixes can be deployed without
+# touching the root-owned /usr/local/bin/ in the image. The gateway watchdog
+# prepends this dir to PATH for spawned children; cron wrappers reference
+# absolute paths under it.
+bin/
+# Sandbox-loaded skill directories. /sandbox/.openclaw/openclaw.json
+# under skills.load.extraDirs points here. Two skills currently live in
+# this tree: openwebui (the chad-webui control surface) and chad-experiment
+# (the autonomous experiment lifecycle). Survives pod rebuilds via this
+# backup; rebuilt sandboxes re-mount from chad-state.
+skills/
+# Autonomous experiment lifecycle state: ledger + active/archive records +
+# config (budget, regression threshold, allowed types). chad-experiment-night
+# cron writes this nightly. Without backup, every experiment Chad has ever
+# tried is lost on pod rebuild.
+state/experiments/
+# Append-only structured event stream from host-side watchdogs
+# (chad-spawn-poll-watchdog, chad-shim-watchdog, future watchdogs).
+# Cron agent turns can `tail` this at startup to surface non-trivial
+# events that happened between turns. Schema: one JSON line per event
+# with ts/source/kind/severity/data. See docs/operations/chad-devflow.md
+# for the schema.
+state/agent-inbox.jsonl
+
+[exclude]
+# Device keypair + operator bearer tokens. Regenerated on first boot via OpenShell
+# device pairing. Backing this up would (a) leak a long-lived signing key into git
+# history and (b) cause identity collisions if two sandboxes restored from the same
+# snapshot. Persona prose lives in [workspace], not here.
+identity/
+# Paired peer device tokens. Same reasoning as identity/.
+devices/
+# Bearer token cache. Always sensitive; regenerated from /sandbox/.nemoclaw/credentials.json.
+credentials/
+# Per-run sub-agent stdout/stderr/result — ephemeral, would bloat the state repo.
+subagents/
+# Gateway logs — ephemeral.
+logs/
+# Runtime caches that don't belong in long-term state.
+canvas/
+media/
+sandbox/
+extensions/
+telegram/
+# Drafter scratch directory — single-turn per call, no persistent value.
+workspace-drafter/
+# PGLite database files. The gbrain export under brain/ is the canonical backup form;
+# raw PGLite files would be useless without a matching schema version.
+gbrain/

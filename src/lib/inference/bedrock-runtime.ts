@@ -20,10 +20,10 @@ export const BEDROCK_RUNTIME_PROVIDER_NAME = "compatible-anthropic-endpoint";
 export const BEDROCK_RUNTIME_ADAPTER_BIND_HOST = "0.0.0.0";
 export const BEDROCK_RUNTIME_ADAPTER_LOOPBACK_HOST = "127.0.0.1";
 export const BEDROCK_RUNTIME_ADAPTER_SANDBOX_HOST = "host.openshell.internal";
-export const BEDROCK_RUNTIME_ADAPTER_OPENAI_BASE_URL =
-  `http://${BEDROCK_RUNTIME_ADAPTER_SANDBOX_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
-export const BEDROCK_RUNTIME_ADAPTER_LOOPBACK_OPENAI_BASE_URL =
-  `http://${BEDROCK_RUNTIME_ADAPTER_LOOPBACK_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
+export const BEDROCK_RUNTIME_ADAPTER_PROCESS_MATCHER =
+  /(?:^|[^A-Za-z0-9_.-])(?:bedrock-runtime-adapter\.mts|bedrock-runtime-adapter\.js)(?:$|[^A-Za-z0-9_.-])/;
+export const BEDROCK_RUNTIME_ADAPTER_OPENAI_BASE_URL = `http://${BEDROCK_RUNTIME_ADAPTER_SANDBOX_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
+export const BEDROCK_RUNTIME_ADAPTER_LOOPBACK_OPENAI_BASE_URL = `http://${BEDROCK_RUNTIME_ADAPTER_LOOPBACK_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
 
 export type CustomAnthropicEndpointClassification =
   | {
@@ -63,6 +63,7 @@ function classifyBedrockRuntimeHostname(
 export function classifyCustomAnthropicEndpoint(
   value: string | URL | null | undefined,
 ): CustomAnthropicEndpointClassification {
+  const original = parseEndpointUrl(value);
   const normalized = normalizeProviderBaseUrl(value, "anthropic");
   const parsed = parseEndpointUrl(normalized);
   if (!parsed) {
@@ -74,7 +75,17 @@ export function classifyCustomAnthropicEndpoint(
   }
 
   const bedrock = classifyBedrockRuntimeHostname(parsed.hostname);
-  if (!bedrock) {
+  // The dedicated adapter relies on normal TLS hostname verification rather
+  // than curl --resolve pinning. Only the canonical HTTPS origin is therefore
+  // eligible: a rebound address cannot receive credentials without presenting
+  // a certificate valid for the AWS-owned hostname. Plain HTTP, custom ports,
+  // and URLs carrying userinfo stay on the generic preflighted path.
+  const isCanonicalTlsOrigin =
+    original?.protocol === "https:" &&
+    original.port === "" &&
+    original.username === "" &&
+    original.password === "";
+  if (!bedrock || !isCanonicalTlsOrigin) {
     return {
       kind: "anthropic-messages",
       endpointUrl: normalized,
@@ -98,11 +109,11 @@ export function isBedrockRuntimeEndpoint(value: string | URL | null | undefined)
 export function hasBedrockRuntimeAwsAuthEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   return Boolean(
     env[BEDROCK_RUNTIME_AWS_BEARER_TOKEN_ENV] ||
-      env.AWS_PROFILE ||
-      env.AWS_ACCESS_KEY_ID ||
-      env.AWS_WEB_IDENTITY_TOKEN_FILE ||
-      env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI ||
-      env.AWS_CONTAINER_CREDENTIALS_FULL_URI,
+    env.AWS_PROFILE ||
+    env.AWS_ACCESS_KEY_ID ||
+    env.AWS_WEB_IDENTITY_TOKEN_FILE ||
+    env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI ||
+    env.AWS_CONTAINER_CREDENTIALS_FULL_URI,
   );
 }
 

@@ -33,6 +33,7 @@ describe("uninstall plan actions", () => {
 
   it("builds a host uninstall plan with shim classification and env-derived paths", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-plan-"));
+    const gatewayStateDir = path.join(tmp, "gateway-state");
     const shimDir = path.join(tmp, ".local", "bin");
     const shim = path.join(shimDir, "nemoclaw");
     fs.mkdirSync(shimDir, { recursive: true });
@@ -41,14 +42,31 @@ describe("uninstall plan actions", () => {
     try {
       const plan = buildHostUninstallPlan({
         deleteModels: false,
-        env: { HOME: tmp, TMPDIR: path.join(tmp, "tmp") },
+        env: {
+          HOME: tmp,
+          NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR: gatewayStateDir,
+          TMPDIR: path.join(tmp, "tmp"),
+        },
         keepOpenShell: false,
       });
       const actions = flattenUninstallPlan(plan);
 
-      expect(actions).toEqual(expect.arrayContaining([{ kind: "preserve-shim", reason: "regular file is not an installer-managed shim" }]));
-      expect(actions).toEqual(expect.arrayContaining([{ kind: "delete-path", path: path.join(tmp, ".nemoclaw") }]));
-      expect(actions).toEqual(expect.arrayContaining([{ kind: "delete-runtime-glob", pattern: path.join(tmp, "tmp", "nemoclaw-create-*.log") }]));
+      expect(actions).toEqual(
+        expect.arrayContaining([
+          { kind: "preserve-shim", reason: "regular file is not an installer-managed shim" },
+        ]),
+      );
+      expect(actions).toEqual(
+        expect.arrayContaining([{ kind: "delete-path", path: path.join(tmp, ".nemoclaw") }]),
+      );
+      expect(actions).toEqual(
+        expect.arrayContaining([{ kind: "delete-path", path: gatewayStateDir }]),
+      );
+      expect(actions).toEqual(
+        expect.arrayContaining([
+          { kind: "delete-runtime-glob", pattern: path.join(tmp, "tmp", "nemoclaw-create-*.log") },
+        ]),
+      );
     } finally {
       fs.rmSync(tmp, { force: true, recursive: true });
     }

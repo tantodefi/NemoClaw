@@ -1,10 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { dockerCapture, dockerRun, type DockerCaptureOptions, type DockerRunOptions } from "./run";
+import {
+  type DockerCaptureOptions,
+  type DockerRunOptions,
+  type DockerRunResult,
+  dockerCapture,
+  dockerRun,
+} from "./run";
 
-export function dockerStop(containerName: string, opts: DockerRunOptions = {}) {
+export function dockerStop(containerName: string, opts: DockerRunOptions = {}): DockerRunResult {
   return dockerRun(["stop", containerName], opts);
+}
+
+export function dockerStart(containerName: string, opts: DockerRunOptions = {}): DockerRunResult {
+  return dockerRun(["start", containerName], opts);
+}
+
+export function dockerUnpause(containerName: string, opts: DockerRunOptions = {}): DockerRunResult {
+  return dockerRun(["unpause", containerName], opts);
 }
 
 // NIM (and most Python services) write errors to stderr, so a stdout-only
@@ -28,11 +42,11 @@ export function dockerLogs(
   return `${stdout}${stderr}`.trim();
 }
 
-export function dockerRm(containerName: string, opts: DockerRunOptions = {}) {
+export function dockerRm(containerName: string, opts: DockerRunOptions = {}): DockerRunResult {
   return dockerRun(["rm", containerName], opts);
 }
 
-export function dockerForceRm(containerName: string, opts: DockerRunOptions = {}) {
+export function dockerForceRm(containerName: string, opts: DockerRunOptions = {}): DockerRunResult {
   return dockerRun(["rm", "-f", containerName], opts);
 }
 
@@ -40,11 +54,14 @@ export function dockerRename(
   oldContainerName: string,
   newContainerName: string,
   opts: DockerRunOptions = {},
-) {
+): DockerRunResult {
   return dockerRun(["rename", oldContainerName, newContainerName], opts);
 }
 
-export function dockerRunDetached(args: readonly string[], opts: DockerRunOptions = {}) {
+export function dockerRunDetached(
+  args: readonly string[],
+  opts: DockerRunOptions = {},
+): DockerRunResult {
   return dockerRun(["run", "-d", ...args], opts);
 }
 

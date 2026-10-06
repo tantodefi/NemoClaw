@@ -5,11 +5,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import {
-  type CaptureOpenshellResult,
-  stripAnsi,
-} from "../../adapters/openshell/client";
+import { type CaptureOpenshellResult, stripAnsi } from "../../adapters/openshell/client";
 import { captureOpenshell } from "../../adapters/openshell/runtime";
+import { resolveDockerDriverGatewayStateDir } from "../../onboard/host-gateway-process";
 import type { SandboxEntry } from "../../state/registry";
 
 const GVPROXY_DNS = "192.168.127.1";
@@ -48,10 +46,12 @@ export function shouldApplyVmDnsMonkeypatch(
   return platform === "darwin" || env.NEMOCLAW_FORCE_VM_DNS_MONKEYPATCH === "1";
 }
 
-function dockerDriverGatewayStateDir(env: NodeJS.ProcessEnv, homeDir: string): string {
-  const configured = env.NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR;
-  if (configured && configured.trim()) return path.resolve(configured.trim());
-  return path.join(homeDir, ".local", "state", "nemoclaw", "openshell-docker-gateway");
+function dockerDriverGatewayStateDir(
+  env: NodeJS.ProcessEnv,
+  homeDir: string,
+  gatewayPort?: number | null,
+): string {
+  return resolveDockerDriverGatewayStateDir(env, homeDir, gatewayPort ?? undefined);
 }
 
 export function parseSandboxIdFromGetOutput(output: string): string | null {
@@ -74,7 +74,9 @@ function errorMessage(error: unknown): string {
 
 function isPathInside(childPath: string, parentPath: string): boolean {
   const relative = path.relative(parentPath, childPath);
-  return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+  return (
+    relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative))
+  );
 }
 
 function realpathIfPresent(filePath: string): string | null {
@@ -224,9 +226,9 @@ function buildGvproxyDnsBlock(indent: string): string {
   ].join("\n");
 }
 
-function buildGuestInitPatch(initPath: string):
-  | { ok: true; changed: boolean; content?: string }
-  | { ok: false; reason: string } {
+function buildGuestInitPatch(
+  initPath: string,
+): { ok: true; changed: boolean; content?: string } | { ok: false; reason: string } {
   if (path.basename(initPath) !== INIT_SCRIPT_RELATIVE_PATH.at(-1)) {
     return {
       ok: false,
@@ -272,12 +274,13 @@ function buildGuestInitPatch(initPath: string):
 
 export function applyOpenShellVmDnsMonkeypatch(
   sandboxName: string,
-  entry: Pick<SandboxEntry, "openshellDriver"> | null | undefined,
+  entry: Pick<SandboxEntry, "gatewayPort" | "openshellDriver"> | null | undefined,
   deps: {
     capture?: CaptureFn;
     env?: NodeJS.ProcessEnv;
     homeDir?: string;
     platform?: NodeJS.Platform;
+    revalidateSandboxIdentity?: (operation: string) => void;
     stateDir?: string;
   } = {},
 ): VmDnsMonkeypatchResult {
@@ -299,7 +302,8 @@ export function applyOpenShellVmDnsMonkeypatch(
   }
 
   const stateDir =
-    deps.stateDir ?? dockerDriverGatewayStateDir(env, deps.homeDir ?? os.homedir());
+    deps.stateDir ??
+    dockerDriverGatewayStateDir(env, deps.homeDir ?? os.homedir(), entry?.gatewayPort);
   const stateDirPath = path.resolve(stateDir);
   const stateDirReal = realpathIfPresent(stateDirPath);
   if (!stateDirReal) {
@@ -308,6 +312,15 @@ export function applyOpenShellVmDnsMonkeypatch(
 
   let changed = false;
   let rootfsContext: string | undefined;
+  let policyObservationError: unknown;
+  const revalidateSandboxIdentity = (operation: string): void => {
+    try {
+      deps.revalidateSandboxIdentity?.(operation);
+    } catch (error) {
+      policyObservationError = error;
+      throw error;
+    }
+  };
   try {
     const sandboxDir = path.join(stateDirReal, "vm-driver", "sandboxes", sandboxId);
     const sandboxDirReal = realpathIfPresent(sandboxDir);
@@ -355,11 +368,13 @@ export function applyOpenShellVmDnsMonkeypatch(
     const currentResolver = readTextFileIfPresent(resolvConf.path) ?? "";
     const desiredResolver = normalizeResolver(currentResolver);
     if (currentResolver !== desiredResolver) {
+      revalidateSandboxIdentity(`write VM resolver for sandbox '${sandboxName}'`);
       fs.writeFileSync(resolvConf.path, desiredResolver);
       changed = true;
     }
 
     if (initPatch.changed && initPatch.content !== undefined) {
+      revalidateSandboxIdentity(`write VM init script for sandbox '${sandboxName}'`);
       fs.writeFileSync(initScript.path, initPatch.content);
       changed = true;
     }
@@ -373,6 +388,8 @@ export function applyOpenShellVmDnsMonkeypatch(
       );
     }
 
+    revalidateSandboxIdentity(`report successful VM DNS repair for sandbox '${sandboxName}'`);
+
     return {
       attempted: true,
       changed,
@@ -381,6 +398,7 @@ export function applyOpenShellVmDnsMonkeypatch(
       status: changed ? "applied" : "already-present",
     };
   } catch (error) {
+    if (error === policyObservationError) throw error;
     return {
       attempted: true,
       changed,

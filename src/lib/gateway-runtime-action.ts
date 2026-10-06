@@ -1,111 +1,166 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-const { startGatewayForRecovery } = require("./onboard") as {
-  startGatewayForRecovery: () => Promise<void>;
+import { createCliOpenShellGatewayLifecycle } from "./adapters/openshell/gateway-lifecycle-cli";
+import { createCliOpenShellGatewayObserver } from "./adapters/openshell/gateway-observer-cli";
+import type { OpenShellGatewayObservation } from "./adapters/openshell/gateway-observer";
+import * as openshellRuntime from "./adapters/openshell/runtime";
+import { GATEWAY_PORT } from "./core/ports";
+import {
+  resolveGatewayName,
+  resolveGatewayPortFromName,
+  resolveSandboxGatewayName,
+} from "./onboard/gateway-binding";
+import type { GatewayRecoveryOutput } from "./onboard/gateway-recovery";
+import { sanitizeReadinessText } from "./readiness/sanitize";
+
+export { resolveGatewayName, resolveSandboxGatewayName };
+
+export const replaceOpenShellRuntimeSelectionEnv =
+  openshellRuntime.replaceOpenShellRuntimeSelectionEnv;
+export const snapshotOpenShellEnv = openshellRuntime.snapshotOpenShellEnv;
+
+type StartGatewayForRecoveryOptions = {
+  gatewayName?: string;
+  gatewayPort?: number;
+  output?: GatewayRecoveryOutput;
+  runtimeSelection?: openshellRuntime.OpenShellRuntimeSelection;
 };
-import { OPENSHELL_OPERATION_TIMEOUT_MS, OPENSHELL_PROBE_TIMEOUT_MS } from "./adapters/openshell/timeouts";
-import { stripAnsi } from "./adapters/openshell/client";
-import { captureOpenshell, runOpenshell } from "./adapters/openshell/runtime";
 
-function hasNamedGateway(output = ""): boolean {
-  return stripAnsi(output).includes("Gateway: nemoclaw");
-}
+type LegacyOnboardModule = {
+  startGatewayForRecovery(options?: StartGatewayForRecoveryOptions): Promise<void>;
+};
 
-function getActiveGatewayName(output = ""): string | null {
-  const match = stripAnsi(output).match(/^\s*Gateway:\s+(.+?)\s*$/m);
-  return match ? match[1].trim() : null;
-}
+/**
+ * Injectable boundary for OpenShell calls and the deliberately lazy onboarding
+ * recovery path. Source-backed tests spy here without loading the onboard graph
+ * or invalidating the CommonJS module cache before every test.
+ */
+export const gatewayRuntimeDependencies = {
+  observeGateway: createCliOpenShellGatewayObserver((args, opts) =>
+    openshellRuntime.captureResolvedOpenshell(args, opts),
+  ).observeGateway,
+  selectGateway: createCliOpenShellGatewayLifecycle((args, opts) =>
+    openshellRuntime.captureResolvedOpenshell(args, opts),
+  ).selectGateway,
+  async startGatewayForRecovery(options?: StartGatewayForRecoveryOptions): Promise<void> {
+    const onboard = (await import("./onboard")) as unknown as LegacyOnboardModule;
+    return onboard.startGatewayForRecovery(options);
+  },
+};
 
-export function getNamedGatewayLifecycleState() {
-  const status = captureOpenshell(["status"], { timeout: OPENSHELL_PROBE_TIMEOUT_MS });
-  const gatewayInfo = captureOpenshell(["gateway", "info", "-g", "nemoclaw"], {
-    timeout: OPENSHELL_PROBE_TIMEOUT_MS,
+export type NamedGatewayLifecycleState = OpenShellGatewayObservation;
+
+/** Read gateway identity and selection through the typed observation boundary. */
+export async function getNamedGatewayLifecycleState(
+  gatewayName: string = resolveGatewayName(GATEWAY_PORT),
+  opts: { runtimeSelection?: openshellRuntime.OpenShellRuntimeSelection } = {},
+): Promise<NamedGatewayLifecycleState> {
+  return gatewayRuntimeDependencies.observeGateway({
+    target: { kind: "named", gatewayName },
+    ...(opts.runtimeSelection ? { runtimeSelection: opts.runtimeSelection } : {}),
   });
-  const cleanStatus = stripAnsi(status.output);
-  const activeGateway = getActiveGatewayName(status.output);
-  const connected = /^\s*Status:\s*Connected\b/im.test(cleanStatus);
-  const named = hasNamedGateway(gatewayInfo.output);
-  const refusing = /Connection refused|client error \(Connect\)|tcp connect error/i.test(
-    cleanStatus,
-  );
-  if (connected && activeGateway === "nemoclaw" && named) {
-    return {
-      state: "healthy_named",
-      status: status.output,
-      gatewayInfo: gatewayInfo.output,
-      activeGateway,
-    };
-  }
-  if (activeGateway === "nemoclaw" && named && refusing) {
-    return {
-      state: "named_unreachable",
-      status: status.output,
-      gatewayInfo: gatewayInfo.output,
-      activeGateway,
-    };
-  }
-  if (activeGateway === "nemoclaw" && named) {
-    return {
-      state: "named_unhealthy",
-      status: status.output,
-      gatewayInfo: gatewayInfo.output,
-      activeGateway,
-    };
-  }
-  if (connected) {
-    return {
-      state: "connected_other",
-      status: status.output,
-      gatewayInfo: gatewayInfo.output,
-      activeGateway,
-    };
-  }
-  return {
-    state: "missing_named",
-    status: status.output,
-    gatewayInfo: gatewayInfo.output,
-    activeGateway,
-  };
 }
+
+type NamedGatewayLifecycleStateName = NamedGatewayLifecycleState["state"];
+
+export type RecoverNamedGatewayRuntimeOptions = {
+  authorizeExactTargetTransportRecovery?: boolean;
+  recoverableStates?: readonly NamedGatewayLifecycleStateName[];
+  gatewayName?: string;
+  output?: GatewayRecoveryOutput;
+  runtimeSelection?: openshellRuntime.OpenShellRuntimeSelection;
+};
 
 /** Attempt to recover the named NemoClaw gateway after a restart or connectivity loss. */
-export async function recoverNamedGatewayRuntime() {
-  const before = getNamedGatewayLifecycleState();
+export async function recoverNamedGatewayRuntime(options: RecoverNamedGatewayRuntimeOptions = {}) {
+  const gatewayName = options.gatewayName ?? resolveGatewayName(GATEWAY_PORT);
+  if (options.runtimeSelection && options.runtimeSelection.gatewayName !== gatewayName) {
+    throw new Error(
+      `Gateway recovery target '${gatewayName}' does not match runtime selection '${options.runtimeSelection.gatewayName}'`,
+    );
+  }
+  const lifecycleOptions = options.runtimeSelection
+    ? { runtimeSelection: options.runtimeSelection }
+    : {};
+  const recoverableStates = new Set<NamedGatewayLifecycleStateName>(
+    options.recoverableStates ?? [
+      "missing_named",
+      "named_unhealthy",
+      "named_unreachable",
+      "connected_other",
+    ],
+  );
+  const before = await getNamedGatewayLifecycleState(gatewayName, lifecycleOptions);
+  const exactTargetTransportRecovery =
+    options.authorizeExactTargetTransportRecovery === true &&
+    options.runtimeSelection?.gatewayName === gatewayName &&
+    before.error?.kind === "transport" &&
+    before.error.reason === "unreachable";
+  if (before.recoveryBlocked && !exactTargetTransportRecovery) {
+    return { recovered: false, before, after: before, attempted: false };
+  }
   if (before.state === "healthy_named") {
     return { recovered: true, before, after: before, attempted: false };
   }
-
-  runOpenshell(["gateway", "select", "nemoclaw"], {
-    ignoreError: true,
-    timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
-  });
-  let after = getNamedGatewayLifecycleState();
-  if (after.state === "healthy_named") {
-    process.env.OPENSHELL_GATEWAY = "nemoclaw";
-    return { recovered: true, before, after, attempted: true, via: "select" };
+  if (!recoverableStates.has(before.state) && !exactTargetTransportRecovery) {
+    return { recovered: false, before, after: before, attempted: false };
   }
 
-  const shouldStartGateway = [before.state, after.state].some((state) =>
-    ["missing_named", "named_unhealthy", "named_unreachable", "connected_other"].includes(state),
-  );
+  let after = before;
+  // A missing registration cannot be selected. Start the exact requested
+  // target first so the startup path can restore its registration, then
+  // select and verify it below.
+  if (!exactTargetTransportRecovery && before.state !== "missing_named") {
+    const selection = await gatewayRuntimeDependencies.selectGateway({
+      target: { kind: "named", gatewayName },
+      ...lifecycleOptions,
+    });
+    after = await getNamedGatewayLifecycleState(gatewayName, lifecycleOptions);
+    if (!selection.ok || after.recoveryBlocked) {
+      return { recovered: false, before, after, attempted: true };
+    }
+    if (selection.ok && after.state === "healthy_named") {
+      process.env.OPENSHELL_GATEWAY = gatewayName;
+      return { recovered: true, before, after, attempted: true, via: "select" };
+    }
+  }
+
+  const shouldStartGateway =
+    exactTargetTransportRecovery ||
+    [before.state, after.state].some((state) => recoverableStates.has(state));
+  let startFailure: unknown = null;
 
   if (shouldStartGateway) {
     try {
-      await startGatewayForRecovery();
-    } catch {
-      // Fall through to the lifecycle re-check below so we preserve the
-      // existing recovery result shape and emit the correct classification.
+      await gatewayRuntimeDependencies.startGatewayForRecovery({
+        gatewayName,
+        gatewayPort: resolveGatewayPortFromName(gatewayName) ?? undefined,
+        ...(options.output ? { output: options.output } : {}),
+        ...(options.runtimeSelection ? { runtimeSelection: options.runtimeSelection } : {}),
+      });
+    } catch (error) {
+      startFailure = error;
     }
-    runOpenshell(["gateway", "select", "nemoclaw"], {
-      ignoreError: true,
-      timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
+    const selection = await gatewayRuntimeDependencies.selectGateway({
+      target: { kind: "named", gatewayName },
+      ...lifecycleOptions,
     });
-    after = getNamedGatewayLifecycleState();
-    if (after.state === "healthy_named") {
-      process.env.OPENSHELL_GATEWAY = "nemoclaw";
+    after = await getNamedGatewayLifecycleState(gatewayName, lifecycleOptions);
+    if (selection.ok && after.state === "healthy_named") {
+      process.env.OPENSHELL_GATEWAY = gatewayName;
       return { recovered: true, before, after, attempted: true, via: "start" };
     }
+  }
+
+  if (startFailure !== null && options.output) {
+    const detail = sanitizeReadinessText(
+      startFailure instanceof Error ? startFailure.message : String(startFailure),
+      240,
+    )
+      .replace(/\s+/gu, " ")
+      .trim();
+    options.output.error(`OpenShell gateway recovery failed${detail ? `: ${detail}` : "."}`);
   }
 
   return { recovered: false, before, after, attempted: true };

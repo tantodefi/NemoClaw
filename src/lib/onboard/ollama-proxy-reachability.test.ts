@@ -28,9 +28,7 @@ const { parseNetworkIpamConfig } = __test;
 
 describe("parseNetworkIpamConfig", () => {
   it("parses a well-formed IPAM config with IPv4 gateway", () => {
-    const raw = JSON.stringify([
-      { Subnet: "172.20.0.0/16", Gateway: "172.20.0.1" },
-    ]);
+    const raw = JSON.stringify([{ Subnet: "172.20.0.0/16", Gateway: "172.20.0.1" }]);
     expect(parseNetworkIpamConfig(raw)).toEqual({
       subnet: "172.20.0.0/16",
       gatewayIp: "172.20.0.1",
@@ -77,9 +75,10 @@ describe("parseNetworkIpamConfig", () => {
 
 // ── probeOllamaProxySandboxReachability ──────────────────────────────────────
 
-function makeNetwork(
-  partial: { subnet?: string; gatewayIp?: string } = {},
-): { subnet?: string; gatewayIp?: string } {
+function makeNetwork(partial: { subnet?: string; gatewayIp?: string } = {}): {
+  subnet?: string;
+  gatewayIp?: string;
+} {
   return { subnet: "172.20.0.0/16", gatewayIp: "172.20.0.1", ...partial };
 }
 
@@ -151,8 +150,9 @@ describe("probeOllamaProxySandboxReachability (#3340)", () => {
     expect(result.reason).toBe("probe_unavailable");
   });
 
-  it("returns probe_unavailable for unexpected non-0/non-1 exit codes", async () => {
-    for (const code of [2, 127, 255]) {
+  it.each([2, 127, 255])(
+    "returns probe_unavailable for unexpected non-0/non-1 exit codes [case %#]",
+    async (code) => {
       const result = await probeOllamaProxySandboxReachability({
         inspectNetworkImpl: () => makeNetwork(),
         usesHostGatewayRouteImpl: () => false,
@@ -160,8 +160,8 @@ describe("probeOllamaProxySandboxReachability (#3340)", () => {
       });
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("probe_unavailable");
-    }
-  });
+    },
+  );
 
   it("returns probe_unavailable when the container runner reports an error", async () => {
     const result = await probeOllamaProxySandboxReachability({

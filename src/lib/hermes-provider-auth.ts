@@ -11,10 +11,14 @@
 
 import type { StdioOptions } from "node:child_process";
 
+import { createCliOpenShellProviderAdapter } from "./adapters/openshell/provider-adapter-cli";
+import { HERMES_PROVIDER_NAME } from "./onboard/inference-providers/hermes-provider-identity";
 import * as oauth from "./oauth-device-code";
 
+export { HERMES_PROVIDER_NAME };
+
 const onboardProviders = require("./onboard/providers") as {
-  providerExistsInGateway: (name: string, runOpenshell: RunOpenshell) => boolean;
+  providerExistsInGateway: (name: string, runOpenshell: RunOpenshell) => Promise<boolean>;
   upsertProvider: (
     name: string,
     type: string,
@@ -22,7 +26,7 @@ const onboardProviders = require("./onboard/providers") as {
     baseUrl: string | null,
     env: NodeJS.ProcessEnv,
     runOpenshell: RunOpenshell,
-  ) => { ok: boolean; status?: number; message?: string };
+  ) => Promise<{ ok: boolean; status?: number; message?: string }>;
 };
 
 type HermesToolGatewayBroker = {
@@ -30,7 +34,7 @@ type HermesToolGatewayBroker = {
     sandboxName: string,
     refreshToken: string,
     runOpenshell: RunOpenshell,
-  ) => { providerName: string; brokerToken: string };
+  ) => Promise<{ providerName: string; brokerToken: string }>;
   ensureHermesToolGatewayBroker: (options?: { refreshToken?: string }) => boolean;
 };
 
@@ -38,7 +42,6 @@ function getHermesToolGatewayBroker(): HermesToolGatewayBroker {
   return require("./hermes-tool-gateway-broker") as HermesToolGatewayBroker;
 }
 
-export const HERMES_PROVIDER_NAME = "hermes-provider";
 export const HERMES_INFERENCE_CREDENTIAL_ENV = "OPENAI_API_KEY";
 export const HERMES_NOUS_API_KEY_CREDENTIAL_ENV = "NOUS_API_KEY";
 export const AGENT_KEY_MIN_TTL_SECONDS = 1800;
@@ -46,7 +49,8 @@ export const AGENT_KEY_MIN_TTL_SECONDS = 1800;
 export type HermesAuthMethod = "oauth" | "api_key";
 
 type RunOpenshellResult = {
-  status?: number | null;
+  status: number | null;
+  output?: string | Buffer | null;
   stdout?: string | Buffer | null;
   stderr?: string | Buffer | null;
 };
@@ -57,6 +61,7 @@ export type RunOpenshell = (
     env?: NodeJS.ProcessEnv;
     stdio?: StdioOptions;
     ignoreError?: boolean;
+    suppressOutput?: boolean;
     timeout?: number;
   },
 ) => RunOpenshellResult;
@@ -82,21 +87,44 @@ function agentKeyExpiresAt(minted: oauth.AgentKeyResponse): string | null {
   return null;
 }
 
-export function isHermesProviderRegistered(runOpenshell: RunOpenshell): boolean {
+export function isHermesProviderRegistered(runOpenshell: RunOpenshell): Promise<boolean> {
   return onboardProviders.providerExistsInGateway(HERMES_PROVIDER_NAME, runOpenshell);
 }
 
-export function registerHermesInferenceProvider(
+export type HermesProviderBinding = {
+  exists: boolean;
+  credentialKeys: string[] | null;
+};
+
+export async function inspectHermesProviderBinding(
+  runOpenshell: RunOpenshell,
+): Promise<HermesProviderBinding> {
+  const result = await createCliOpenShellProviderAdapter({ run: runOpenshell }).getProvider({
+    target: { kind: "selected" },
+    providerName: HERMES_PROVIDER_NAME,
+  });
+  if (!result.ok) {
+    return result.error.kind === "command" && result.error.reason === "not_found"
+      ? { exists: false, credentialKeys: null }
+      : { exists: true, credentialKeys: null };
+  }
+  return {
+    exists: true,
+    credentialKeys: [...result.value.credentialKeys].sort(),
+  };
+}
+
+export async function registerHermesInferenceProvider(
   apiKey: string,
   runOpenshell: RunOpenshell,
   credentialEnv = HERMES_INFERENCE_CREDENTIAL_ENV,
   baseUrl = oauth.DEFAULT_INFERENCE_BASE_URL,
-): void {
+): Promise<void> {
   const normalizedApiKey = nonEmptyString(apiKey);
   if (!normalizedApiKey) {
     throw new Error("Hermes Provider credential is empty");
   }
-  const result = onboardProviders.upsertProvider(
+  const result = await onboardProviders.upsertProvider(
     HERMES_PROVIDER_NAME,
     "openai",
     credentialEnv,
@@ -142,7 +170,7 @@ export async function ensureHermesProviderOAuthCredentials(
     minTtlSeconds: AGENT_KEY_MIN_TTL_SECONDS,
   });
   const inferenceBaseUrl = minted.inference_base_url || baseUrl;
-  registerHermesInferenceProvider(
+  await registerHermesInferenceProvider(
     minted.api_key,
     runOpenshell,
     HERMES_INFERENCE_CREDENTIAL_ENV,
@@ -150,7 +178,7 @@ export async function ensureHermesProviderOAuthCredentials(
   );
   if (Array.isArray(toolGatewayPresets) && toolGatewayPresets.length > 0) {
     const hermesToolGateway = getHermesToolGatewayBroker();
-    hermesToolGateway.registerHermesToolGatewayRefreshProvider(
+    await hermesToolGateway.registerHermesToolGatewayRefreshProvider(
       _sandboxName,
       tokens.refresh_token,
       runOpenshell,
@@ -186,7 +214,7 @@ export async function ensureHermesProviderApiKeyCredentials(
   const normalizedApiKey = nonEmptyString(apiKey);
   if (!normalizedApiKey) return null;
 
-  registerHermesInferenceProvider(
+  await registerHermesInferenceProvider(
     normalizedApiKey,
     runOpenshell,
     HERMES_NOUS_API_KEY_CREDENTIAL_ENV,
@@ -206,6 +234,7 @@ module.exports = {
   HERMES_NOUS_API_KEY_CREDENTIAL_ENV,
   AGENT_KEY_MIN_TTL_SECONDS,
   isHermesProviderRegistered,
+  inspectHermesProviderBinding,
   registerHermesInferenceProvider,
   ensureHermesProviderOAuthCredentials,
   ensureHermesProviderApiKeyCredentials,

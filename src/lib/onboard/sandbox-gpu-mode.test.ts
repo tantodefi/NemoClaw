@@ -81,21 +81,49 @@ describe("sandbox GPU mode helpers", () => {
     expect(explicitFlagEnable.errors).toEqual([]);
   });
 
-  it("defaults to CPU sandbox on Jetson when NEMOCLAW_SANDBOX_GPU is unset", () => {
+  it("rejects an empty CDI identifier from environment and CLI selectors", () => {
+    const fromEnvironment = resolveSandboxGpuConfig(gpu(), {
+      env: { NEMOCLAW_SANDBOX_GPU: "1", NEMOCLAW_SANDBOX_GPU_DEVICE: "nvidia.com/gpu=" },
+    });
+    expect(fromEnvironment.sandboxGpuDevice).toBeNull();
+    expect(fromEnvironment.errors.join("\n")).toContain("must include an identifier");
+
+    const fromCli = resolveSandboxGpuConfig(gpu(), {
+      flag: "enable",
+      device: "nvidia.com/gpu=",
+      env: {},
+    });
+    expect(fromCli.sandboxGpuDevice).toBeNull();
+    expect(fromCli.errors.join("\n")).toContain("must include an identifier");
+  });
+
+  it("enables sandbox GPU on Jetson without rejecting the platform", () => {
     const jetson = gpu({ platform: "jetson" });
-    expect(resolveSandboxGpuConfig(jetson, { env: {} }).sandboxGpuEnabled).toBe(false);
+    const auto = resolveSandboxGpuConfig(jetson, { env: {} });
+    expect(auto.mode).toBe("auto");
+    expect(auto.sandboxGpuEnabled).toBe(true);
+    expect(auto.hostGpuPlatform).toBe("jetson");
+
+    const envAuto = resolveSandboxGpuConfig(jetson, { env: { NEMOCLAW_SANDBOX_GPU: "auto" } });
+    expect(envAuto.mode).toBe("auto");
+    expect(envAuto.sandboxGpuEnabled).toBe(true);
+
     const jetsonDeviceOnly = resolveSandboxGpuConfig(jetson, {
       env: { NEMOCLAW_SANDBOX_GPU_DEVICE: "nvidia.com/gpu=0" },
     });
-    expect(jetsonDeviceOnly.sandboxGpuEnabled).toBe(false);
+    expect(jetsonDeviceOnly.sandboxGpuEnabled).toBe(true);
     expect(jetsonDeviceOnly.sandboxGpuDevice).toBeNull();
     expect(jetsonDeviceOnly.errors.join("\n")).toContain("requires sandbox GPU mode 1");
+
     const jetsonExplicitEnable = resolveSandboxGpuConfig(jetson, {
       env: { NEMOCLAW_SANDBOX_GPU: "1", NEMOCLAW_SANDBOX_GPU_DEVICE: "nvidia.com/gpu=0" },
     });
-    expect(jetsonExplicitEnable.sandboxGpuEnabled).toBe(true);
+    expect(jetsonExplicitEnable.errors).toEqual([]);
     expect(jetsonExplicitEnable.sandboxGpuDevice).toBe("nvidia.com/gpu=0");
-    expect(resolveSandboxGpuConfig(jetson, { flag: "enable", env: {} }).mode).toBe("1");
+
+    const jetsonFlagEnable = resolveSandboxGpuConfig(jetson, { flag: "enable", env: {} });
+    expect(jetsonFlagEnable.mode).toBe("1");
+    expect(jetsonFlagEnable.errors).toEqual([]);
   });
 
   it("resumes sandbox GPU auto mode without turning CPU fallback into explicit opt-out", () => {
@@ -104,17 +132,17 @@ describe("sandbox GPU mode helpers", () => {
       false,
     );
     expect(resumedAuto).toEqual({ flag: null, device: null });
-    expect(
-      resolveSandboxGpuConfig(gpu(), { ...resumedAuto, env: {} }).sandboxGpuEnabled,
-    ).toBe(true);
+    expect(resolveSandboxGpuConfig(gpu(), { ...resumedAuto, env: {} }).sandboxGpuEnabled).toBe(
+      true,
+    );
 
     const resumedDisabled = getResumeSandboxGpuOverrides(
       { sandboxGpuMode: "0", sandboxGpuDevice: null },
       false,
     );
-    expect(
-      resolveSandboxGpuConfig(gpu(), { ...resumedDisabled, env: {} }).sandboxGpuEnabled,
-    ).toBe(false);
+    expect(resolveSandboxGpuConfig(gpu(), { ...resumedDisabled, env: {} }).sandboxGpuEnabled).toBe(
+      false,
+    );
 
     const legacyGpuSession = getResumeSandboxGpuOverrides(null, true);
     expect(legacyGpuSession.flag).toBe("enable");

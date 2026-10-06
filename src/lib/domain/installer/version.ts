@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-export const MIN_NODE_VERSION = "22.16.0";
+export const MIN_NODE_VERSION = "22.19.0";
 export const MIN_NPM_MAJOR = 10;
 
 export type RuntimeCheckResult =
@@ -45,7 +45,8 @@ export function checkInstallerRuntime(input: {
   const npmVersion = input.npmVersion.trim();
   const npmMajor = versionMajor(npmVersion);
 
-  if (!SEMVER_RE.test(normalizeVersion(nodeVersion))) return { ok: false, reason: "invalid-node-version" };
+  if (!SEMVER_RE.test(normalizeVersion(nodeVersion)))
+    return { ok: false, reason: "invalid-node-version" };
   if (npmMajor === null) return { ok: false, reason: "invalid-npm-version" };
 
   if (

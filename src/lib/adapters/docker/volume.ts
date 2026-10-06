@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { dockerCapture, dockerRun, type DockerCaptureOptions, type DockerRunOptions } from "./run";
+import {
+  dockerCapture,
+  dockerRun,
+  type DockerCaptureOptions,
+  type DockerRunOptions,
+  type DockerRunResult,
+} from "./run";
 
 function splitNonEmptyLines(output: string): string[] {
   return output
@@ -18,6 +24,13 @@ function normalizeVolumePrefix(prefix: string): string {
   return normalized;
 }
 
+export function dockerVolumeRun(
+  args: readonly string[],
+  opts: DockerRunOptions = {},
+): DockerRunResult {
+  return dockerRun(["volume", ...args], opts);
+}
+
 export function dockerListVolumesByPrefix(
   prefix: string,
   opts: DockerCaptureOptions = {},
@@ -27,18 +40,20 @@ export function dockerListVolumesByPrefix(
     ignoreError: true,
     ...opts,
   });
-  return splitNonEmptyLines(output).filter((name) => name.startsWith(normalized));
+  return splitNonEmptyLines(output).filter(
+    (name) => name === normalized || name.startsWith(`${normalized}-`),
+  );
 }
 
-export function dockerRemoveVolumes(names: readonly string[], opts: DockerRunOptions = {}) {
+export function dockerRemoveVolumes(
+  names: readonly string[],
+  opts: DockerRunOptions = {},
+): DockerRunResult | null {
   if (names.length === 0) return null;
   return dockerRun(["volume", "rm", ...names], opts);
 }
 
-export function dockerRemoveVolumesByPrefix(
-  prefix: string,
-  opts: DockerRunOptions = {},
-): string[] {
+export function dockerRemoveVolumesByPrefix(prefix: string, opts: DockerRunOptions = {}): string[] {
   const normalized = normalizeVolumePrefix(prefix);
   let names: string[];
   try {

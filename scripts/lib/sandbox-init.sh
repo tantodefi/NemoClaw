@@ -10,7 +10,8 @@
 # security fix applied here protects both agents automatically.
 #
 # Usage (from an entrypoint script):
-#   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+#   SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+#   SCRIPT_DIR="${SCRIPT_SOURCE%/*}"
 #   # shellcheck source=scripts/lib/sandbox-init.sh
 #   source "${SCRIPT_DIR}/../scripts/lib/sandbox-init.sh"  # adjust path
 #
@@ -20,18 +21,31 @@
 [ -z "${_SANDBOX_INIT_LOADED:-}" ] || return 0
 _SANDBOX_INIT_LOADED=1
 
+_SANDBOX_INIT_SOURCE="${BASH_SOURCE[0]}"
+_SANDBOX_INIT_DIR="${_SANDBOX_INIT_SOURCE%/*}"
+if [ "$_SANDBOX_INIT_DIR" = "$_SANDBOX_INIT_SOURCE" ]; then
+  _SANDBOX_INIT_DIR="."
+fi
+_SANDBOX_INIT_DIR="$(cd "$_SANDBOX_INIT_DIR" && pwd)"
+unset _SANDBOX_INIT_SOURCE
+# shellcheck source=scripts/lib/sandbox-rlimits.sh
+source "${_SANDBOX_INIT_DIR}/sandbox-rlimits.sh"
+
 # ── /tmp trust boundary map ──────────────────────────────────────
-# Files in /tmp that cross user boundaries. Every file sourced by
-# .bashrc/.profile MUST be root-owned 444 in root mode.
+# Files in /tmp that cross user boundaries. Every file sourced by system-wide
+# shell hooks MUST be root-owned 444 in root mode.
 #
 # File                         Owner      Mode  Writer   Reader    Sourced?
-# /tmp/nemoclaw-proxy-env.sh   root       444   root     sandbox   YES (.bashrc/.profile)
+# /tmp/nemoclaw-proxy-env.sh   root       444   root     sandbox   YES (/etc shell hooks)
 # /tmp/gateway.log             gateway    644   gateway  all       no (world-readable for diagnostics)
-# /tmp/auto-pair.log           sandbox    600   sandbox  sandbox   no
+# /tmp/auto-pair.log           root*      600   root*    inherited no
 # /tmp/.npm-cache/             sandbox    755   sandbox  sandbox   no (tool data)
 # /tmp/.cache/                 sandbox    755   sandbox  sandbox   no (tool data)
-# /tmp/.config/                sandbox    755   sandbox  sandbox   no (tool data)
 # /tmp/.gnupg/                 sandbox    700   sandbox  sandbox   no (key data)
+#
+# * In non-root mode the sandbox user owns and opens auto-pair.log. In root
+# mode PID 1 owns and opens it before the stepped-down watcher inherits the
+# descriptor; PID 1 has already dropped CAP_DAC_OVERRIDE at that boundary.
 #
 # In non-root mode privilege separation is disabled — all files are
 # owned by sandbox. chmod 444 is best-effort (owner can chmod back).
@@ -121,9 +135,20 @@ validate_tmp_permissions() {
   # Restricted log files — gateway.log may be 600 (Hermes) or 644 (OpenClaw,
   # world-readable for diagnostics). auto-pair.log is 600.
   for f in /tmp/gateway.log /tmp/auto-pair.log; do
-    [ -f "$f" ] || continue
-    local perms
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    if [ -L "$f" ]; then
+      echo "[SECURITY] $f is a symlink (expected regular log file)" >&2
+      failed=1
+      continue
+    fi
+    if [ ! -f "$f" ]; then
+      echo "[SECURITY] $f is not a regular file" >&2
+      failed=1
+      continue
+    fi
+    local perms owner
     perms="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null || echo "unknown")"
+    owner="$(stat -c '%U' "$f" 2>/dev/null || stat -f '%Su' "$f" 2>/dev/null || echo "unknown")"
     case "$f" in
       */gateway.log)
         if [ "$perms" != "600" ] && [ "$perms" != "644" ]; then
@@ -143,218 +168,207 @@ validate_tmp_permissions() {
   return $failed
 }
 
-# ── Config file permission helpers ────────────────────────────────
-# After drop_capabilities() strips CAP_DAC_OVERRIDE, root can no longer write
-# files it does not own. These helpers temporarily make config files root-owned
-# and 644 for writing, then re-lock to 444 afterward.
-#
-# CAP_FOWNER is retained (by design in PR #917), so root can still chmod
-# files it doesn't own. The helpers include symlink guards to prevent
-# symlink-following attacks on the config path.
-#
-# Usage:
-#   relax_config_for_write /sandbox/.openclaw/openclaw.json /sandbox/.openclaw/.config-hash
-#   # ... perform writes ...
-#   lock_config_after_write /sandbox/.openclaw/openclaw.json /sandbox/.openclaw/.config-hash
-#
-# Ref: https://github.com/NVIDIA/NemoClaw/issues/2653
-
-relax_config_for_write() {
-  local f
-  for f in "$@"; do
-    if [ -L "$f" ]; then
-      printf '[SECURITY] Refusing to relax permissions — %s is a symlink\n' "$f" >&2
-      return 1
-    fi
-    [ -f "$f" ] || continue
-    if [ "$(id -u)" -eq 0 ] && ! chown root:root "$f"; then
-      printf '[SECURITY] Failed to take ownership of %s for write\n' "$f" >&2
-      return 1
-    fi
-    if ! chmod 644 "$f"; then
-      printf '[SECURITY] Failed to relax permissions on %s\n' "$f" >&2
-      return 1
-    fi
-  done
-}
-
-lock_config_after_write() {
-  local f
-  for f in "$@"; do
-    if [ -L "$f" ]; then
-      printf '[SECURITY] Refusing to lock permissions — %s is a symlink\n' "$f" >&2
-      return 1
-    fi
-    [ -f "$f" ] || continue
-    if ! chmod 444 "$f"; then
-      printf '[SECURITY] Failed to lock permissions on %s\n' "$f" >&2
-      return 1
-    fi
-  done
-}
-
 # ── Capability dropping ──────────────────────────────────────────
-# CIS Docker Benchmark 5.3: containers should not run with default caps.
-# OpenShell manages the container runtime so we cannot pass --cap-drop=ALL
-# to docker run. Instead, drop dangerous capabilities from the bounding set
-# at startup using capsh. The bounding set limits what caps any child process
-# (gateway, sandbox, agent) can ever acquire.
+# OpenShell-managed entrypoints do not call this section. Direct-root
+# entrypoints can still need capsh. Their retained bounding caps
+# (chown, fowner, setuid, setgid, kill) support initialization and supervised
+# shutdown; init_step_down_prefixes can remove them when changing user.
+# NEMOCLAW_REQUIRE_CAP_DROP=1 retains fail-closed verification for unavailable
+# drops. The default preserves the legacy warn-and-continue behavior.
 #
-# Dropped (issue #3280): cap_sys_admin, cap_sys_ptrace plus the historical
-# set (cap_net_raw, cap_dac_override, cap_sys_chroot, cap_fsetid,
-# cap_setfcap, cap_mknod, cap_audit_write, cap_net_bind_service).
-# Dashboard listens on a high port (default 18789, validated >=1024 in
-# nemoclaw-start.sh), so cap_net_bind_service is unconditionally unused.
-#
-# Kept (each load-bearing — do not drop without an entrypoint refactor):
-#   cap_chown, cap_fowner — needed to chown/chmod files we did not create
-#     after dropping cap_dac_override (see #2659).
-#   cap_setuid, cap_setgid — required by gosu to step down from root into
-#     the sandbox/gateway UIDs during entrypoint privilege separation.
-#   cap_kill — sandbox user signals gateway-user processes via the UID
-#     separation enforced by the entrypoint (see test 13 in
-#     e2e-gateway-isolation.sh).
-# Ref: https://github.com/NVIDIA/NemoClaw/issues/797
-#      https://github.com/NVIDIA/NemoClaw/issues/3280
-#
-# Usage:
-#   drop_capabilities /usr/local/bin/nemoclaw-start "$@"
-#
-# The first argument is the absolute path to the entrypoint script to
-# re-exec via capsh. Remaining arguments are forwarded.
+# Single drop/verification list, with bit numbers from linux/capability.h.
+DANGEROUS_CAPS=(
+  "21:cap_sys_admin"
+  "19:cap_sys_ptrace"
+  "13:cap_net_raw"
+  "1:cap_dac_override"
+  "18:cap_sys_chroot"
+  "4:cap_fsetid"
+  "31:cap_setfcap"
+  "27:cap_mknod"
+  "29:cap_audit_write"
+  "10:cap_net_bind_service"
+)
+
+# Comma-separated capability names for `capsh --drop`, derived from DANGEROUS_CAPS.
+dangerous_caps_drop_list() {
+  local entry out=""
+  for entry in "${DANGEROUS_CAPS[@]}"; do
+    out="${out:+$out,}${entry#*:}"
+  done
+  printf '%s' "$out"
+}
+
+# Use built-ins so verification observes the calling shell rather than an
+# exec'd reader whose capability state can differ. An explicit file argument
+# permits deterministic direct-root fixtures.
+read_capability_bounding_set() {
+  local key value rest seen=0 cap_bnd_hex=""
+  while IFS=$' \t' read -r key value rest; do
+    [ "$key" = CapBnd: ] || continue
+    [ "$seen" -eq 0 ] || return 1
+    seen=1
+    cap_bnd_hex="$value"
+    [ -z "$rest" ] || return 1
+  done <"$1" || return 1
+  [ "$seen" -eq 1 ] && [ -n "$cap_bnd_hex" ] || return 1
+  printf '%s\n' "$cap_bnd_hex"
+}
+
+# The first argument is the absolute entrypoint path; remaining args are forwarded.
 drop_capabilities() {
   local entrypoint="$1"
   shift
 
-  if [ "${NEMOCLAW_CAPS_DROPPED:-}" != "1" ] && command -v capsh >/dev/null 2>&1; then
-    # capsh --drop requires CAP_SETPCAP in the bounding set. OpenShell's
-    # sandbox runtime may strip it, so check before attempting the drop.
-    if capsh --has-p=cap_setpcap 2>/dev/null; then
-      export NEMOCLAW_CAPS_DROPPED=1
-      exec capsh \
-        --drop=cap_sys_admin,cap_sys_ptrace,cap_net_raw,cap_dac_override,cap_sys_chroot,cap_fsetid,cap_setfcap,cap_mknod,cap_audit_write,cap_net_bind_service \
-        -- -c "exec $entrypoint \"\$@\"" -- "$@"
-    else
-      report_residual_capabilities
+  local cap_bnd_hex present reason=""
+  if ! cap_bnd_hex="$(read_capability_bounding_set /proc/self/status 2>/dev/null)"; then
+    reason="could not read bounding set from /proc/self/status"
+  else
+    if ! present="$(dangerous_caps_in_capbnd "$cap_bnd_hex")"; then
+      reason="could not parse bounding set (CapBnd=${cap_bnd_hex})"
+    elif [ -n "$present" ]; then
+      reason="dangerous caps remain in bounding set (CapBnd=${cap_bnd_hex}): ${present}"
     fi
-  elif [ "${NEMOCLAW_CAPS_DROPPED:-}" != "1" ]; then
-    echo "[SECURITY WARNING] capsh not available — running with default capabilities" >&2
   fi
+
+  # Keep one capsh attempt for legacy entrypoints even when /proc is unreadable.
+  # The sentinel prevents re-execution loops; it never proves a successful drop.
+  if [ "${NEMOCLAW_CAPS_DROPPED:-}" != "1" ] \
+    && command -v capsh >/dev/null 2>&1 \
+    && capsh --has-p=cap_setpcap 2>/dev/null; then
+    export NEMOCLAW_CAPS_DROPPED=1
+    # capsh expands the positional parameters in its child shell.
+    # shellcheck disable=SC2016
+    exec capsh \
+      --drop="$(dangerous_caps_drop_list)" \
+      -- -c 'exec "$0" "$@"' "$entrypoint" "$@"
+  fi
+
+  [ -z "$reason" ] && return 0
+  if [ "${NEMOCLAW_REQUIRE_CAP_DROP:-}" = "1" ]; then
+    echo "[SECURITY] Refusing to start sandbox: ${reason}" >&2
+    exit 1
+  fi
+  echo "[SECURITY WARNING] Cannot drop bounding-set capabilities with capsh: ${reason}" >&2
 }
 
-# Emit a loud diagnostic when capsh-based dropping is unavailable so that
-# residual dangerous bounding-set caps surface in logs instead of being
-# silently inherited from the container runtime. Called from the
-# CAP_SETPCAP-missing fallback path of drop_capabilities() (issue #3280).
-report_residual_capabilities() {
-  echo "[SECURITY] CAP_SETPCAP not available — cannot drop bounding-set caps via capsh" >&2
-
-  local cap_bnd_hex val name bit present_caps=""
-  if ! cap_bnd_hex=$(awk '/^CapBnd:/{print $2}' /proc/self/status 2>/dev/null) \
-    || [ -z "$cap_bnd_hex" ]; then
-    echo "[SECURITY] Could not read /proc/self/status — residual caps unknown" >&2
-    return 0
-  fi
-  echo "[SECURITY] Residual CapBnd=${cap_bnd_hex}" >&2
-
-  # Bash arithmetic handles 64-bit ints on 64-bit platforms; CAP_LAST_CAP
-  # is ~41 today, well within range. Avoids a gawk-strtonum dependency.
+# Pure decode: given a CapBnd hex string, echo the comma-separated list of the
+# dangerous capabilities present (empty string if none). Factored out so the
+# residual diagnostic, the strict-mode gate, and the unit tests all share one
+# implementation instead of re-deriving the bit math.
+#
+# Bash arithmetic handles 64-bit ints on 64-bit platforms; CAP_LAST_CAP is ~41
+# today, well within range. Avoids a gawk-strtonum dependency.
+#
+# Returns nonzero with no output if the hex is empty or malformed, so callers
+# can treat "could not parse" the same as "could not read" instead of silently
+# treating an unparseable bounding set as clean (issue #3280).
+dangerous_caps_in_capbnd() {
+  local cap_bnd_hex="$1" val entry bit name present=""
+  case "$cap_bnd_hex" in
+    "" | *[!0-9A-Fa-f]*) return 1 ;;
+  esac
   val=$((16#$cap_bnd_hex))
-  for entry in \
-    "21:cap_sys_admin" \
-    "19:cap_sys_ptrace" \
-    "13:cap_net_raw" \
-    "1:cap_dac_override" \
-    "10:cap_net_bind_service"; do
+  for entry in "${DANGEROUS_CAPS[@]}"; do
     bit="${entry%%:*}"
     name="${entry#*:}"
     if [ $(((val >> bit) & 1)) -ne 0 ]; then
-      present_caps="${present_caps:+$present_caps,}$name"
+      present="${present:+$present,}$name"
     fi
   done
-  if [ -n "$present_caps" ]; then
-    echo "[SECURITY] Dangerous caps remain in bounding set: ${present_caps}" >&2
-  fi
+  printf '%s' "$present"
 }
 
 # ── Privilege step-down (issue #3280 follow-up) ──────────────────
-# Replaces direct `gosu <user>` invocations with `setpriv` so the load-
-# bearing caps (cap_setuid, cap_setgid, cap_fowner, cap_chown, cap_kill)
-# are stripped from the bounding set *atomically with* the setuid
-# transition. gosu cannot do this: dropping those caps before gosu
-# breaks its setuid() syscall, and after gosu we are non-root and have
-# already lost CAP_SETPCAP. setpriv performs reuid + bounding-set drop
-# in a single process, in the correct order, before exec.
+# Uses `setpriv` for every root-to-user transition. When CAP_SETPCAP is
+# available, setpriv also strips the load-bearing caps (cap_setuid,
+# cap_setgid, cap_fowner, cap_chown, cap_kill) from the bounding set atomically
+# with the setuid transition. setpriv performs both operations in the correct
+# order before exec.
 #
 # Two prefix arrays are populated at source time:
 #   STEP_DOWN_PREFIX_SANDBOX  — step down to the 'sandbox' user
 #   STEP_DOWN_PREFIX_GATEWAY  — step down to the 'gateway' user
 #
-# Callers use them like the old `gosu <user>` prefix:
+# Callers use them as a command prefix:
 #   exec "${STEP_DOWN_PREFIX_SANDBOX[@]}" "${NEMOCLAW_CMD[@]}"
 #   "${STEP_DOWN_PREFIX_SANDBOX[@]}" bash -c "..."
 #   nohup "${STEP_DOWN_PREFIX_GATEWAY[@]}" gateway run --port "$port" &
 #
-# Fallback: if setpriv is missing or CAP_SETPCAP isn't available, the
-# arrays fall back to plain `gosu <user>` and a warning is logged so the
-# residual bounding-set caps surface in the entrypoint log (matches the
-# residual-surface design of report_residual_capabilities).
+# If CAP_SETPCAP is unavailable, setpriv still changes identity and initializes
+# supplementary groups, but cannot remove the remaining load-bearing caps from
+# the bounding set. That case is logged consistently with
+# drop_capabilities. If setpriv itself is unavailable, the prefix
+# invokes a fail-closed helper instead of risking execution as root.
 # File-scope array declarations: bash 3.2 (macOS) does not accept `declare -g`,
 # but plain assignment at file scope is global by default. Inside
 # init_step_down_prefixes() we re-assign these without `local`, which targets
 # the globals in both bash 3.2 and 4+.
 #
-# Initialize to the gosu fallback (NOT empty) so callers cannot accidentally
+# Initialize to the fail-closed helper (NOT empty) so callers cannot accidentally
 # `exec "${STEP_DOWN_PREFIX_SANDBOX[@]}" "${NEMOCLAW_CMD[@]}"` with an unset
 # array — which would expand to nothing and run NEMOCLAW_CMD as root (privesc
-# regression). init_step_down_prefixes() below upgrades to setpriv when
-# CAP_SETPCAP is available; otherwise these stay at the gosu defaults.
+# regression).
 # shellcheck disable=SC2034  # consumed by scripts/nemoclaw-start.sh and agents/hermes/start.sh
-STEP_DOWN_PREFIX_SANDBOX=(gosu sandbox)
+STEP_DOWN_PREFIX_SANDBOX=(
+  /bin/sh -c 'echo "[SECURITY] setpriv unavailable: refusing to execute a root privilege transition" >&2; exit 1' --
+)
 # shellcheck disable=SC2034  # consumed by scripts/nemoclaw-start.sh and agents/hermes/start.sh
-STEP_DOWN_PREFIX_GATEWAY=(gosu gateway)
+STEP_DOWN_PREFIX_GATEWAY=(
+  /bin/sh -c 'echo "[SECURITY] setpriv unavailable: refusing to execute a root privilege transition" >&2; exit 1' --
+)
 
 init_step_down_prefixes() {
-  if command -v setpriv >/dev/null 2>&1 \
-    && command -v capsh >/dev/null 2>&1 \
-    && capsh --has-p=cap_setpcap 2>/dev/null; then
-    # setpriv cap names are unprefixed (per `setpriv --list`); capsh uses
-    # cap_* names. Keep them in sync but format-distinct.
-    #
-    # --init-groups (NOT --clear-groups): gateway is a member of the sandbox
-    # group via `usermod -aG sandbox gateway` in Dockerfile.base so it can
-    # write the chmod 660 /sandbox/.openclaw/openclaw.json (setgid'd
-    # config dir, see #2681). --clear-groups would strip that membership
-    # and break mutateConfigFile / control-UI config edits with EACCES.
-    # --init-groups matches gosu's setgroups+initgroups behavior and
-    # restores exactly the groups defined in /etc/group for the target user.
-    local drop="-setuid,-setgid,-fowner,-chown,-kill"
+  local setpriv_path
+  if ! setpriv_path="$(command -v setpriv 2>/dev/null)" || [ -z "$setpriv_path" ]; then
+    echo "[SECURITY WARNING] setpriv unavailable: root privilege transitions will fail closed" >&2
     # shellcheck disable=SC2034  # consumed by entrypoint scripts (cross-file)
     STEP_DOWN_PREFIX_SANDBOX=(
-      setpriv --reuid=sandbox --regid=sandbox --init-groups
-      --bounding-set="$drop" --
+      /bin/sh -c 'echo "[SECURITY] setpriv unavailable: refusing to execute a root privilege transition" >&2; exit 1' --
     )
     # shellcheck disable=SC2034  # consumed by entrypoint scripts (cross-file)
     STEP_DOWN_PREFIX_GATEWAY=(
-      setpriv --reuid=gateway --regid=gateway --init-groups
-      --bounding-set="$drop" --
+      /bin/sh -c 'echo "[SECURITY] setpriv unavailable: refusing to execute a root privilege transition" >&2; exit 1' --
     )
-  else
-    echo "[SECURITY WARNING] setpriv or CAP_SETPCAP unavailable — falling back to gosu (bounding set will retain cap_setuid/setgid/fowner/chown/kill — issue #3280)" >&2
-    # shellcheck disable=SC2034  # consumed by entrypoint scripts (cross-file)
-    STEP_DOWN_PREFIX_SANDBOX=(gosu sandbox)
-    # shellcheck disable=SC2034  # consumed by entrypoint scripts (cross-file)
-    STEP_DOWN_PREFIX_GATEWAY=(gosu gateway)
+    return 0
   fi
+
+  # --init-groups (NOT --clear-groups): gateway is a member of the sandbox
+  # group via `usermod -aG sandbox gateway` in Dockerfile.base so it can write
+  # the chmod 660 /sandbox/.openclaw/openclaw.json. --clear-groups would strip
+  # that membership and break config edits with EACCES.
+  local -a sandbox_prefix=(
+    "$setpriv_path" "--reuid=sandbox" "--regid=sandbox" --init-groups
+  )
+  local -a gateway_prefix=(
+    "$setpriv_path" "--reuid=gateway" "--regid=gateway" --init-groups
+  )
+
+  if command -v capsh >/dev/null 2>&1 && capsh --has-p=cap_setpcap 2>/dev/null; then
+    # setpriv cap names are unprefixed (per `setpriv --list`); capsh uses cap_*.
+    local drop="-setuid,-setgid,-fowner,-chown,-kill"
+    sandbox_prefix+=("--bounding-set=$drop")
+    gateway_prefix+=("--bounding-set=$drop")
+  else
+    echo "[SECURITY WARNING] CAP_SETPCAP unavailable: setpriv will change identity without dropping the remaining privilege-separation capabilities from the bounding set" >&2
+  fi
+
+  sandbox_prefix+=(--)
+  gateway_prefix+=(--)
+  # shellcheck disable=SC2034  # consumed by entrypoint scripts (cross-file)
+  STEP_DOWN_PREFIX_SANDBOX=("${sandbox_prefix[@]}")
+  # shellcheck disable=SC2034  # consumed by entrypoint scripts (cross-file)
+  STEP_DOWN_PREFIX_GATEWAY=("${gateway_prefix[@]}")
 }
-init_step_down_prefixes
+if [ "$(id -u)" -eq 0 ]; then
+  init_step_down_prefixes
+fi
 
 # ── Config integrity check ──────────────────────────────────────
 # The config hash was pinned at build time. If it doesn't match,
 # someone (or something) has tampered with the config.
 #
 # Usage:
-#   verify_config_integrity_if_locked /sandbox/.openclaw               # OpenClaw
 #   verify_config_integrity /sandbox/.hermes /etc/nemoclaw/hermes.config-hash # Hermes
 #
 # The config_dir must contain a .config-hash file with sha256sum output unless
@@ -389,75 +403,6 @@ verify_config_integrity() {
     echo "[SECURITY] Config integrity check FAILED in ${config_dir} — config may have been tampered with" >&2
     return 1
   fi
-}
-
-# OpenClaw is mutable by default in PR #2227: openclaw.json and .config-hash
-# are sandbox-owned until `shields up` locks them. A sandbox-writable hash is
-# not a trust anchor, so fail-closed integrity enforcement would only create a
-# self-DoS after legitimate runtime config writes. Enforce the strict verifier
-# only once the hash is root-owned and has no write bits, which is the state
-# applied by shields-up. Explicit hash files remain strict.
-verify_config_integrity_if_locked() {
-  local config_dir="$1"
-  local hash_file="${2:-${config_dir}/.config-hash}"
-
-  if [ "${2:-}" != "" ]; then
-    verify_config_integrity "$config_dir" "$hash_file"
-    return $?
-  fi
-
-  if [ ! -f "$hash_file" ]; then
-    local config_uid config_mode
-    config_uid="$(stat -c '%u' "$config_dir" 2>/dev/null || stat -f '%u' "$config_dir" 2>/dev/null || echo unknown)"
-    config_mode="$(stat -c '%a' "$config_dir" 2>/dev/null || stat -f '%Lp' "$config_dir" 2>/dev/null || echo unknown)"
-    if [ "$config_uid" = "0" ] && [ "$config_mode" != "unknown" ] && (((8#$config_mode & 0022) == 0)); then
-      echo "[SECURITY] Locked config is missing hash file (${hash_file}) — refusing to start" >&2
-      return 1
-    fi
-    echo "[config] Config integrity check skipped for mutable default (${hash_file} missing)" >&2
-    return 0
-  fi
-  if [ -L "$hash_file" ]; then
-    echo "[SECURITY] Config hash file is a symlink (${hash_file}) — refusing to trust it" >&2
-    return 1
-  fi
-
-  local hash_uid hash_mode
-  hash_uid="$(stat -c '%u' "$hash_file" 2>/dev/null || stat -f '%u' "$hash_file" 2>/dev/null || echo unknown)"
-  hash_mode="$(stat -c '%a' "$hash_file" 2>/dev/null || stat -f '%Lp' "$hash_file" 2>/dev/null || echo unknown)"
-  if [ "$hash_uid" = "0" ] && [ "$hash_mode" != "unknown" ] && (((8#$hash_mode & 0222) == 0)); then
-    verify_config_integrity "$config_dir" "$hash_file"
-    return $?
-  fi
-
-  echo "[config] Config integrity check skipped for mutable default (${hash_file} is not locked)" >&2
-  return 0
-}
-
-# ── RC file locking ──────────────────────────────────────────────
-# Lock .bashrc and .profile to 444 after startup has written dynamic shell
-# state to /tmp/nemoclaw-proxy-env.sh. This prevents the sandbox user from
-# injecting code that runs on every `nemoclaw connect`.
-#
-# SECURITY: This fixes the Hermes vulnerability where .bashrc/.profile
-# were never locked (unlike OpenClaw which had this via #2125).
-#
-# Usage:
-#   lock_rc_files /sandbox   # locks /sandbox/.bashrc and /sandbox/.profile
-lock_rc_files() {
-  local home_dir="$1"
-
-  for rc_file in "${home_dir}/.bashrc" "${home_dir}/.profile"; do
-    if [ -L "$rc_file" ]; then
-      echo "[SECURITY] Refusing to lock symlinked rc file: ${rc_file}" >&2
-      continue
-    fi
-    if [ -f "$rc_file" ]; then
-      if ! chmod 444 "$rc_file" 2>/dev/null; then
-        echo "[SECURITY] Could not lock ${rc_file} to 444 — continuing (best-effort, Landlock may enforce)" >&2
-      fi
-    fi
-  done
 }
 
 # ── Cleanup / signal forwarding ──────────────────────────────────
@@ -527,63 +472,291 @@ validate_config_symlinks() {
   done
 }
 
-# Lock a config directory and its symlinks with the immutable flag so
-# they cannot be swapped at runtime even if DAC or Landlock are bypassed.
-# chattr requires cap_linux_immutable which the entrypoint has as root;
-# the sandbox user cannot remove the flag.
+# ── Messaging channels ──────────────────────────────────────────
+# Channel entries are baked into the config at image build time via manifest
+# render hooks. Placeholder tokens flow through to the L7 proxy for rewriting
+# at egress. Real tokens are never visible inside the sandbox.
 #
-# Usage:
-#   harden_config_symlinks /sandbox/.openclaw
-#   harden_config_symlinks /sandbox/.hermes
-harden_config_symlinks() {
-  local config_dir="$1"
-  local label="${2:-$(basename "$config_dir")}"
-  local entry hardened failed
-  hardened=0
-  failed=0
+# This function just logs which channels are active. Managed runtime config
+# changes use the agent-aware host transaction paths.
+configure_messaging_channels() {
+  local channels
+  channels="$(read_messaging_plan_channels || true)"
+  [ -n "$channels" ] || return 0
 
-  if ! command -v chattr >/dev/null 2>&1; then
-    echo "[SECURITY] chattr not available — relying on DAC + Landlock for ${label} hardening" >&2
-    return 0
+  echo "[channels] Messaging channels active (baked at build time):" >&2
+  while IFS= read -r channel; do
+    [ -n "$channel" ] || continue
+    echo "[channels]   $channel" >&2
+  done <<EOF
+$channels
+EOF
+  return 0
+}
+
+read_messaging_plan_channels() {
+  python3 -I - <<'PY'
+import base64
+import json
+import os
+
+DEFAULT_ARTIFACT_PATH = "/usr/local/share/nemoclaw/messaging-runtime-plan.json"
+
+
+def read_plan():
+    raw = os.environ.get("NEMOCLAW_MESSAGING_PLAN_B64", "").strip()
+    if raw:
+        try:
+            return json.loads(base64.b64decode(raw).decode("utf-8"))
+        except Exception:
+            raise SystemExit(0)
+    artifact_path = os.environ.get("NEMOCLAW_MESSAGING_RUNTIME_PLAN_PATH", DEFAULT_ARTIFACT_PATH)
+    if not artifact_path or not os.path.isfile(artifact_path):
+        raise SystemExit(0)
+    try:
+        with open(artifact_path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        raise SystemExit(0)
+
+
+plan = read_plan()
+if not isinstance(plan, dict):
+    raise SystemExit(0)
+seen = set()
+disabled = {
+    str(channel).strip().lower()
+    for channel in plan.get("disabledChannels", [])
+    if isinstance(channel, str)
+}
+for item in plan.get("channels", []):
+    if not isinstance(item, dict):
+        continue
+    channel = str(item.get("channelId") or "").strip().lower()
+    if not channel or channel in seen:
+        continue
+    if item.get("active") is True and item.get("disabled") is not True and channel not in disabled:
+        seen.add(channel)
+        print(channel)
+PY
+}
+
+# Process observation helpers used for launch health and signal cleanup.
+
+gateway_control_pid_is_live() {
+  local pid="$1"
+  local state
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  # kill -0 succeeds for an unreaped zombie. Do not record or trust a process
+  # that can no longer own a listener or handle a termination signal.
+  if command -v ps >/dev/null 2>&1; then
+    state="$(ps -o stat= -p "$pid" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+    [ -n "$state" ] || return 1
+    case "$state" in
+      Z*) return 1 ;;
+    esac
+  elif [ -r "/proc/${pid}/stat" ]; then
+    state="$(sed -E 's/^[0-9]+ \(.*\) ([^ ]).*/\1/' "/proc/${pid}/stat" 2>/dev/null || true)"
+    [ "$state" != "Z" ] || return 1
   fi
+  return 0
+}
 
-  if chattr +i "$config_dir" 2>/dev/null; then
-    hardened=$((hardened + 1))
+gateway_control_proc_root() {
+  if [ "${_NEMOCLAW_PROC_ROOT+x}" = x ]; then
+    printf '%s\n' "$_NEMOCLAW_PROC_ROOT"
+  elif [ "${_HERMES_PROC_ROOT+x}" = x ]; then
+    printf '%s\n' "$_HERMES_PROC_ROOT"
   else
-    failed=$((failed + 1))
-  fi
-
-  for entry in "${config_dir}"/*; do
-    [ -L "$entry" ] || continue
-    if chattr +i "$entry" 2>/dev/null; then
-      hardened=$((hardened + 1))
-    else
-      failed=$((failed + 1))
-    fi
-  done
-
-  if [ "$failed" -gt 0 ]; then
-    echo "[SECURITY] Immutable hardening applied to $hardened path(s); $failed path(s) could not be hardened — continuing with DAC + Landlock" >&2
-  elif [ "$hardened" -gt 0 ]; then
-    echo "[SECURITY] Immutable hardening applied to ${label} and validated symlinks" >&2
+    printf '/proc\n'
   fi
 }
 
-# ── Messaging channels ──────────────────────────────────────────
-# Channel entries are baked into the config at image build time via
-# NEMOCLAW_MESSAGING_CHANNELS_B64. Placeholder tokens flow through
-# to the L7 proxy for rewriting at egress. Real tokens are never
-# visible inside the sandbox.
-#
-# This function just logs which channels are active. Runtime patching
-# of config files is not possible — Landlock enforces read-only at
-# the kernel level.
-configure_messaging_channels() {
-  [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${DISCORD_BOT_TOKEN:-}" ] || [ -n "${SLACK_BOT_TOKEN:-}" ] || return 0
+gateway_control_proc_root_is_explicit() {
+  [ "${_NEMOCLAW_PROC_ROOT+x}" = x ] || [ "${_HERMES_PROC_ROOT+x}" = x ]
+}
 
-  echo "[channels] Messaging channels active (baked at build time):" >&2
-  [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "[channels]   telegram" >&2
-  [ -n "${DISCORD_BOT_TOKEN:-}" ] && echo "[channels]   discord" >&2
-  [ -n "${SLACK_BOT_TOKEN:-}" ] && echo "[channels]   slack" >&2
-  return 0
+gateway_control_pid_start_identity() {
+  local pid="$1"
+  local proc_root stat_line stat_suffix started
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  proc_root="$(gateway_control_proc_root)" || return 1
+  if [ -r "${proc_root}/${pid}/stat" ]; then
+    IFS= read -r stat_line <"${proc_root}/${pid}/stat" || return 1
+    stat_suffix="${stat_line##*) }"
+    [ "$stat_suffix" != "$stat_line" ] || return 1
+    # shellcheck disable=SC2086  # intentional field split of proc stat suffix
+    set -- $stat_suffix
+    [ "$#" -ge 20 ] || return 1
+    case "${20}" in
+      '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "${20}"
+    return 0
+  fi
+  gateway_control_proc_root_is_explicit && return 1
+  command -v ps >/dev/null 2>&1 || return 1
+  started="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | awk 'NR == 1 { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print; exit }')"
+  [ -n "$started" ] || return 1
+  printf 'ps:%s\n' "${started//[[:space:]]/_}"
+}
+
+gateway_control_pid_state() {
+  local pid="$1"
+  local proc_root stat_line stat_suffix state
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 1 ;;
+  esac
+  proc_root="$(gateway_control_proc_root)" || return 1
+  if [ -r "${proc_root}/${pid}/stat" ]; then
+    IFS= read -r stat_line <"${proc_root}/${pid}/stat" || return 1
+    stat_suffix="${stat_line##*) }"
+    [ "$stat_suffix" != "$stat_line" ] || return 1
+    # shellcheck disable=SC2086  # intentional field split of proc stat suffix
+    set -- $stat_suffix
+    [ "$#" -ge 1 ] || return 1
+    state="$1"
+  else
+    gateway_control_proc_root_is_explicit && return 1
+    command -v ps >/dev/null 2>&1 || return 1
+    state="$(ps -o stat= -p "$pid" 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+  fi
+  [ -n "$state" ] || return 1
+  printf '%s\n' "$state"
+}
+
+gateway_control_pid_matches_start_identity() {
+  local pid="$1"
+  local expected_start_identity="$2"
+  local current_start_identity
+  [ -n "$expected_start_identity" ] || return 1
+  current_start_identity="$(gateway_control_pid_start_identity "$pid")" || return 1
+  [ "$current_start_identity" = "$expected_start_identity" ]
+}
+
+gateway_control_pid_owns_tcp_listener() {
+  local pid="$1"
+  local port="$2"
+  local proc_root
+  local port_hex listener_inodes inode fd_path target listener_inode
+  if [ "$#" -ge 3 ]; then
+    proc_root="$3"
+  else
+    proc_root="$(gateway_control_proc_root)" || return 1
+  fi
+  case "$port" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  gateway_control_pid_is_live "$pid" || return 1
+
+  # Match the listener socket inode to an fd owned by the exact tracked child.
+  # Callers cross a UID boundary before invoking this helper when PID 1 cannot
+  # inspect the gateway/dashboard fd directory after dropping CAP_SYS_PTRACE
+  # and CAP_DAC_OVERRIDE.
+  port_hex="$(printf '%04X' "$port")"
+  listener_inodes="$(awk -v expected_port="$port_hex" '
+    {
+      split($2, local_address, ":")
+      if (toupper(local_address[2]) == expected_port && $4 == "0A") {
+        print $10
+      }
+    }
+  ' "${proc_root}/net/tcp" "${proc_root}/net/tcp6" 2>/dev/null || true)"
+  [ -n "$listener_inodes" ] || return 1
+
+  for fd_path in "${proc_root}/${pid}"/fd/*; do
+    [ -L "$fd_path" ] || continue
+    target="$(readlink "$fd_path" 2>/dev/null || true)"
+    case "$target" in
+      'socket:['*']')
+        inode="${target#socket:[}"
+        inode="${inode%]}"
+        ;;
+      *) continue ;;
+    esac
+    while IFS= read -r listener_inode; do
+      [ "$inode" = "$listener_inode" ] && return 0
+    done <<EOF
+$listener_inodes
+EOF
+  done
+  return 1
+}
+
+gateway_control_stop_tracked_pid() {
+  local pid="$1"
+  local expected_start_identity="${2:-}"
+  local state
+  local attempts=0
+  case "$pid" in
+    '' | 0 | 1 | *[!0-9]*) return 0 ;;
+  esac
+  [ -n "$expected_start_identity" ] || return 1
+
+  # A missing or different identity means the tracked child is already gone.
+  # Never signal or wait for the process currently occupying a reused PID.
+  gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity" || return 0
+  state="$(gateway_control_pid_state "$pid")" || return 0
+  case "$state" in
+    Z*)
+      if gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity"; then
+        wait "$pid" 2>/dev/null || true
+      fi
+      return 0
+      ;;
+  esac
+
+  # Revalidate immediately before every signal. A numeric PID alone is never
+  # authority to terminate a process.
+  gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity" || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$attempts" -lt 50 ]; do
+    gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity" || return 0
+    state="$(gateway_control_pid_state "$pid")" || return 0
+    case "$state" in
+      Z*)
+        if gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity"; then
+          wait "$pid" 2>/dev/null || true
+        fi
+        return 0
+        ;;
+    esac
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity" || return 0
+  state="$(gateway_control_pid_state "$pid")" || return 0
+  case "$state" in
+    Z*)
+      if gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity"; then
+        wait "$pid" 2>/dev/null || true
+      fi
+      return 0
+      ;;
+  esac
+  gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity" || return 0
+  kill -KILL "$pid" 2>/dev/null || true
+
+  attempts=0
+  while [ "$attempts" -lt 50 ]; do
+    gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity" || return 0
+    state="$(gateway_control_pid_state "$pid")" || return 0
+    case "$state" in
+      Z*)
+        if gateway_control_pid_matches_start_identity "$pid" "$expected_start_identity"; then
+          wait "$pid" 2>/dev/null || true
+        fi
+        return 0
+        ;;
+    esac
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  return 1
 }

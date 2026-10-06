@@ -1,0 +1,21 @@
+{
+  "_comment": "Rough $/1M-token estimates [input, output] for the runs-IDE savings widget. TUNABLE INPUT (tracked, like seed-candidates.json). Nemotron via the NVIDIA key is FREE, so actual cost is ~0; these list prices power two views: (1) the frontier counterfactual — what every token WOULD cost on a top frontier model — and (2) the token-optimize downgrade math (from-tier vs to-tier). All estimates, deliberately conservative. Update as public pricing moves.",
+  "_updated": "2026-06-22",
+  "frontier": { "label": "Claude Opus-class (frontier ref)", "per1M": [15, 75] },
+  "tiers": {
+    "frontier": [15, 75],
+    "large": [3, 12],
+    "mid": [0.6, 2.4],
+    "small": [0.1, 0.4],
+    "free": [0, 0]
+  },
+  "patterns": [
+    ["claude-opus|gpt-5|o\\d-pro", "frontier"],
+    ["ultra|deepseek-v4-pro|maverick|kimi|llama-4-4|405|step-3|glm-5|minimax|397", "large"],
+    ["super|gpt-oss|flash|gemma|mini\\b|claude|mimo|north|deepseek-v4-flash", "mid"],
+    ["nano", "small"]
+  ],
+  "defaultTier": "mid",
+  "actualTier": "free",
+  "_actualNote": "Nemotron is served free via the NVIDIA key, so realized spend is ~$0; 'actualTier=free' makes that explicit. Set actualTier to a paying tier to model a paid-inference scenario."
+}

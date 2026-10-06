@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 version: "0.1.0"
-min_openshell_version: "0.0.39"
-max_openshell_version: "0.0.39"
+# NOTE(chad): pinned to chad's live OpenShell range (0.0.32-0.0.36). Upstream now
+# requires OpenShell 0.0.116 (MCP/JSON-RPC L7 policy support, NVIDIA/OpenShell#1865);
+# bump these to "0.0.116" AFTER upgrading the pod's OpenShell binary (see TODO).
+min_openshell_version: "0.0.32"
+max_openshell_version: "0.0.36"
 min_openclaw_version: "2026.4.24"
 # Mirrors the components.sandbox.image manifest digest below. Lets a
 # downstream consumer (or release tooling) verify the blueprint declares
@@ -35,23 +38,40 @@ components:
     name: "openclaw"
     forward_ports:
       - 18789
+    resource_profiles:
+      creator:
+        cpu: "50%"
+        memory: "50%"
+      gamer:
+        cpu: "25%"
+        memory: "25%"
+      game-developer:
+        cpu: "60%"
+        memory: "60%"
+      developer:
+        cpu: "75%"
+        memory: "75%"
 
   inference:
     profiles:
+      # Hosted NVIDIA profiles default to the newest, most capable open model
+      # (Ultra 550B, 2026-06-04). No local-hardware implication — it's hosted.
       default:
         provider_type: "nvidia"
         provider_name: "nvidia-inference"
         endpoint: "https://integrate.api.nvidia.com/v1"
-        model: "nvidia/nemotron-3-super-120b-a12b"
+        model: "nvidia/nemotron-3-ultra-550b-a55b"
 
       ncp:
         provider_type: "nvidia"
         provider_name: "nvidia-ncp"
         endpoint: ""
-        model: "nvidia/nemotron-3-super-120b-a12b"
-        credential_env: "NVIDIA_API_KEY"
+        model: "nvidia/nemotron-3-ultra-550b-a55b"
+        credential_env: "NVIDIA_API_KEY"   # chad's live creds use NVIDIA_API_KEY (not NVIDIA_INFERENCE_API_KEY)
         dynamic_endpoint: true
 
+      # Self-hosted profiles stay on Super 120B: running Ultra 550B locally is a
+      # far larger GPU footprint, so we don't impose that as a default here.
       nim-local:
         provider_type: "openai"
         provider_name: "nim-local"
@@ -76,7 +96,7 @@ components:
         provider_name: "nvidia-router"
         endpoint: "http://localhost:4000/v1"
         model: "nvidia-routed"
-        credential_env: "NVIDIA_API_KEY"
+        credential_env: "NVIDIA_INFERENCE_API_KEY"
         timeout_secs: 180
 
   router:
@@ -84,12 +104,24 @@ components:
     port: 4000
     pool_config_path: "router/pool-config.yaml"
 
+  plugins:
+    gbrain:
+      repo: "https://github.com/garrytan/gbrain.git"
+      install_path: "/sandbox/.gbrain-plugin"
+      mcp_server:
+        command: "gbrain"
+        args: ["serve"]
+        env:
+          GBRAIN_DIR: "/sandbox/.gbrain"
+      skills_path: "skills/"
+      description: "Personal knowledge brain with hybrid vector+graph search"
+
+    gstack:
+      repo: "https://github.com/garrytan/gstack.git"
+      install_path: "/sandbox/.gstack-plugin"
+      binary: "browse/dist/browse"
+      skills_path: ".agents/skills/"
+      description: "Workflow skills and persistent browser daemon"
+
   policy:
     base: "sandboxes/openclaw/policy.yaml"
-    additions:
-      nim_service:
-        name: nim_service
-        endpoints:
-          - host: "nim-service.local"
-            port: 8000
-            access: full

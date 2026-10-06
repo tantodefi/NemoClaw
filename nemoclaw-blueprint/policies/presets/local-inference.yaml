@@ -3,12 +3,22 @@
 
 preset:
   name: local-inference
-  description: "Local inference access (Ollama, vLLM) via host gateway"
+  description: "Local inference access (Ollama :11434, vLLM :8000, llama.cpp) through the OpenShell gateway"
 
 network_policies:
   local_inference:
     name: local_inference
     endpoints:
+      - host: host.openshell.internal
+        port: 8081
+        protocol: rest
+        enforcement: enforce
+        allowed_ips:
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+        rules:
+          - allow: { method: POST, path: "/v1/chat/completions" }
       - host: host.openshell.internal
         port: 11434
         protocol: rest
@@ -46,6 +56,9 @@ network_policies:
           - allow: { method: POST, path: "/**" }
     binaries:
       - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/bun }
       - { path: /usr/local/bin/node }
       - { path: /usr/bin/node }        # alternative Node install path (apt-installed)
       - { path: /usr/bin/curl }

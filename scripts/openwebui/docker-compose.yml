@@ -1,0 +1,156 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# open-webui — chat front-end backed by NemoClaw inference + Chad's gbrain.
+#
+# Hardened for internet exposure via Cloudflare Tunnel + Cloudflare Access:
+#   - 127.0.0.1 binding only (cloudflared is the sole inbound path).
+#   - Local signup disabled; CF Access at the edge is the front door.
+#   - Trusted-header SSO so the password layer is never internet-facing.
+#
+# Bring up:   bash scripts/openwebui-setup.sh
+# Tear down:  bash scripts/openwebui-down.sh
+
+services:
+  open-webui:
+    # Derived from upstream v0.11.4 to add cross-origin isolation headers
+    # (COOP/COEP/CORP). CheerpX cannot transfer SharedArrayBuffer into its
+    # worker without them, so the in-browser terminal never boots without this.
+    # Rebuild after bumping the base version: Dockerfile.coi + main.py.patched.
+    build:
+      context: .
+      dockerfile: Dockerfile.coi
+    image: nemoclaw-open-webui:coi-v0.11.4
+    container_name: nemoclaw-openwebui
+    restart: unless-stopped
+    expose:
+      - "8080"
+    ports:
+      - "127.0.0.1:${WEBUI_HOST_PORT:-3000}:8080"
+    volumes:
+      - ${WEBUI_DATA_DIR:-${HOME}/.nemoclaw/openwebui/data}:/app/backend/data
+      - ./static/loader.js:/app/build/static/loader.js:ro
+      # CheerpX runtime, xterm, and the 600 MB ext2 disk image. Bind-mounted
+      # rather than baked into the image or docker cp'd, because the container
+      # is recreated by `docker compose up` and would otherwise lose them.
+      - ./static/vendor:/app/backend/open_webui/static/vendor:ro
+    environment:
+      WEBUI_AUTH: "True"
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY is required — generate with: openssl rand -hex 32}"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-False}"
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${WEBUI_AUTH_TRUSTED_EMAIL_HEADER:-}"
+      WEBUI_AUTH_TRUSTED_NAME_HEADER: "${WEBUI_AUTH_TRUSTED_EMAIL_HEADER:-}"
+      DEFAULT_USER_ROLE: "user"
+      BYPASS_MODEL_ACCESS_CONTROL: "True"
+      JWT_EXPIRES_IN: "24h"
+      ENABLE_COMMUNITY_SHARING: "False"
+      ENABLE_MESSAGE_RATING: "False"
+      WEBUI_NAME: "${WEBUI_NAME:-Chad}"
+      OPENAI_API_BASE_URL: "${OPENAI_API_BASE_URL}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-sk-no-key-required}"
+      DATABASE_ENABLE_SQLITE_WAL: "False"
+      ENABLE_FORWARD_USER_INFO_HEADERS: "True"
+      ENABLE_WEB_SEARCH: "${ENABLE_WEB_SEARCH:-True}"
+      WEB_SEARCH_ENGINE: "${WEB_SEARCH_ENGINE:-searxng}"
+      SEARXNG_QUERY_URL: "${SEARXNG_QUERY_URL:-http://searxng:8080/search?q=<query>&format=json}"
+      WEB_SEARCH_RESULT_COUNT: "${WEB_SEARCH_RESULT_COUNT:-4}"
+      TERMINAL_SERVER_CONNECTIONS: '[{"id":"docker-term","name":"Docker Terminal","enabled":true,"url":"http://docker-vm-relay:8787","auth_type":"bearer","key":"${BROWSER_VM_RELAY_KEY:?BROWSER_VM_RELAY_KEY is required}","config":{"contexts":{"chat":{"context_id":"chat_id"}},"chat_uploads":"default"}},{"id":"webvm","name":"Browser VM (fresh)","url":"${BROWSER_VM_RELAY_URL:-http://browser-vm-relay:8787}","server_type":"orchestrator","auth_type":"bearer","key":"${BROWSER_VM_RELAY_KEY:?BROWSER_VM_RELAY_KEY is required or the terminal bridge will not authenticate}","config":{"contexts":{"chat":{"context_id":"chat_id"}},"chat_uploads":"default"}}]'
+    depends_on:
+      - searxng
+      - docker-vm-relay
+    networks:
+      - openwebui_openwebui-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: nemoclaw-searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: "${SEARXNG_SECRET:?SEARXNG_SECRET is required — generate with: openssl rand -hex 32}"
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    expose:
+      - "8080"
+    networks:
+      - openwebui_openwebui-net
+
+  # Docker Terminal backend.
+  #
+  # The relay opens its own PTY (os.openpty) and speaks OpenWebUI's
+  # Open-Terminal contract against it. The upstream `open-terminal` image cannot
+  # serve this leg: it exposes only /api/terminals/user/{input,output}, with no
+  # session-create route and no WebSocket, so OpenWebUI's proxy gets 405 on
+  # POST /api/terminals and the terminal never comes up.
+  #
+  # Set DOCKER_TARGET to run the shell inside a specific container
+  # (`docker exec -i -t`); with it empty the shell runs in the relay's own
+  # container. Either way the socket is only reachable on the compose network.
+  docker-vm-relay:
+    build:
+      context: ./browser-vm
+      dockerfile: deploy/relay.Dockerfile
+    container_name: nemoclaw-docker-vm-relay
+    restart: unless-stopped
+    environment:
+      RELAY_PORT: "8787"
+      RELAY_API_KEY: "${BROWSER_VM_RELAY_KEY:?BROWSER_VM_RELAY_KEY is required}"
+      RELAY_WS_KEY: "${BROWSER_VM_RELAY_KEY}"
+      RELAY_LOG_VERBOSE: "${BROWSER_VM_LOG_VERBOSE:-0}"
+      # Same relay code as the browser leg, different far end of the pipe:
+      # a real PTY instead of the in-tab CheerpX pod.
+      RELAY_BACKEND: "docker"
+      # Shell to run in the PTY. Set DOCKER_TARGET to land inside a specific
+      # container ("docker exec -i -t"); leave it empty for a shell in the
+      # relay's own container.
+      DOCKER_SHELL: "${DOCKER_SHELL:-/bin/bash}"
+      DOCKER_TARGET: "${DOCKER_TARGET:-}"
+      DOCKER_CWD: "${DOCKER_CWD:-/root}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - openwebui_openwebui-net
+
+  cloudflared-tunnel:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    container_name: nemoclaw-cloudflared
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: tunnel --no-autoupdate run --protocol http2 --token ${CF_TUNNEL_TOKEN:-missing}
+    depends_on:
+      - open-webui
+    networks:
+      - openwebui_openwebui-net
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+  cloudflared-quick:
+    profiles: ["quick"]
+    image: cloudflare/cloudflared:latest
+    container_name: nemoclaw-cloudflared-quick
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://open-webui:8080
+    depends_on:
+      - open-webui
+    networks:
+      - openwebui_openwebui-net
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+networks:
+  openwebui_openwebui-net:
+    external: true
+    name: openwebui_openwebui-net
+
+volumes:
+  terminals-data:

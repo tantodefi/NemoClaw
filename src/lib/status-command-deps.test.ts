@@ -1,15 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const require = createRequire(import.meta.url);
-const { buildStatusCommandDeps } =
-  require("../../dist/lib/status-command-deps.js") as typeof import("../../dist/lib/status-command-deps");
+import * as receiptAuthority from "./onboard/experimental/hermes-portable-receipt";
+import * as registry from "./state/registry";
+import { buildStatusCommandDeps } from "./status-command-deps";
 
 function writeExecutable(target: string, body: string): void {
   fs.writeFileSync(target, body, { mode: 0o755 });
@@ -30,6 +29,7 @@ describe("buildStatusCommandDeps", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (previousOverride === undefined) {
       delete process.env.NEMOCLAW_OPENSHELL_BIN;
     } else {
@@ -38,13 +38,44 @@ describe("buildStatusCommandDeps", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  it("classifies copied Hermes authority for status before probe migration (#10423)", () => {
+    const classify = vi
+      .spyOn(receiptAuthority, "inspectPortableAgentReceiptAuthorityForClassification")
+      .mockReturnValue({
+        kind: "hermes",
+        snapshot: {
+          receipt: {
+            phase: "active",
+            sandboxName: "alpha",
+            gatewayName: "nemoclaw",
+            lifecycleGeneration: "generation-1",
+            openshellExecutableAuthority: { version: "0.0.106" },
+          },
+        } as never,
+      });
+    vi.spyOn(registry, "getSandbox").mockReturnValue({
+      name: "alpha",
+      agent: "hermes",
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      lifecycleGeneration: "generation-1",
+      openshellDriver: "docker",
+      openshellVersion: "0.0.106",
+    } as never);
+
+    const deps = buildStatusCommandDeps(tmp);
+
+    expect(deps.getHermesPortablePhase?.("alpha")).toBe("active");
+    expect(classify).toHaveBeenCalledOnce();
+  });
+
   it("detects Telegram conflict signatures from the gateway log", () => {
     writeExecutable(
       openshell,
       `#!/usr/bin/env bash
 printf '%s\n' "$*" >> ${JSON.stringify(callsFile)}
 if [ "$1" = "sandbox" ] && [ "$2" = "exec" ]; then
-  printf '7\n'
+  printf 'getUpdates conflict\\n409 Conflict\\n409: Conflict\\n'
   exit 0
 fi
 exit 0
@@ -54,11 +85,12 @@ exit 0
     const deps = buildStatusCommandDeps(tmp);
 
     expect(deps.checkMessagingBridgeHealth!("alpha", ["telegram"])).toEqual([
-      { channel: "telegram", conflicts: 7 },
+      { channel: "telegram", conflicts: 3 },
     ]);
     expect(fs.readFileSync(callsFile, "utf-8")).toContain(
       "sandbox exec -n alpha -- sh -c tail -n 200 /tmp/gateway.log",
     );
+    expect(fs.readFileSync(callsFile, "utf-8")).not.toContain("grep -cE");
   });
 
   it("skips gateway-log probes for non-Telegram channel sets", () => {
@@ -103,7 +135,7 @@ exit 0
     expect(deps.readGatewayLog?.("alpha")).toBeNull();
   });
 
-  it("parses live gateway inference through the OpenShell override", () => {
+  it("parses live gateway inference through the OpenShell override", async () => {
     writeExecutable(
       openshell,
       `#!/usr/bin/env bash
@@ -120,7 +152,10 @@ exit 0
 
     const deps = buildStatusCommandDeps(tmp);
 
-    expect(deps.getLiveInference()).toEqual({ provider: "nvidia-prod", model: "nvidia/nemotron" });
+    await expect(deps.getLiveInference()).resolves.toEqual({
+      provider: "nvidia-prod",
+      model: "nvidia/nemotron",
+    });
     expect(fs.readFileSync(callsFile, "utf-8")).toContain("inference get");
   });
 });

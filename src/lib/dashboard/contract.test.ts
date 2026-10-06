@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
-import { buildChain, buildControlUiUrls } from "../../../dist/lib/dashboard/contract.js";
+import { describe, expect, it } from "vitest";
+import { buildChain, buildControlUiUrls, buildFallbackControlUiUrls } from "./contract.js";
 
 describe("buildChain", () => {
   it("returns default loopback chain with no arguments", () => {
     const c = buildChain();
     expect(c).toMatchObject({
-      accessUrl: "http://127.0.0.1:18789", forwardTarget: "18789",
-      healthEndpoint: "/health", port: 18789, bindAddress: "127.0.0.1",
+      accessUrl: "http://127.0.0.1:18789",
+      fallbackUrls: [],
+      forwardTarget: "18789",
+      healthEndpoint: "/health",
+      port: 18789,
+      bindAddress: "127.0.0.1",
+      dashboardHealthEndpoint: "/health",
+      gatewayPort: 18789,
+      gatewayHealthEndpoint: "/health",
     });
     expect(c.corsOrigins).toEqual(["http://127.0.0.1:18789"]);
     expect(c.shouldDisableDeviceAuth).toBe(false);
@@ -21,25 +28,67 @@ describe("buildChain", () => {
     expect(c.forwardTarget).toBe("19000");
   });
 
-  it("binds to 0.0.0.0 for non-loopback URL and includes both CORS origins", () => {
+  it("keeps a loopback bind for a non-loopback URL and includes both CORS origins", () => {
     const c = buildChain({ chatUiUrl: "https://my-brev-host.example.com:18789" });
-    expect(c.forwardTarget).toBe("0.0.0.0:18789");
-    expect(c.bindAddress).toBe("0.0.0.0");
+    expect(c.forwardTarget).toBe("18789");
+    expect(c.bindAddress).toBe("127.0.0.1");
     expect(c.corsOrigins[0]).toBe("http://127.0.0.1:18789");
     expect(c.corsOrigins).toContain("https://my-brev-host.example.com:18789");
     expect(c.shouldDisableDeviceAuth).toBe(true);
   });
 
-  it("uses WSL host address and binds to 0.0.0.0", () => {
+  it("keeps loopback primary on WSL and offers the host IP as a fallback", () => {
     const c = buildChain({ isWsl: true, wslHostAddress: "172.24.240.1" });
+    expect(c.accessUrl).toBe("http://127.0.0.1:18789");
+    expect(c.fallbackUrls).toEqual(["http://172.24.240.1:18789"]);
     expect(c.forwardTarget).toBe("0.0.0.0:18789");
-    expect(c.accessUrl).toBe("http://172.24.240.1:18789");
-    expect(c.corsOrigins).toContain("http://172.24.240.1:18789");
+    expect(c.bindAddress).toBe("0.0.0.0");
+    expect(c.corsOrigins).toEqual(["http://127.0.0.1:18789", "http://172.24.240.1:18789"]);
     expect(c.shouldDisableDeviceAuth).toBe(true);
+  });
+
+  it("offers no fallback when WSL host address is unavailable", () => {
+    const c = buildChain({ isWsl: true, wslHostAddress: null });
+    expect(c.accessUrl).toBe("http://127.0.0.1:18789");
+    expect(c.fallbackUrls).toEqual([]);
+    expect(c.forwardTarget).toBe("0.0.0.0:18789");
+  });
+
+  it("prefers an explicit non-loopback chatUiUrl over the WSL fallback", () => {
+    const c = buildChain({
+      isWsl: true,
+      wslHostAddress: "172.24.240.1",
+      chatUiUrl: "https://example.com:18789",
+    });
+    expect(c.accessUrl).toBe("https://example.com:18789");
+    expect(c.fallbackUrls).toEqual([]);
   });
 
   it("respects explicit port override", () => {
     expect(buildChain({ port: 19000 }).port).toBe(19000);
+  });
+
+  it("supports separate agent dashboard and gateway health probes", () => {
+    const c = buildChain({
+      chatUiUrl: "http://127.0.0.1:18789",
+      dashboardHealthEndpoint: "api/status",
+      gatewayPort: 8642,
+      gatewayHealthEndpoint: "/health",
+    });
+    expect(c.port).toBe(18789);
+    expect(c.dashboardHealthEndpoint).toBe("/api/status");
+    expect(c.healthEndpoint).toBe("/api/status");
+    expect(c.gatewayPort).toBe(8642);
+    expect(c.gatewayHealthEndpoint).toBe("/health");
+  });
+
+  it("normalizes URL-shaped health endpoints to their pathname", () => {
+    expect(
+      buildChain({ dashboardHealthEndpoint: "http://127.0.0.1/" }).dashboardHealthEndpoint,
+    ).toBe("/");
+    expect(
+      buildChain({ gatewayHealthEndpoint: "http://127.0.0.1/health" }).gatewayHealthEndpoint,
+    ).toBe("/health");
   });
 
   it("treats empty/invalid chatUiUrl as default without throwing", () => {
@@ -55,7 +104,7 @@ describe("buildChain", () => {
   it("canonicalizes schemeless non-loopback URLs", () => {
     const c = buildChain({ chatUiUrl: "remote-host:18789" });
     expect(c.accessUrl).toBe("http://remote-host:18789");
-    expect(c.forwardTarget).toBe("0.0.0.0:18789");
+    expect(c.forwardTarget).toBe("18789");
     expect(c.shouldDisableDeviceAuth).toBe(true);
   });
 
@@ -69,6 +118,12 @@ describe("buildChain", () => {
 
   // #3259 — explicit operator opt-in to bind dashboard on all interfaces
   // for remote-SSH-deployed hosts (Brev / cloud workstations).
+  it("does not widen the bind when only a non-loopback CHAT_UI_URL is configured", () => {
+    const c = buildChain({ chatUiUrl: "https://dashboard.example.com:18789" });
+    expect(c.forwardTarget).toBe("18789");
+    expect(c.bindAddress).toBe("127.0.0.1");
+  });
+
   it("binds to 0.0.0.0 when bindOverride='0.0.0.0' is set, even for loopback URL", () => {
     const c = buildChain({ chatUiUrl: "http://127.0.0.1:18789", bindOverride: "0.0.0.0" });
     expect(c.forwardTarget).toBe("0.0.0.0:18789");
@@ -124,5 +179,31 @@ describe("buildControlUiUrls", () => {
   it("encodes special characters in tokens", () => {
     const urls = buildControlUiUrls("a=b&c");
     expect(urls[0]).toContain("#token=a%3Db%26c");
+  });
+});
+
+describe("buildFallbackControlUiUrls", () => {
+  it("rewrites the fallback host's port to the requested port", () => {
+    const urls = buildFallbackControlUiUrls("tok", 8642, ["http://172.24.240.1:18789"]);
+    expect(urls).toEqual(["http://172.24.240.1:8642/#token=tok"]);
+  });
+
+  it("returns an empty array when there are no fallback URLs", () => {
+    expect(buildFallbackControlUiUrls(null, 8642, [])).toEqual([]);
+  });
+
+  it("drops an unparseable fallback URL", () => {
+    const urls = buildFallbackControlUiUrls(null, 8642, ["http://[invalid"]);
+    expect(urls).toEqual([]);
+  });
+
+  it("drops fallback URLs that are not http/https", () => {
+    const urls = buildFallbackControlUiUrls(null, 8642, [
+      "ftp://x.com",
+      "javascript:alert(1)",
+      "data:text/html,hi",
+      "http://valid.example.com:18789",
+    ]);
+    expect(urls).toEqual(["http://valid.example.com:8642/"]);
   });
 });

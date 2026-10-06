@@ -21,25 +21,31 @@ export function getChangedFiles(base: string, head: string): string[] {
     .sort();
 }
 
-export function getDiff(base: string, head: string, maxChars: number): string {
+export function getDiff(base: string, head: string, cwd?: string): string {
   const stdout = gitOutput(
     [
       ["diff", "--find-renames", "--find-copies", "--unified=80", `${base}...${head}`],
       ["diff", "--find-renames", "--find-copies", "--unified=80", `${base}..${head}`],
     ],
-    20 * 1024 * 1024,
+    Number.POSITIVE_INFINITY,
+    cwd,
   );
-  return stdout === undefined ? "" : truncate(stdout, maxChars);
+  if (stdout === undefined) {
+    throw new Error(`failed to read complete diff ${base}..${head}; ensure both refs are fetched`);
+  }
+  return stdout;
 }
 
 export function getDiffStat(base: string, head: string): string {
-  return gitOutput(
-    [
-      ["diff", "--stat", `${base}...${head}`],
-      ["diff", "--stat", `${base}..${head}`],
-    ],
-    1024 * 1024,
-  )?.trim() || "<diff stat unavailable>";
+  return (
+    gitOutput(
+      [
+        ["diff", "--stat", `${base}...${head}`],
+        ["diff", "--stat", `${base}..${head}`],
+      ],
+      1024 * 1024,
+    )?.trim() || "<diff stat unavailable>"
+  );
 }
 
 export function getCommits(base: string, head: string): string[] {
@@ -54,18 +60,17 @@ export function getHeadSha(head: string): string {
   return execFileSync("git", ["rev-parse", head], { encoding: "utf8" }).trim();
 }
 
-export function gitOutput(commands: string[][], maxBuffer: number): string | undefined {
+export function gitOutput(
+  commands: string[][],
+  maxBuffer: number,
+  cwd?: string,
+): string | undefined {
   for (const command of commands) {
     try {
-      return execFileSync("git", command, { encoding: "utf8", maxBuffer });
+      return execFileSync("git", command, { encoding: "utf8", maxBuffer, cwd });
     } catch {
       // Try the next form. Some checkouts do not have a merge base locally.
     }
   }
   return undefined;
-}
-
-export function truncate(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}\n\n<diff truncated at ${maxChars} characters>`;
 }

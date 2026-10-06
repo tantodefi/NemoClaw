@@ -1,0 +1,30 @@
+# Routing the durable run dashboard to runs.supachad.com (subdomain — decided).
+#
+# The dashboard (serve-runs.js, a Hono server reading the Smithers SQLite DBs)
+# runs on the Mac host, port 7331, bound 0.0.0.0 (via the launchd plist
+# dev.nemoclaw.chad-runs-ui.plist). The cloudflared tunnel is TOKEN-managed, so
+# the route below is configured in the Cloudflare Zero Trust DASHBOARD, not a
+# local file. This file just records the exact values to enter.
+#
+# Dashboard → Networks → Tunnels → <your tunnel> → Configure → Public Hostname →
+#   Add a public hostname:
+#     Subdomain: runs
+#     Domain:    supachad.com
+#     Path:      (leave empty — subdomain serves at root, no base-path issue)
+#     Service:   http://host.docker.internal:7331
+#       (cloudflared runs in Docker; host.docker.internal = the Mac host. The
+#        dashboard binds 0.0.0.0 so the container can reach it.)
+#
+# Access: a subdomain needs its own Cloudflare Access application. Add an Access
+# app for runs.supachad.com with the same SSO policy as chad.supachad.com so the
+# same people can reach it.
+#
+# Equivalent config-file form (for reference only — NOT used with a token tunnel):
+ingress:
+  - hostname: runs.supachad.com
+    service: http://host.docker.internal:7331
+  - service: http_status:404
+#
+# Smoke test after adding the route:
+#   curl -sS https://runs.supachad.com/api/health   # {"ok":true,"dbs":[...]}
+# Then open https://runs.supachad.com in a browser.

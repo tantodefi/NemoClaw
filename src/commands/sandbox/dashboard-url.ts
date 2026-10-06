@@ -4,15 +4,14 @@
 import { Args } from "@oclif/core";
 import { quietFlag } from "../../lib/cli/common-flags";
 import { NemoClawCommand } from "../../lib/cli/nemoclaw-oclif-command";
-import {
-  DashboardUrlCommandError,
-  runDashboardUrlCommand,
-} from "../../lib/dashboard-url-command";
+import { DashboardUrlCommandError, runDashboardUrlCommand } from "../../lib/dashboard-url-command";
 import type { SandboxEntry } from "../../lib/state/registry";
 
 type DashboardUrlRuntimeBridge = {
-  fetchGatewayAuthTokenFromSandbox: (sandboxName: string) => string | null;
-  getSandbox: (sandboxName: string) => Pick<SandboxEntry, "agent" | "dashboardPort"> | null;
+  fetchGatewayAuthTokenFromSandbox: (sandboxName: string) => Promise<string | null>;
+  getSandbox: (
+    sandboxName: string,
+  ) => Pick<SandboxEntry, "agent" | "dashboardPort" | "dashboardExternalUrl"> | null;
   getAccessUrl?: (port: number) => string | null;
 };
 
@@ -26,7 +25,10 @@ let runtimeBridgeFactory = (): DashboardUrlRuntimeBridge => {
   };
   const dashboardAccess =
     require("../../lib/onboard/dashboard-access") as typeof import("../../lib/onboard/dashboard-access");
-  const runner = require("../../lib/runner") as Pick<typeof import("../../lib/runner"), "runCapture">;
+  const runner = require("../../lib/runner") as Pick<
+    typeof import("../../lib/runner"),
+    "runCapture"
+  >;
   return {
     fetchGatewayAuthTokenFromSandbox: onboard.fetchGatewayAuthTokenFromSandbox,
     getSandbox: (sandboxName: string) => {
@@ -56,8 +58,8 @@ function getRuntimeBridge(): DashboardUrlRuntimeBridge {
 export default class DashboardUrlCliCommand extends NemoClawCommand {
   static id = "sandbox:dashboard-url";
   static strict = true;
-  static summary = "Print the authenticated OpenClaw dashboard URL";
-  static description = "Print the authenticated OpenClaw dashboard URL for a running sandbox.";
+  static summary = "Print the dashboard URL";
+  static description = "Print the browser-facing dashboard URL for a running sandbox.";
   static usage = ["<name> [--quiet|-q]"];
   static examples = [
     "<%= config.bin %> sandbox dashboard-url alpha",
@@ -86,7 +88,7 @@ export default class DashboardUrlCliCommand extends NemoClawCommand {
 
     const runtime = getRuntimeBridge();
     try {
-      runDashboardUrlCommand(
+      await runDashboardUrlCommand(
         args.sandboxName,
         { quiet: flags.quiet === true },
         {

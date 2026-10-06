@@ -2,20 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { AgentDefinition } from "../agent/defs";
+import {
+  createBuiltInChannelManifestRegistry,
+  getMessagingManifestAvailabilityContext,
+} from "../messaging";
 import { channelUsesInSandboxQrPairing, type ChannelDef } from "../sandbox/channels";
 
 export type MessagingChannel = { name: string } & ChannelDef;
-
-export function getAvailableMessagingChannelsForAgent<T extends { name: string }>(
-  channels: T[],
-  agent: AgentDefinition | null = null,
-): T[] {
-  const supportedPlatforms = agent?.messagingPlatforms;
-  if (supportedPlatforms && supportedPlatforms.length > 0) {
-    return channels.filter((c) => supportedPlatforms.includes(c.name));
-  }
-  return channels;
-}
 
 export function resolveQrSelectedChannels(
   channels: MessagingChannel[],
@@ -30,32 +23,17 @@ export function resolveQrSelectedChannels(
   });
 }
 
-export function resolveMessagingChannelSeed(
-  channels: MessagingChannel[],
-  existingChannels: string[] | null | undefined,
-  hasChannelToken: (channel: MessagingChannel) => boolean,
-  { includeAllExisting = false }: { includeAllExisting?: boolean } = {},
-): string[] {
-  const seeded = new Set(channels.filter(hasChannelToken).map((channel) => channel.name));
-  if (!Array.isArray(existingChannels)) return Array.from(seeded);
-
-  const channelByName = new Map(channels.map((channel) => [channel.name, channel]));
-  for (const name of existingChannels) {
-    const channel = channelByName.get(name);
-    if (!channel) continue;
-    if (includeAllExisting || channelUsesInSandboxQrPairing(channel)) {
-      seeded.add(name);
-    }
-  }
-  return Array.from(seeded);
-}
-
 export function filterEnabledChannelsByAgent<T extends string[] | null | undefined>(
   enabledChannels: T,
   agent: AgentDefinition | null,
 ): T {
   if (!Array.isArray(enabledChannels)) return enabledChannels;
-  const supported = agent?.messagingPlatforms ?? [];
-  if (supported.length === 0) return enabledChannels;
-  return enabledChannels.filter((n) => supported.includes(n)) as T;
+  if (!agent) return enabledChannels;
+  const registry = createBuiltInChannelManifestRegistry();
+  const available = registry.listAvailable(
+    getMessagingManifestAvailabilityContext(agent, registry.list()),
+  );
+  if (available.length === 0) return [] as unknown as T;
+  const supported = new Set(available.map((manifest) => manifest.id));
+  return enabledChannels.filter((n) => supported.has(n)) as T;
 }

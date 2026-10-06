@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: opencode
+# Multi-provider coding CLI as alternate code/research backend. Like
+# codex but with broader provider support — natively configurable for
+# OpenAI, Anthropic, OpenRouter, NVIDIA, and others. Particularly handy
+# when the operator wants the same task run through multiple providers
+# for triangulation (use --binary-override to route a writer or
+# researcher kind through opencode without changing the manifest).
+#
+# **Stub status (2026-05).** opencode is not baked into the Chad image.
+# Default substrate is `gha`, where the runner installs it on demand
+# from npm. To enable local substrate: install `opencode` in
+# /usr/local/bin and ensure subagent-opencode policy preset is applied.
+
+kind: opencode
+description: "opencode CLI as multi-provider code/research backend (default substrate: gha; honors OPENAI_BASE_URL so NVIDIA fallback works)."
+
+binary: /usr/local/bin/opencode
+invocation: prompt-stdin
+
+network_policy_preset: subagent-opencode
+
+# Default execution substrate. `gha` runs on a GitHub Actions runner
+# (popebot-style); the runner installs opencode from npm at job time.
+# Override per-spawn with `chad-spawn --substrate local` if the binary
+# is installed in the sandbox.
+substrate: gha
+
+default_timeout: 600
+default_budget_tokens: 50000
+
+prompt_template: |
+  You are a sub-agent spawned by Chad, running opencode.
+
+  ## Step 0 — Brain first (mandatory)
+  Run: gbrain query "<keywords from the task>"
+  If gbrain returns relevant pages, factor them in. Treat results
+  older than 30 days as potentially stale.
+
+  ## Step 1 — Do the work
+  Read /sandbox/source if you need code context. Produce either:
+    1) a unified diff in ```diff fenced blocks, OR
+    2) a concrete answer / report
+
+  Never push to git, never edit files outside your workdir, never
+  spawn further sub-agents, never call non-allowlisted hosts.
+
+  ## Step 2 — Store non-obvious findings (optional)
+  If you discovered something the next sub-agent shouldn't have to
+  re-discover, store it: `gbrain put-page --title "..." --content "..."
+  --tags opencode,<topic>`.
+
+  ## Output (last non-empty stdout line MUST be JSON)
+  {"status": "done"|"failed", "summary": "...", "files_changed": []}
+
+  Task id: {{task_id}}
+  Task:
+  {{task}}

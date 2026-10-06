@@ -3,13 +3,19 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const mocks = vi.hoisted(() => ({
+  createOnboardActionRuntimeDeps: vi.fn(),
+  onboardRuntimeDeps: { googlechatTunnelRuntime: {} },
+}));
+
 import { runOnboardAction } from "../lib/actions/global";
 import OnboardCliCommand from "./onboard";
 
 vi.mock("../lib/actions/global", () => ({
   runOnboardAction: vi.fn().mockResolvedValue(undefined),
-  runSetupAction: vi.fn().mockResolvedValue(undefined),
-  runSetupSparkAction: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../lib/cli/onboard-runtime-deps", () => ({
+  createOnboardActionRuntimeDeps: mocks.createOnboardActionRuntimeDeps,
 }));
 
 const rootDir = process.cwd();
@@ -17,6 +23,7 @@ const rootDir = process.cwd();
 describe("onboard oclif command", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.createOnboardActionRuntimeDeps.mockReturnValue(mocks.onboardRuntimeDeps);
   });
 
   it("rejects mutually exclusive resume and fresh flags before dispatch", async () => {
@@ -27,56 +34,128 @@ describe("onboard oclif command", () => {
     expect(runOnboardAction).not.toHaveBeenCalled();
   });
 
-  it("accepts --yes and forwards it to the legacy onboard action", async () => {
+  it("accepts --yes and forwards typed flags to the onboard action", async () => {
     await OnboardCliCommand.run(
       ["--non-interactive", "--yes", "--yes-i-accept-third-party-software"],
       rootDir,
     );
 
-    expect(runOnboardAction).toHaveBeenCalledWith([
-      "--non-interactive",
-      "--yes",
-      "--yes-i-accept-third-party-software",
-    ]);
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        "non-interactive": true,
+        yes: true,
+        "yes-i-accept-third-party-software": true,
+      }),
+      mocks.onboardRuntimeDeps,
+    );
   });
 
   it("accepts -y as the short form for --yes", async () => {
     await OnboardCliCommand.run(["--non-interactive", "-y"], rootDir);
 
-    expect(runOnboardAction).toHaveBeenCalledWith(["--non-interactive", "--yes"]);
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({ "non-interactive": true, yes: true }),
+      mocks.onboardRuntimeDeps,
+    );
   });
 
-  it("forwards sandbox GPU flags to legacy onboard parsing", async () => {
+  it("forwards explicit APF interceptor selection as a boolean (#9833)", async () => {
+    await OnboardCliCommand.run(["--apf-interceptor"], rootDir);
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({ "apf-interceptor": true }),
+      mocks.onboardRuntimeDeps,
+    );
+  });
+
+  it.each(["--resume", "--recreate-sandbox"])(
+    "rejects --apf-interceptor with %s before dispatch (#9833)",
+    async (lifecycleFlag) => {
+      await expect(
+        OnboardCliCommand.run(["--apf-interceptor", lifecycleFlag], rootDir),
+      ).rejects.toThrow(/apf-interceptor|resume|recreate-sandbox/);
+
+      expect(runOnboardAction).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts an exact managed runtime catalog without candidate activation", async () => {
     await OnboardCliCommand.run(
-      [
-        "--non-interactive",
-        "--yes",
-        "--sandbox-gpu",
-        "--sandbox-gpu-device",
-        "nvidia.com/gpu=0",
-      ],
+      ["--temp-managed-runtime-catalog", "managed-catalog.json"],
       rootDir,
     );
 
-    expect(runOnboardAction).toHaveBeenCalledWith([
-      "--non-interactive",
-      "--sandbox-gpu",
-      "--sandbox-gpu-device",
-      "nvidia.com/gpu=0",
-      "--yes",
-    ]);
+    const [flags, deps] = vi.mocked(runOnboardAction).mock.calls[0]!;
+    expect(flags["temp-managed-runtime-catalog"]).toBe("managed-catalog.json");
+    expect(flags["temp-managed-runtime"]).toBeUndefined();
+    expect(deps).toBe(mocks.onboardRuntimeDeps);
   });
 
-  it("forwards --no-gpu to the legacy onboard action", async () => {
+  it("forwards typed sandbox GPU flags", async () => {
+    await OnboardCliCommand.run(
+      ["--non-interactive", "--yes", "--sandbox-gpu", "--sandbox-gpu-device", "nvidia.com/gpu=0"],
+      rootDir,
+    );
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        "non-interactive": true,
+        "sandbox-gpu": true,
+        "sandbox-gpu-device": "nvidia.com/gpu=0",
+        yes: true,
+      }),
+      mocks.onboardRuntimeDeps,
+    );
+  });
+
+  it("forwards the managed vLLM GPU device independently of sandbox GPU flags", async () => {
+    await OnboardCliCommand.run(
+      ["--non-interactive", "--vllm-gpu-device", "GPU-69adb14e-820e-bfb4-0993-171e73f68504"],
+      rootDir,
+    );
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        "non-interactive": true,
+        "vllm-gpu-device": "GPU-69adb14e-820e-bfb4-0993-171e73f68504",
+      }),
+      mocks.onboardRuntimeDeps,
+    );
+  });
+
+  it("forwards --no-gpu to the onboard action", async () => {
     await OnboardCliCommand.run(["--non-interactive", "--no-gpu"], rootDir);
 
-    expect(runOnboardAction).toHaveBeenCalledWith(["--non-interactive", "--no-gpu"]);
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({ "non-interactive": true, "no-gpu": true }),
+      mocks.onboardRuntimeDeps,
+    );
   });
 
-  it("rejects mutually exclusive gpu and no-gpu flags before dispatch", async () => {
-    await expect(OnboardCliCommand.run(["--gpu", "--no-gpu"], rootDir)).rejects.toThrow(
-      /gpu|no-gpu/,
+  it("accepts the hidden portable experimental profile", async () => {
+    await OnboardCliCommand.run(["--experimental-profile", "portable"], rootDir);
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({ "experimental-profile": "portable" }),
+      mocks.onboardRuntimeDeps,
     );
+  });
+
+  it.each([
+    ["--gpu", "--no-gpu"],
+    ["--sandbox-gpu", "--no-sandbox-gpu"],
+    ["--gpu", "--no-sandbox-gpu"],
+    ["--no-gpu", "--sandbox-gpu"],
+  ])("rejects incompatible GPU flags %s and %s before dispatch", async (left, right) => {
+    await expect(OnboardCliCommand.run([left, right], rootDir)).rejects.toThrow(/gpu/i);
+
+    expect(runOnboardAction).not.toHaveBeenCalled();
+  });
+
+  it("rejects a sandbox GPU device without explicit sandbox GPU mode", async () => {
+    await expect(
+      OnboardCliCommand.run(["--sandbox-gpu-device", "nvidia.com/gpu=0"], rootDir),
+    ).rejects.toThrow(/sandbox-gpu/);
 
     expect(runOnboardAction).not.toHaveBeenCalled();
   });

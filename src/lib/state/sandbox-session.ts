@@ -14,6 +14,11 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { buildSelectedOpenShellSubprocessEnv } from "../adapters/openshell/command-argv";
+import { resolveOpenshell } from "../adapters/openshell/resolve";
+import type { OpenShellRuntimeSelection } from "../adapters/openshell/runtime-selection";
+import { createOpenshellSandboxIdReader } from "../adapters/openshell/sandbox-identity";
+import { openshellSandboxSshHost } from "../adapters/openshell/sandbox-ssh-host";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,7 +30,7 @@ export interface SandboxSession {
   sandboxName: string;
   /** PID of the SSH process on the host. */
   pid: number;
-  /** SSH target host (typically openshell-<sandboxName>). */
+  /** SSH target host (current `.default` or legacy upgrade-window alias). */
   sshHost: string;
 }
 
@@ -37,69 +42,35 @@ export interface ActiveSessionsResult {
   sessions: SandboxSession[];
 }
 
-/** A forward entry parsed from `openshell forward list` output. */
-export interface ForwardEntry {
-  /** Sandbox name owning the forward. */
-  sandboxName: string;
-  /** Bind address (e.g., "127.0.0.1"). */
-  bind: string;
-  /** Port number being forwarded. */
-  port: string;
-  /** PID of the forwarding process (null if not parseable). */
-  pid: number | null;
-  /** Status string (e.g., "running", "stopped"). */
-  status: string;
-}
-
 // ---------------------------------------------------------------------------
 // Pure classifiers — parse CLI output, no I/O
 // ---------------------------------------------------------------------------
 
-function stripAnsi(value: string): string {
-  return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
-}
-
 /**
- * Parse `openshell forward list` output into structured forward entries.
+ * Does this command line belong to an interactive shell rather than a forward?
  *
- * Output format (columns separated by whitespace):
- *   SANDBOX  BIND  PORT  PID  STATUS
- *
- * The first line may be a header row — we skip lines where "SANDBOX" appears
- * literally in the first column.
+ * OpenShell starts the dashboard port-forward through the same proxy and the
+ * same `sandbox` host alias as `connect`, so the sandbox reference alone cannot
+ * tell them apart. The interactive session is the one that asks for a TTY; the
+ * forward runs `-N` with no remote command. Counting the forward would report a
+ * session on every Ready sandbox.
  */
-export function parseForwardList(output: string | null | undefined): ForwardEntry[] {
-  if (!output || typeof output !== "string") return [];
-
-  const entries: ForwardEntry[] = [];
-  const lines = stripAnsi(output)
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  for (const line of lines) {
-    // Skip header row
-    if (/^\s*SANDBOX\s/i.test(line)) continue;
-
-    const parts = line.split(/\s+/);
-    if (parts.length < 4) continue;
-
-    const [sandboxName, bind, port, pidStr, ...rest] = parts;
-    const pid = /^\d+$/.test(pidStr) ? Number.parseInt(pidStr, 10) : null;
-    const status = rest.join(" ").toLowerCase() || "unknown";
-
-    entries.push({ sandboxName, bind, port, pid, status });
-  }
-
-  return entries;
+function isInteractiveSshCommand(command: string): boolean {
+  return /(?:^|\s)-tt(?:\s|$)/.test(command) || /RequestTTY=force/.test(command);
 }
 
 /**
  * Parse process list output to find SSH processes targeting a specific sandbox.
  *
- * SSH connections to sandboxes use the host pattern `openshell-<sandboxName>`.
- * We match the full SSH host as a complete word to avoid false positives when
- * one sandbox name is a prefix of another (e.g., `dev` vs `dev-staging`).
+ * Two shapes are recognized. OpenShell used to place the sandbox in the SSH
+ * host itself (`openshell-<sandboxName>.default`, and the legacy
+ * `openshell-<sandboxName>` from the v0.0.85 to v0.0.99 upgrade window); those
+ * are matched as complete tokens so one sandbox name cannot match another it is
+ * a prefix of (`dev` vs `dev-staging`). Newer OpenShell connects every sandbox
+ * through the fixed `sandbox` alias and identifies the target with
+ * `--sandbox-id <id>` on its proxy command instead, which left interactive
+ * sessions invisible to every session-reporting surface (#9316). When the
+ * caller knows the durable sandbox ID, that form is matched too.
  *
  * Input format: one line per process — `<PID> <full command line>`
  * (compatible with both `pgrep -a` on Linux and `ps -axo pid,command`)
@@ -107,15 +78,19 @@ export function parseForwardList(output: string | null | undefined): ForwardEntr
 export function parseSshProcesses(
   pgrepOutput: string | null | undefined,
   sandboxName: string,
+  sandboxId?: string | null,
 ): SandboxSession[] {
   if (!pgrepOutput || typeof pgrepOutput !== "string") return [];
   if (!sandboxName) return [];
 
-  const sshHost = `openshell-${sandboxName}`;
-  // Match sshHost as a complete word — preceded by whitespace/start and followed
-  // by whitespace/end. This prevents `openshell-dev` from matching inside
-  // `openshell-dev-staging`.
-  const hostPattern = new RegExp(`(?:^|\\s)${escapeRegExp(sshHost)}(?:\\s|$)`);
+  const sshHosts = [openshellSandboxSshHost(sandboxName), `openshell-${sandboxName}`] as const;
+  const hostPatterns = sshHosts.map(
+    (sshHost) => [sshHost, new RegExp(`(?:^|\\s)${escapeRegExp(sshHost)}(?:\\s|$)`)] as const,
+  );
+  const idPattern =
+    sandboxId && sandboxId.trim()
+      ? new RegExp(`--sandbox-id[=\\s]+${escapeRegExp(sandboxId.trim())}(?:\\s|$)`)
+      : null;
   const sessions: SandboxSession[] = [];
   const lines = pgrepOutput.split("\n").filter(Boolean);
 
@@ -124,10 +99,17 @@ export function parseSshProcesses(
     if (!pidMatch) continue;
 
     const pid = Number.parseInt(pidMatch[1], 10);
-    const cmdline = pidMatch[2];
+    const command = pidMatch[2];
 
-    if (hostPattern.test(cmdline)) {
+    const sshHost = hostPatterns.find(([, pattern]) => pattern.test(command))?.[0];
+    if (sshHost) {
       sessions.push({ sandboxName, pid, sshHost });
+      continue;
+    }
+    // The proxied form carries no sandbox name, so it is only attributable
+    // when the caller resolved the sandbox's durable ID.
+    if (idPattern?.test(command) && isInteractiveSshCommand(command)) {
+      sessions.push({ sandboxName, pid, sshHost: openshellSandboxSshHost(sandboxName) });
     }
   }
 
@@ -139,81 +121,19 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/**
- * Check if a sandbox has active forwards from parsed forward entries.
- * Active forwards (status includes "running") indicate an active connection.
- */
-export function hasActiveForwards(entries: ForwardEntry[], sandboxName: string): boolean {
-  return entries.some((e) => e.sandboxName === sandboxName && e.status.includes("running"));
-}
-
-/**
- * Get forward entries for a specific sandbox.
- */
-export function getForwardsForSandbox(
-  entries: ForwardEntry[],
-  sandboxName: string,
-): ForwardEntry[] {
-  return entries.filter((e) => e.sandboxName === sandboxName);
-}
-
-/** Classification result from combining forward and SSH session evidence. */
-export interface SessionClassification {
-  /** Whether interactive SSH sessions are active (authoritative indicator). */
-  hasActiveSessions: boolean;
-  /** Number of active SSH sessions. */
-  sessionCount: number;
-  /** Number of running port forwards for this sandbox. */
-  forwardCount: number;
-  /** Which detection sources contributed evidence (e.g., ["forward", "ssh"]). */
-  sources: string[];
-}
-
-/**
- * Determine whether there are active SSH sessions for a sandbox from both
- * forward list and process detection.
- *
- * Combines evidence from forward entries and SSH processes. Either source
- * alone is sufficient to detect an active session — forwards may exist
- * without an interactive SSH session (e.g., port-forward only), and SSH
- * sessions may exist without a tracked forward (e.g., manual SSH).
- */
-export function classifySessionState(
-  forwardEntries: ForwardEntry[],
-  sshSessions: SandboxSession[],
-  sandboxName: string,
-): SessionClassification {
-  const sources: string[] = [];
-
-  const activeForwards = getForwardsForSandbox(forwardEntries, sandboxName).filter((e) =>
-    e.status.includes("running"),
-  );
-  if (activeForwards.length > 0) {
-    sources.push("forward");
-  }
-
-  const matchingSessions = sshSessions.filter((s) => s.sandboxName === sandboxName);
-  if (matchingSessions.length > 0) {
-    sources.push("ssh");
-  }
-
-  // SSH sessions are the authoritative indicator of interactive connections.
-  // Forwards alone don't necessarily mean interactive use (dashboard forward).
-  const sessionCount = matchingSessions.length;
-  const hasActiveSessions = sessionCount > 0;
-
-  return { hasActiveSessions, sessionCount, forwardCount: activeForwards.length, sources };
-}
-
 // ---------------------------------------------------------------------------
 // I/O layer — invokes system commands to gather raw output
 // ---------------------------------------------------------------------------
 
 export interface SessionDetectionDeps {
-  /** Run `openshell forward list` and return stdout. Null if unavailable. */
-  getForwardList: () => string | null;
   /** Run `pgrep -a ssh` and return stdout. Null if unavailable. */
   getSshProcesses: () => string | null;
+  /**
+   * Resolve the sandbox's durable OpenShell ID, or null when it cannot be
+   * determined. Only consulted when the process list contains a proxied
+   * connection, which is the only shape that needs it (#9316).
+   */
+  resolveSandboxId?: (sandboxName: string) => string | null;
 }
 
 /**
@@ -223,10 +143,7 @@ export interface SessionDetectionDeps {
  * It invokes system commands through the deps interface for testability.
  *
  * Detection relies on `pgrep -a ssh` to find SSH processes targeting the
- * sandbox's SSH host. The `getForwardList` dep is not used here (forward
- * activity alone doesn't indicate interactive sessions — the dashboard
- * forward is always running). Consumers that need forward state can call
- * `parseForwardList` + `classifySessionState` directly.
+ * sandbox's SSH host.
  */
 export function getActiveSandboxSessions(
   sandboxName: string,
@@ -242,7 +159,12 @@ export function getActiveSandboxSessions(
     return { detected: false, sessions: [] };
   }
 
-  const sshSessions = parseSshProcesses(pgrepOutput, sandboxName);
+  // Resolving the ID costs an OpenShell call, so only pay it for the proxied
+  // shape that cannot be attributed from the SSH host alone (#9316).
+  const sandboxId = pgrepOutput.includes("--sandbox-id")
+    ? (deps.resolveSandboxId?.(sandboxName) ?? null)
+    : null;
+  const sshSessions = parseSshProcesses(pgrepOutput, sandboxName, sandboxId);
 
   return {
     detected: true,
@@ -257,9 +179,9 @@ export function getActiveSandboxSessions(
  * for matching SSH target hosts. `ps -axo pid,command` works on both platforms
  * and returns full command lines in pgrep-compatible format (`PID COMMAND`).
  */
-function querySshProcesses(): string | null {
+function querySshProcesses(runCommand: typeof spawnSync = spawnSync): string | null {
   try {
-    const result = spawnSync("ps", ["-axo", "pid,command"], {
+    const result = runCommand("ps", ["-axo", "pid,command"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 5000,
@@ -278,23 +200,36 @@ function querySshProcesses(): string | null {
 
 /**
  * Create the default system deps for session detection.
- * Uses `openshell forward list` and `ps` (cross-platform) on the host.
+ * Uses `ps` on the host.
  */
-export function createSystemDeps(openshellBinary: string): SessionDetectionDeps {
+export function createSystemDeps(
+  openshellBinary: string | null = resolveOpenshell(),
+  options: {
+    readonly runtimeSelection?: OpenShellRuntimeSelection;
+    readonly spawnSync?: typeof spawnSync;
+  } = {},
+): SessionDetectionDeps {
+  const runCommand = options.spawnSync ?? spawnSync;
+  const selectedEnv = options.runtimeSelection
+    ? buildSelectedOpenShellSubprocessEnv(options.runtimeSelection)
+    : undefined;
   return {
-    getForwardList: (): string | null => {
-      try {
-        const result = spawnSync(openshellBinary, ["forward", "list"], {
-          encoding: "utf-8",
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 5000,
-        });
-        if (result.status !== 0) return null;
-        return result.stdout || "";
-      } catch {
-        return null;
-      }
-    },
-    getSshProcesses: querySshProcesses,
+    getSshProcesses: () => querySshProcesses(runCommand),
+    ...(openshellBinary
+      ? {
+          resolveSandboxId: createOpenshellSandboxIdReader(openshellBinary, (binary, args) => {
+            const selectedArgs = options.runtimeSelection
+              ? [args[0]!, args[1]!, "-g", options.runtimeSelection.gatewayName, ...args.slice(2)]
+              : args;
+            const result = runCommand(binary, selectedArgs, {
+              encoding: "utf-8",
+              ...(selectedEnv ? { env: selectedEnv } : {}),
+              stdio: ["ignore", "pipe", "pipe"],
+              timeout: 5000,
+            });
+            return { status: result.status, stdout: result.stdout || "" };
+          }),
+        }
+      : {}),
   };
 }

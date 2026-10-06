@@ -1,54 +1,87 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
-
-import { ROOT, redact } from "./runner";
+import { stripVTControlCharacters } from "node:util";
 import {
   dockerBuild,
-  dockerCapture,
   dockerImageInspect,
   dockerImageInspectFormat,
   dockerPull,
 } from "./adapters/docker";
+import { ROOT, redact } from "./runner";
+import { imageMeetsMinimumGlibc } from "./sandbox-base-image/image-compatibility";
+import { withLocalBuildHeartbeat } from "./sandbox-base-image/local-build-heartbeat";
+import {
+  createSandboxBaseImageBuildProvenance,
+  createSandboxBaseImageBuildProvenanceKey,
+  createSandboxBaseImageResolutionKey,
+} from "./sandbox-base-image/resolution-key";
+import {
+  finalizeSandboxBaseImageResolution,
+  inspectLocalImageMetadata,
+  reuseSandboxBaseImageResolutionHint,
+} from "./sandbox-base-image/resolution-metadata";
+import {
+  baseImageInputsChangedSinceMain,
+  baseImageInputsDirty,
+  getNearestVersionedBaseImageTags,
+  getSourceShortShaTags,
+  getVersionedBaseImageTags,
+} from "./sandbox-base-image/source-identity";
+import {
+  OPENSHELL_SANDBOX_MIN_GLIBC,
+  type ResolveBaseImageOptions,
+  SANDBOX_BASE_BUILD_PROVENANCE_LABEL,
+  SANDBOX_BASE_TAG,
+  type SandboxBaseImageResolution,
+} from "./sandbox-base-image/types";
+import { redactFull } from "./security/redact";
+import { addTraceEvent } from "./trace";
 
-export const OPENCLAW_SANDBOX_BASE_IMAGE = "ghcr.io/nvidia/nemoclaw/sandbox-base";
-export const SANDBOX_BASE_TAG = "latest";
-export const OPENSHELL_SANDBOX_MIN_GLIBC = "2.39";
+export * from "./sandbox-base-image/image-compatibility";
+export * from "./sandbox-base-image/label-codec";
+export * from "./sandbox-base-image/resolution-key";
+export * from "./sandbox-base-image/resolution-metadata";
+export * from "./sandbox-base-image/source-identity";
+export * from "./sandbox-base-image/types";
 
-type ResolveBaseImageOptions = {
-  imageName: string;
-  dockerfilePath: string;
-  localTag: string;
-  envVar?: string;
-  label?: string;
-  requireOpenshellSandboxAbi?: boolean;
-  minGlibcVersion?: string;
-  rootDir?: string;
-  env?: NodeJS.ProcessEnv;
-};
+const BUILD_FAILURE_DIAGNOSTIC_LIMIT = 8_000;
+const BUILD_FAILURE_TRUNCATED_PREFIX = "[diagnostic truncated]\n";
+const UNSAFE_BUILD_DIAGNOSTIC_CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu;
 
-export type SandboxBaseImageResolution = {
-  ref: string;
-  digest: string | null;
-  source: "override" | "source-sha" | "latest" | "local";
-  glibcVersion: string | null;
-};
+function stripBuildDiagnosticControls(value: string): string {
+  return stripVTControlCharacters(value).replace(UNSAFE_BUILD_DIAGNOSTIC_CONTROLS, "");
+}
 
-const BASE_IMAGE_INPUT_PATHS = ["Dockerfile.base", "nemoclaw-blueprint/blueprint.yaml"];
+function retainBuildDiagnosticTails(streams: readonly string[]): string {
+  let remaining = BUILD_FAILURE_DIAGNOSTIC_LIMIT - (streams.length - 1);
+  const budgets = new Array<number>(streams.length).fill(0);
+  const shortestFirst = streams
+    .map((stream, index) => ({ index, length: stream.length }))
+    .sort((left, right) => left.length - right.length || left.index - right.index);
+  shortestFirst.forEach((stream, index) => {
+    const budget = Math.min(stream.length, Math.floor(remaining / (streams.length - index)));
+    budgets[stream.index] = budget;
+    remaining -= budget;
+  });
+  return streams.map((stream, index) => stream.slice(-budgets[index]!)).join("\n");
+}
 
 /**
  * Combine stderr + stdout from a captured `dockerBuild` failure and pass them
- * through the runner's redaction so secrets in build output never reach the
- * terminal. BuildKit splits diagnostics across both streams depending on the
- * backend and progress mode, so taking only stderr can hide the actual reason
- * a build failed.
+ * through the complete diagnostic redaction pipeline so secrets, host paths,
+ * and terminal control sequences never reach the terminal. BuildKit splits
+ * diagnostics across both streams depending on the backend and progress mode,
+ * so taking only stderr can hide the actual reason a build failed.
  */
-export function formatBuildFailureDiagnostics(
-  buildResult: { stderr?: unknown; stdout?: unknown },
-): string {
-  const streams = [buildResult.stderr, buildResult.stdout]
+export function formatBuildFailureDiagnostics(buildResult: {
+  error?: unknown;
+  stderr?: unknown;
+  stdout?: unknown;
+}): string {
+  const streams = [buildResult.error, buildResult.stderr, buildResult.stdout]
     .map((stream) => {
       if (stream == null) return "";
       if (Buffer.isBuffer(stream)) return stream.toString("utf8");
@@ -56,152 +89,26 @@ export function formatBuildFailureDiagnostics(
     })
     .map((text) => text.trim())
     .filter((text) => text.length > 0);
-  return streams.length > 0 ? redact(streams.join("\n")) : "";
-}
+  if (streams.length === 0) return "";
 
-export function parseGlibcVersion(output: string | null | undefined): string | null {
-  const text = String(output || "");
-  const match = text.match(/GLIBC\s+([0-9]+(?:\.[0-9]+)+)/i) || text.match(/\s([0-9]+\.[0-9]+)\s*$/);
-  return match ? match[1] : null;
-}
-
-export function versionGte(left = "0.0.0", right = "0.0.0"): boolean {
-  const lhs = String(left)
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
-  const rhs = String(right)
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
-  const length = Math.max(lhs.length, rhs.length);
-  for (let index = 0; index < length; index += 1) {
-    const a = lhs[index] || 0;
-    const b = rhs[index] || 0;
-    if (a > b) return true;
-    if (a < b) return false;
-  }
-  return true;
-}
-
-export function getImageGlibcVersion(imageRef: string): string | null {
-  const output = dockerCapture(
-    ["run", "--rm", "--entrypoint", "/usr/bin/ldd", imageRef, "--version"],
-    { ignoreError: true, timeout: 20_000 },
-  );
-  return parseGlibcVersion(output);
-}
-
-export function imageMeetsMinimumGlibc(imageRef: string, minVersion = OPENSHELL_SANDBOX_MIN_GLIBC): {
-  ok: boolean;
-  version: string | null;
-} {
-  const version = getImageGlibcVersion(imageRef);
-  return { ok: !!version && versionGte(version, minVersion), version };
-}
-
-export function getSourceShortShaTags(rootDir = ROOT, env: NodeJS.ProcessEnv = process.env): string[] {
-  const values: string[] = [];
-  const push = (value: string | null | undefined) => {
-    const normalized = String(value || "").trim().toLowerCase();
-    if (!/^[0-9a-f]{7,40}$/.test(normalized)) return;
-    values.push(normalized.slice(0, 8), normalized.slice(0, 7));
-  };
-
-  push(env.GITHUB_SHA);
-  const git = spawnSync("git", ["-C", rootDir, "rev-parse", "HEAD"], {
-    encoding: "utf-8",
-    stdio: ["ignore", "pipe", "ignore"],
-    timeout: 5_000,
+  const sanitizedStreams = streams.map((stream) => {
+    let diagnostics = redact(redactFull(stripBuildDiagnosticControls(stream)));
+    for (const [prefix, replacement] of [
+      [process.env.HOME, "~"],
+      [os.homedir(), "~"],
+      [os.tmpdir(), "<tmp>"],
+    ] as const) {
+      if (!prefix || prefix === path.parse(prefix).root) continue;
+      diagnostics = diagnostics.replaceAll(prefix, replacement);
+    }
+    return diagnostics;
   });
-  if (git.status === 0) push(git.stdout);
-
-  return Array.from(new Set(values));
-}
-
-function gitStatus(rootDir: string, args: string[], env: NodeJS.ProcessEnv = process.env): number | null {
-  const git = spawnSync("git", ["-C", rootDir, ...args], {
-    encoding: "utf-8",
-    stdio: "ignore",
-    timeout: 5_000,
-    env,
-  });
-  return git.status;
-}
-
-function gitRefExists(rootDir: string, ref: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  return gitStatus(rootDir, ["rev-parse", "--verify", `${ref}^{commit}`], env) === 0;
-}
-
-function gitFetchRemoteBranch(
-  rootDir: string,
-  remote: string,
-  branch: string,
-  localRef: string,
-  env: NodeJS.ProcessEnv = process.env,
-): void {
-  const normalizedBranch = String(branch || "").trim();
-  if (!normalizedBranch) return;
-
-  spawnSync(
-    "git",
-    [
-      "-C",
-      rootDir,
-      "fetch",
-      "--no-tags",
-      "--depth=1",
-      remote,
-      `+refs/heads/${normalizedBranch}:${localRef}`,
-    ],
-    {
-      encoding: "utf-8",
-      stdio: "ignore",
-      timeout: 30_000,
-      env: { ...env, GIT_TERMINAL_PROMPT: "0" },
-    },
-  );
-}
-
-function gitHasPathDiff(
-  rootDir: string,
-  args: string[],
-  env: NodeJS.ProcessEnv = process.env,
-): boolean | null {
-  const status = gitStatus(rootDir, [...args, "--", ...BASE_IMAGE_INPUT_PATHS], env);
-  if (status === 0) return false;
-  if (status === 1) return true;
-  return null;
-}
-
-export function baseImageInputsChangedSinceMain(
-  rootDir = ROOT,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  const worktreeDiff = gitHasPathDiff(rootDir, ["diff", "--quiet"], env);
-  if (worktreeDiff === true) return true;
-
-  const stagedDiff = gitHasPathDiff(rootDir, ["diff", "--cached", "--quiet"], env);
-  if (stagedDiff === true) return true;
-
-  const baseBranch = String(env.GITHUB_BASE_REF || "main").trim() || "main";
-  const baseRemoteRef = `origin/${baseBranch}`;
-  if (!gitRefExists(rootDir, baseRemoteRef, env)) {
-    gitFetchRemoteBranch(rootDir, "origin", baseBranch, `refs/remotes/origin/${baseBranch}`, env);
-  }
-
-  const candidates = [
-    baseRemoteRef,
-    "origin/main",
-    "upstream/main",
-    "main",
-  ].filter((ref): ref is string => !!ref);
-
-  for (const ref of Array.from(new Set(candidates))) {
-    if (!gitRefExists(rootDir, ref, env)) continue;
-    const diff = gitHasPathDiff(rootDir, ["diff", "--quiet", ref, "HEAD"], env);
-    if (diff != null) return diff;
-  }
-
-  return false;
+  const diagnostics = stripBuildDiagnosticControls(sanitizedStreams.join("\n"));
+  const retainedDiagnostics =
+    diagnostics.length > BUILD_FAILURE_DIAGNOSTIC_LIMIT
+      ? `${BUILD_FAILURE_TRUNCATED_PREFIX}${retainBuildDiagnosticTails(sanitizedStreams)}`
+      : diagnostics;
+  return stripBuildDiagnosticControls(retainedDiagnostics);
 }
 
 function localBuildAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -213,45 +120,150 @@ function localBuildAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.NODE_ENV !== "test" && env.VITEST !== "true";
 }
 
-function getRepoDigest(imageName: string, imageRef: string): { digest: string; ref: string } | null {
-  const atIndex = imageRef.indexOf("@sha256:");
-  if (atIndex !== -1) {
-    const digest = imageRef.slice(atIndex + 1);
-    return { digest, ref: imageRef };
-  }
+function hasCurrentLocalBuildProvenance(
+  imageRef: string,
+  options: ResolveBaseImageOptions,
+): boolean {
+  const inspected = inspectLocalImageMetadata(imageRef);
+  const labels =
+    inspected?.Config?.Labels && typeof inspected.Config.Labels === "object"
+      ? (inspected.Config.Labels as Record<string, unknown>)
+      : {};
+  const provenance = labels[SANDBOX_BASE_BUILD_PROVENANCE_LABEL];
+  const expectedProvenance = createSandboxBaseImageBuildProvenanceKey(options);
+  return (
+    typeof provenance === "string" &&
+    provenance.startsWith(`${expectedProvenance}.`) &&
+    /^[0-9a-f]{64}\.[0-9a-f]{64}$/.test(provenance)
+  );
+}
 
+function getRepoDigest(
+  imageName: string,
+  imageRef: string,
+  preserveExactDigestRef = false,
+): { digest: string; ref: string } | null {
+  const referencesExpectedRepository =
+    imageRef === imageName ||
+    imageRef.startsWith(`${imageName}:`) ||
+    imageRef.startsWith(`${imageName}@`);
+  // A directly tagged local override can retain the upstream RepoDigest of
+  // its source image. Keep the caller's explicit repository boundary instead
+  // of silently converting that trusted local ref back into a remote digest.
+  if (!referencesExpectedRepository) return null;
+
+  const atIndex = imageRef.indexOf("@sha256:");
+  const pinnedDigest =
+    atIndex !== -1 ? { digest: imageRef.slice(atIndex + 1), ref: imageRef } : null;
+
+  // Docker can normalize a pulled manifest-list digest to the platform manifest
+  // digest in RepoDigests. Prefer that local proof when present, but keep the
+  // caller's exact digest ref as the fallback for offline or sparse metadata.
   const inspectOutput = dockerImageInspectFormat("{{json .RepoDigests}}", imageRef, {
     ignoreError: true,
   });
-  if (!inspectOutput) return null;
+  if (!inspectOutput) return pinnedDigest;
 
   let repoDigests: unknown;
   try {
     repoDigests = JSON.parse(inspectOutput || "[]");
   } catch {
-    return null;
+    addTraceEvent("nemoclaw.sandbox_base_image.repodigest_parse_failed", {
+      digest_pinned: pinnedDigest !== null,
+    });
+    return pinnedDigest;
   }
+  if (preserveExactDigestRef && pinnedDigest) return pinnedDigest;
   const repoDigest = Array.isArray(repoDigests)
     ? repoDigests.find((entry) => String(entry).startsWith(`${imageName}@sha256:`))
     : null;
-  if (!repoDigest) return null;
+  if (!repoDigest) return pinnedDigest;
   const digest = String(repoDigest).slice(String(repoDigest).indexOf("@") + 1);
   return { digest, ref: `${imageName}@${digest}` };
 }
 
-function resolvePulledCandidate(
-  imageName: string,
+type PulledCandidateOptions = {
+  pinnedRemoteRef?: string;
+  preserveExactDigestRef?: boolean;
+  refreshBeforeValidation?: boolean;
+  refreshIfLocalInvalid?: boolean;
+};
+
+function imageRefCanRefresh(imageRef: string): boolean {
+  return !imageRef.includes("@sha256:");
+}
+
+function isExpectedRemoteBaseImageRef(imageName: string, imageRef: string): boolean {
+  return (
+    imageRef === imageName ||
+    imageRef.startsWith(`${imageName}:`) ||
+    imageRef.startsWith(`${imageName}@sha256:`)
+  );
+}
+
+export function parseTemporarySandboxBaseImageId(
+  localImageName: string,
   imageRef: string,
-  source: SandboxBaseImageResolution["source"],
+): string | null {
+  const temporaryPrefix = `${localImageName}:rebuild-`;
+  if (!imageRef.startsWith(temporaryPrefix)) return null;
+  const match = imageRef
+    .slice(temporaryPrefix.length)
+    .match(/^[1-9][0-9]*-[0-9a-f]{16}-image-([0-9a-f]{64})$/);
+  return match ? `sha256:${match[1]}` : null;
+}
+
+export function parseContentAddressedSandboxBaseImageId(
+  localImageName: string,
+  imageRef: string,
+): string | null {
+  const prefix = `${localImageName}:image-`;
+  if (imageRef.startsWith(prefix)) {
+    const digest = imageRef.slice(prefix.length);
+    return /^[0-9a-f]{64}$/.test(digest) ? `sha256:${digest}` : null;
+  }
+  return parseTemporarySandboxBaseImageId(localImageName, imageRef);
+}
+
+function contentAddressedLocalImageId(localTag: string, imageRef: string): string | null {
+  return parseContentAddressedSandboxBaseImageId(localTag.replace(/:[^/:]+$/, ""), imageRef);
+}
+
+function resolveContentAddressedLocalOverride(
+  imageRef: string,
   options: ResolveBaseImageOptions,
 ): SandboxBaseImageResolution | null {
-  const inspectResult = dockerImageInspect(imageRef, {
-    ignoreError: true,
-    suppressOutput: true,
-  });
-  if (inspectResult.status !== 0) {
-    const pullResult = dockerPull(imageRef, { ignoreError: true, suppressOutput: true });
-    if (pullResult.status !== 0) return null;
+  const expectedImageId = contentAddressedLocalImageId(options.localTag, imageRef);
+  if (!expectedImageId) return null;
+
+  const inspected = inspectLocalImageMetadata(imageRef);
+  const imageId = typeof inspected?.Id === "string" ? inspected.Id.trim().toLowerCase() : "";
+  if (imageId !== expectedImageId) {
+    throw new SandboxBaseImageResolutionError(
+      `${options.label || "Sandbox base image"} local override '${imageRef}' does not match ` +
+        "its content-addressed image ID.",
+    );
+  }
+
+  const labels =
+    inspected?.Config?.Labels && typeof inspected.Config.Labels === "object"
+      ? (inspected.Config.Labels as Record<string, unknown>)
+      : {};
+  const expectedProvenance = createSandboxBaseImageBuildProvenanceKey(options);
+  const trustedOverride = options.trustedLocalOverride;
+  const provenance = trustedOverride?.provenance;
+  const imageProvenance = labels[SANDBOX_BASE_BUILD_PROVENANCE_LABEL];
+  if (
+    typeof provenance !== "string" ||
+    !provenance.startsWith(`${expectedProvenance}.`) ||
+    !/^[0-9a-f]{64}\.[0-9a-f]{64}$/.test(provenance) ||
+    trustedOverride?.ref !== imageRef ||
+    imageProvenance !== provenance
+  ) {
+    throw new SandboxBaseImageResolutionError(
+      `${options.label || "Sandbox base image"} local override '${imageRef}' is not backed ` +
+        "by the current NemoClaw build operation.",
+    );
   }
 
   let glibcVersion: string | null = null;
@@ -262,44 +274,162 @@ function resolvePulledCandidate(
     );
     glibcVersion = check.version;
     if (!check.ok) {
-      console.warn(
-        `  Warning: ${options.label || "sandbox base image"} ${imageRef} has glibc ` +
-          `${glibcVersion || "unknown"}; OpenShell sandbox supervisor requires ` +
-          `glibc >= ${options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC}.`,
+      throw new SandboxBaseImageResolutionError(
+        `${options.label || "Sandbox base image"} local override '${imageRef}' failed ` +
+          "the required OpenShell sandbox ABI check.",
       );
+    }
+  }
+  if (options.validateImage && !options.validateImage(imageRef, { source: "local" })) {
+    throw new SandboxBaseImageResolutionError(
+      `${options.label || "Sandbox base image"} local override '${imageRef}' lacks ` +
+        `${options.validationDescription || "a required runtime capability"}.`,
+    );
+  }
+
+  return { ref: imageRef, digest: null, source: "local", glibcVersion };
+}
+
+function validatePulledCandidate(
+  imageName: string,
+  imageRef: string,
+  source: SandboxBaseImageResolution["source"],
+  options: ResolveBaseImageOptions,
+  candidateOptions: PulledCandidateOptions,
+  warn: boolean,
+): SandboxBaseImageResolution | null {
+  let glibcVersion: string | null = null;
+  if (options.requireOpenshellSandboxAbi) {
+    const check = imageMeetsMinimumGlibc(
+      imageRef,
+      options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC,
+    );
+    glibcVersion = check.version;
+    if (!check.ok) {
+      if (warn) {
+        console.warn("  Warning: sandbox base image does not meet the required glibc version.");
+      }
       return null;
     }
   }
 
-  const repoDigest = getRepoDigest(imageName, imageRef);
+  if (
+    options.validateImage &&
+    !options.validateImage(imageRef, {
+      source,
+      ...(candidateOptions.pinnedRemoteRef
+        ? { pinnedRemoteRef: candidateOptions.pinnedRemoteRef }
+        : {}),
+    })
+  ) {
+    if (warn) {
+      console.warn("  Warning: sandbox base image lacks a required runtime capability.");
+    }
+    return null;
+  }
+
+  const repoDigest = getRepoDigest(
+    imageName,
+    imageRef,
+    candidateOptions.preserveExactDigestRef === true,
+  );
   return {
     ref: repoDigest?.ref || imageRef,
     digest: repoDigest?.digest || null,
     source,
+    ...(candidateOptions.pinnedRemoteRef
+      ? { pinnedRemoteRef: candidateOptions.pinnedRemoteRef }
+      : {}),
     glibcVersion,
   };
 }
 
+function resolvePulledCandidate(
+  imageName: string,
+  imageRef: string,
+  source: SandboxBaseImageResolution["source"],
+  options: ResolveBaseImageOptions,
+  candidateOptions: PulledCandidateOptions = {},
+): SandboxBaseImageResolution | null {
+  const inspectResult = dockerImageInspect(imageRef, {
+    ignoreError: true,
+    suppressOutput: true,
+  });
+  const localPresent = inspectResult.status === 0;
+  addTraceEvent("nemoclaw.sandbox_base_image.local_validation", {
+    source,
+    present: localPresent,
+  });
+  const refreshBeforeValidation =
+    candidateOptions.refreshBeforeValidation === true && imageRefCanRefresh(imageRef);
+  if (!localPresent || refreshBeforeValidation) {
+    addTraceEvent(
+      refreshBeforeValidation
+        ? "nemoclaw.sandbox_base_image.remote_refresh"
+        : "nemoclaw.sandbox_base_image.remote_pull",
+      { source },
+    );
+    const pullResult = pullSandboxBaseImage(imageRef);
+    if (pullResult.status !== 0) return null;
+  }
+
+  const resolved = validatePulledCandidate(
+    imageName,
+    imageRef,
+    source,
+    options,
+    candidateOptions,
+    !localPresent || refreshBeforeValidation || !candidateOptions.refreshIfLocalInvalid,
+  );
+  if (resolved) return resolved;
+
+  if (
+    localPresent &&
+    candidateOptions.refreshIfLocalInvalid === true &&
+    imageRefCanRefresh(imageRef)
+  ) {
+    addTraceEvent("nemoclaw.sandbox_base_image.remote_refresh", { source });
+    const pullResult = pullSandboxBaseImage(imageRef);
+    if (pullResult.status !== 0) return null;
+    return validatePulledCandidate(imageName, imageRef, source, options, candidateOptions, true);
+  }
+
+  return null;
+}
+
+function pullSandboxBaseImage(imageRef: string) {
+  return withLocalBuildHeartbeat(
+    () => dockerPull(imageRef, { ignoreError: true, suppressOutput: true }),
+    { activity: "pull" },
+  );
+}
+
 function resolveLocalCandidate(
   options: ResolveBaseImageOptions,
+  forceBuild = false,
 ): SandboxBaseImageResolution | null {
   const imageRef = options.localTag;
-  const inspectResult = dockerImageInspect(imageRef, { ignoreError: true, suppressOutput: true });
-  if (inspectResult.status === 0) {
-    const check = options.requireOpenshellSandboxAbi
-      ? imageMeetsMinimumGlibc(imageRef, options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC)
-      : { ok: true, version: null };
-    if (check.ok) {
-      return { ref: imageRef, digest: null, source: "local", glibcVersion: check.version };
+  if (!forceBuild) {
+    const inspectResult = dockerImageInspect(imageRef, { ignoreError: true, suppressOutput: true });
+    if (inspectResult.status === 0 && hasCurrentLocalBuildProvenance(imageRef, options)) {
+      const check = options.requireOpenshellSandboxAbi
+        ? imageMeetsMinimumGlibc(imageRef, options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC)
+        : { ok: true, version: null };
+      if (
+        check.ok &&
+        (!options.validateImage || options.validateImage(imageRef, { source: "local" }))
+      ) {
+        addTraceEvent("nemoclaw.sandbox_base_image.local_fallback_reuse");
+        return { ref: imageRef, digest: null, source: "local", glibcVersion: check.version };
+      }
     }
   }
 
   if (!localBuildAllowed(options.env)) return null;
 
   const label = options.label || "sandbox base image";
-  console.warn(
-    `  Building ${label} locally because no compatible published base image was found.`,
-  );
+  console.warn(`  Building ${label} locally because no compatible published base image was found.`);
+  addTraceEvent("nemoclaw.sandbox_base_image.local_fallback_build");
   console.warn("  This is a one-time step and can take several minutes.");
   // Suppress the full BuildKit log (apt-get output, layer hashes, debconf
   // warnings) on success — same approach as #3311 for the [2/8] gateway
@@ -307,16 +437,23 @@ function resolveLocalCandidate(
   // `suppressOutput` keeps captured stdio out of the user's terminal.
   // On failure, surface the captured stderr so the user still gets a
   // useful diagnostic.
-  const buildResult = dockerBuild(options.dockerfilePath, imageRef, options.rootDir || ROOT, {
-    quiet: true,
-    ignoreError: true,
-    suppressOutput: true,
-  });
+  const buildResult = withLocalBuildHeartbeat(() =>
+    dockerBuild(options.dockerfilePath, imageRef, options.rootDir || ROOT, {
+      buildArgs: options.buildArgs,
+
+      labels: {
+        [SANDBOX_BASE_BUILD_PROVENANCE_LABEL]: createSandboxBaseImageBuildProvenance(options),
+      },
+      quiet: true,
+      ignoreError: true,
+      suppressOutput: true,
+    }),
+  );
   if (buildResult.error || buildResult.status !== 0) {
     const diagnostics = formatBuildFailureDiagnostics(buildResult);
     if (diagnostics) console.error(diagnostics);
     const detail = buildResult.error
-      ? `: ${buildResult.error.message}`
+      ? " (process launch failed)"
       : ` (exit ${buildResult.status ?? "unknown"})`;
     console.error(`  Failed to build ${label}${detail}`);
     return null;
@@ -326,62 +463,170 @@ function resolveLocalCandidate(
     ? imageMeetsMinimumGlibc(imageRef, options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC)
     : { ok: true, version: null };
   if (!check.ok) {
-    console.error(
-      `  Local ${label} ${imageRef} has glibc ` +
-        `${check.version || "unknown"}; expected >= ` +
-        `${options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC}.`,
-    );
+    console.error("  Local sandbox base image does not meet the required glibc version.");
+    return null;
+  }
+
+  if (options.validateImage && !options.validateImage(imageRef, { source: "local" })) {
+    console.error("  Local sandbox base image lacks a required runtime capability.");
     return null;
   }
 
   return { ref: imageRef, digest: null, source: "local", glibcVersion: check.version };
 }
 
+export class SandboxBaseImageResolutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxBaseImageResolutionError";
+  }
+}
+
 export function resolveSandboxBaseImage(
   options: ResolveBaseImageOptions,
 ): SandboxBaseImageResolution | null {
   const env = options.env || process.env;
+  const allowLocalFallback = options.allowLocalFallback !== false;
   const override = options.envVar ? String(env[options.envVar] || "").trim() : "";
+  if (options.requirePinnedRemoteRef === true && !options.pinnedRemoteRef?.trim()) {
+    throw new SandboxBaseImageResolutionError(
+      `${options.label || "Sandbox base image"} requires a non-empty pinned remote reference.`,
+    );
+  }
+  const resolutionKey = createSandboxBaseImageResolutionKey(options);
+
+  if (!options.forceRefresh) {
+    const reused = reuseSandboxBaseImageResolutionHint(options, resolutionKey);
+    if (reused) return reused;
+  } else if (options.forceRefresh) {
+    addTraceEvent("nemoclaw.sandbox_base_image.force_refresh");
+  }
+  addTraceEvent("nemoclaw.sandbox_base_image.cache_miss", {
+    has_hint: options.resolutionHint != null,
+  });
+
+  const finish = (resolution: SandboxBaseImageResolution): SandboxBaseImageResolution =>
+    finalizeSandboxBaseImageResolution(options, resolutionKey, resolution);
+  const resolveChangedInputs = (): SandboxBaseImageResolution => {
+    const local = resolveLocalCandidate(options, true);
+    if (local) return finish(local);
+    throw new SandboxBaseImageResolutionError(
+      `${options.label || "Sandbox base image"} inputs differ from main, but no image built ` +
+        `from the current inputs could be validated. Resolve the local build failure or enable ` +
+        "NEMOCLAW_SANDBOX_BASE_LOCAL_BUILD, then retry.",
+    );
+  };
 
   if (override) {
-    const resolved = resolvePulledCandidate(options.imageName, override, "override", options);
-    if (resolved) return resolved;
-    if (!options.requireOpenshellSandboxAbi) return null;
+    const localOverride = resolveContentAddressedLocalOverride(override, options);
+    if (localOverride) return finish(localOverride);
+    if (!isExpectedRemoteBaseImageRef(options.imageName, override)) {
+      throw new SandboxBaseImageResolutionError(
+        `${options.label || "Sandbox base image"} override '${override}' is outside the ` +
+          `trusted repository '${options.imageName}'.`,
+      );
+    }
+    const resolved = resolvePulledCandidate(options.imageName, override, "override", options, {
+      preserveExactDigestRef: true,
+      refreshBeforeValidation: true,
+    });
+    if (resolved?.digest) return finish(resolved);
+    throw new SandboxBaseImageResolutionError(
+      `${options.label || "Sandbox base image"} override '${override}' could not be resolved ` +
+        "to an immutable trusted digest or failed required compatibility checks.",
+    );
   } else {
+    const rootDir = options.rootDir || ROOT;
+    const inputPaths = [options.dockerfilePath, ...(options.inputPaths ?? [])];
+    const requirePinnedRemoteRef = options.requirePinnedRemoteRef === true;
+    const versionTags = getVersionedBaseImageTags(options.rootDir || ROOT, env);
+    const resolveVersionTags = (tags: string[]): SandboxBaseImageResolution | null => {
+      for (const tag of tags) {
+        const imageRef = `${options.imageName}:${tag}`;
+        const resolved = resolvePulledCandidate(
+          options.imageName,
+          imageRef,
+          "version-tag",
+          options,
+          { refreshIfLocalInvalid: true },
+        );
+        if (resolved) return finish(resolved);
+      }
+
+      if (tags.length === 0 || !allowLocalFallback) return null;
+      const local = resolveLocalCandidate(options, true);
+      if (local) return finish(local);
+      throw new SandboxBaseImageResolutionError(
+        `${options.label || "Sandbox base image"} versioned base image ` +
+          `${tags.map((tag) => `${options.imageName}:${tag}`).join(", ")} could not be ` +
+          "resolved or validated, and no compatible local base image could be produced.",
+      );
+    };
+    if (allowLocalFallback && baseImageInputsDirty(rootDir, env, inputPaths)) {
+      return resolveChangedInputs();
+    }
+
+    if (requirePinnedRemoteRef && options.pinnedRemoteRef) {
+      const resolved = resolvePulledCandidate(
+        options.imageName,
+        options.pinnedRemoteRef,
+        "pinned",
+        options,
+        { pinnedRemoteRef: options.pinnedRemoteRef },
+      );
+      if (resolved) return finish(resolved);
+      const local = allowLocalFallback ? resolveLocalCandidate(options) : null;
+      if (local) return finish(local);
+      const validationFailure = options.validationDescription
+        ? `did not pass ${options.validationDescription}`
+        : "did not pass required compatibility checks";
+      const fallbackFailure = allowLocalFallback
+        ? "No compatible local base image could be produced."
+        : "Local base image fallback is disabled for this operation.";
+      throw new SandboxBaseImageResolutionError(
+        `${options.label || "Sandbox base image"} '${options.pinnedRemoteRef}' is required but ` +
+          `could not be pulled or ${validationFailure}. ${fallbackFailure}`,
+      );
+    }
+
+    const versionTagResolution = resolveVersionTags(versionTags);
+    if (versionTagResolution) return versionTagResolution;
+
     for (const tag of getSourceShortShaTags(options.rootDir || ROOT, env)) {
       const imageRef = `${options.imageName}:${tag}`;
       const resolved = resolvePulledCandidate(options.imageName, imageRef, "source-sha", options);
-      if (resolved) return resolved;
+      if (resolved) return finish(resolved);
     }
 
-    if (baseImageInputsChangedSinceMain(options.rootDir || ROOT, env)) {
-      const local = resolveLocalCandidate(options);
-      if (local) return local;
-      // The base Dockerfile changed, so fail closed instead of silently using stale :latest.
-      return {
-        ref: options.localTag,
-        digest: null,
-        source: "local",
-        glibcVersion: null,
-      };
+    if (allowLocalFallback && baseImageInputsChangedSinceMain(rootDir, env, inputPaths)) {
+      return resolveChangedInputs();
     }
+
+    if (options.pinnedRemoteRef) {
+      const resolved = resolvePulledCandidate(
+        options.imageName,
+        options.pinnedRemoteRef,
+        "pinned",
+        options,
+        { pinnedRemoteRef: options.pinnedRemoteRef },
+      );
+      if (resolved) return finish(resolved);
+    }
+
+    const nearestVersionTags = getNearestVersionedBaseImageTags(rootDir, env).filter(
+      (tag) => !versionTags.includes(tag),
+    );
+    const nearestVersionTagResolution = resolveVersionTags(nearestVersionTags);
+    if (nearestVersionTagResolution) return nearestVersionTagResolution;
 
     const latestRef = `${options.imageName}:${SANDBOX_BASE_TAG}`;
     const resolved = resolvePulledCandidate(options.imageName, latestRef, "latest", options);
-    if (resolved) return resolved;
+    if (resolved) return finish(resolved);
   }
 
-  if (options.requireOpenshellSandboxAbi) {
-    return resolveLocalCandidate(options);
+  if (allowLocalFallback && (options.requireOpenshellSandboxAbi || options.validateImage)) {
+    const local = resolveLocalCandidate(options);
+    return local ? finish(local) : null;
   }
   return null;
-}
-
-export function buildLocalBaseTag(prefix: string, rootDir = ROOT, env = process.env): string {
-  const tag = getSourceShortShaTags(rootDir, env)[0] || "local";
-  return `${prefix}:${tag}`;
-}
-
-export function defaultOpenclawBaseDockerfile(rootDir = ROOT): string {
-  return path.join(rootDir, "Dockerfile.base");
 }

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-claude — launch Claude Code INSIDE a tmux session so Moshi can route
+# approve/deny decisions back to the pane (inline phone buttons instead of "respond
+# on <host>"). Moshi's approval round-trip only works when `moshi-hook context`
+# reports kind=tmux (a plain-terminal session is kind=shell → not routable). This
+# wrapper guarantees the routable context so the buttons don't silently regress
+# whenever a session is started outside tmux.
+#
+# Usage:
+#   chad-claude [claude args...]     # new/attach a routable tmux running claude
+#   (already inside tmux → just execs claude, since the context is already routable)
+#
+# Session name via CHAD_CLAUDE_TMUX (default: chad-claude). Attach later from the
+# Moshi phone app / mosh the same way you attach any Moshi tmux session.
+
+set -euo pipefail
+
+# Already routable (inside any tmux) — just run claude; Moshi sees kind=tmux.
+if [ -n "${TMUX:-}" ]; then
+  exec claude "$@"
+fi
+
+command -v tmux >/dev/null 2>&1 || { echo "chad-claude: tmux not found (brew install tmux)" >&2; exit 1; }
+SESSION="${CHAD_CLAUDE_TMUX:-chad-claude}"
+
+# Reattach if the session already exists, else start one that launches claude.
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "chad-claude: attaching existing routable session '$SESSION'" >&2
+  exec tmux attach-session -t "$SESSION"
+fi
+echo "chad-claude: starting routable tmux '$SESSION' (Moshi approve/deny will route here)" >&2
+exec tmux new-session -s "$SESSION" claude "$@"

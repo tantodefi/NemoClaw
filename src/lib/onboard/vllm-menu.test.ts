@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 import { describe, it } from "vitest";
 
-import { buildVllmMenuEntries } from "./vllm-menu";
+import { buildVllmMenuEntries, isManagedVllmDefaultPlatform } from "./vllm-menu";
 
 describe("buildVllmMenuEntries", () => {
   it("returns no entries when nothing is running, no profile, and no opt-in", () => {
@@ -20,11 +20,12 @@ describe("buildVllmMenuEntries", () => {
     assert.deepEqual(entries, []);
   });
 
-  it("returns the running entry when vLLM is reachable on localhost", () => {
+  it("marks the running entry experimental on generic hosts", () => {
     const entries = buildVllmMenuEntries({
       vllmRunning: true,
       vllmProfile: null,
       experimental: false,
+      platform: "linux",
       hasVllmImage: false,
       log: () => {},
       env: {},
@@ -32,6 +33,25 @@ describe("buildVllmMenuEntries", () => {
     assert.equal(entries.length, 1);
     assert.equal(entries[0].key, "vllm");
     assert.match(entries[0].label, /Local vLLM \[experimental\]/);
+    assert.match(entries[0].label, /running/);
+  });
+
+  it.each([
+    { platform: "spark", hostLabel: "Spark" },
+    { platform: "station", hostLabel: "Station" },
+  ] as const)("does not mark the running entry experimental on DGX $hostLabel", ({ platform }) => {
+    const entries = buildVllmMenuEntries({
+      vllmRunning: true,
+      vllmProfile: null,
+      experimental: false,
+      platform,
+      hasVllmImage: false,
+      log: () => {},
+      env: {},
+    });
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].key, "vllm");
+    assert.doesNotMatch(entries[0].label, /experimental/);
     assert.match(entries[0].label, /running/);
   });
 
@@ -79,6 +99,51 @@ describe("buildVllmMenuEntries", () => {
     assert.equal(entries[0].label, "Start vLLM (DGX Station)");
   });
 
+  it("keeps the Deferred label scoped to the pre-admission N1x managed entry (#8574)", () => {
+    const install = buildVllmMenuEntries({
+      vllmRunning: false,
+      vllmProfile: { name: "N1x" },
+      experimental: false,
+      platform: "n1x",
+      hasVllmImage: false,
+      env: {},
+      log: () => {},
+    });
+    const running = buildVllmMenuEntries({
+      vllmRunning: true,
+      vllmProfile: { name: "N1x" },
+      experimental: false,
+      platform: "n1x",
+      hasVllmImage: true,
+      env: {},
+      log: () => {},
+    });
+
+    // N1x readiness rejects the running-server state without explicit managed
+    // intent. If this lower-level helper sees that state in isolation, it must
+    // not mislabel an operator-managed server as the Deferred managed preview.
+    assert.equal(install[0].label, "Install vLLM (N1x) [Deferred preview]");
+    assert.equal(running[0].label, "Local vLLM (localhost:8000) — running");
+    assert.doesNotMatch(running[0].label, /Deferred preview/);
+    assert.doesNotMatch(running[0].label, /suggested/);
+  });
+
+  it("keeps the N1x managed preview selected when vLLM already occupies port 8000 (#8574)", () => {
+    const entries = buildVllmMenuEntries({
+      vllmRunning: true,
+      vllmProfile: { name: "N1x" },
+      experimental: false,
+      platform: "n1x",
+      hasVllmImage: true,
+      env: { NEMOCLAW_PROVIDER: "install-vllm" },
+      log: () => {},
+    });
+
+    assert.deepEqual(entries, [
+      { key: "install-vllm", label: "Start vLLM (N1x) [Deferred preview]" },
+    ]);
+  });
+
   it("keeps generic Linux managed vLLM behind EXPERIMENTAL", () => {
     const entries = buildVllmMenuEntries({
       vllmRunning: false,
@@ -118,6 +183,38 @@ describe("buildVllmMenuEntries", () => {
     assert.match(entries[0].label, /no profile detected/);
   });
 
+  it("rejects explicit managed vLLM before install when Docker is absent (#10891)", () => {
+    const logs: string[] = [];
+    const entries = buildVllmMenuEntries({
+      vllmRunning: false,
+      vllmProfile: { name: "DGX Spark" },
+      experimental: false,
+      platform: "spark",
+      hasVllmImage: false,
+      dockerAvailable: false,
+      env: { NEMOCLAW_PROVIDER: "install-vllm" },
+      log: (message) => logs.push(message),
+    });
+
+    assert.deepEqual(entries, []);
+    assert.deepEqual(logs, ["  Managed vLLM install/start requires Docker on PATH."]);
+  });
+
+  it("omits interactive managed vLLM before install when Docker is absent (#10891)", () => {
+    const entries = buildVllmMenuEntries({
+      vllmRunning: false,
+      vllmProfile: { name: "DGX Spark" },
+      experimental: false,
+      platform: "spark",
+      hasVllmImage: false,
+      dockerAvailable: false,
+      env: {},
+      log: () => {},
+    });
+
+    assert.deepEqual(entries, []);
+  });
+
   it("does NOT surface install-vllm when no profile matches and the user did not explicitly opt in", () => {
     const entries = buildVllmMenuEntries({
       vllmRunning: false,
@@ -147,6 +244,25 @@ describe("buildVllmMenuEntries", () => {
     assert.match(logs[0], /selecting the running instance/);
   });
 
+  it("preserves managed install intent when a running server conflicts with GPU selection", () => {
+    const logs: string[] = [];
+    const entries = buildVllmMenuEntries({
+      vllmRunning: true,
+      vllmProfile: { name: "DGX Station" },
+      experimental: false,
+      platform: "station",
+      hasVllmImage: true,
+      env: {
+        NEMOCLAW_PROVIDER: "install-vllm",
+        NEMOCLAW_VLLM_GPU_DEVICE: "2",
+      },
+      log: (message) => logs.push(message),
+    });
+
+    assert.equal(entries[0].key, "install-vllm");
+    assert.deepEqual(logs, []);
+  });
+
   it("does not log the override note when the user did not request install-vllm", () => {
     const logs: string[] = [];
     buildVllmMenuEntries({
@@ -158,5 +274,19 @@ describe("buildVllmMenuEntries", () => {
       log: (m) => logs.push(m),
     });
     assert.deepEqual(logs, []);
+  });
+});
+
+describe("isManagedVllmDefaultPlatform (#7293)", () => {
+  it("is true for the DGX managed-vLLM default platforms", () => {
+    assert.equal(isManagedVllmDefaultPlatform("spark"), true);
+    assert.equal(isManagedVllmDefaultPlatform("station"), true);
+  });
+
+  it("is false for other or missing platforms", () => {
+    assert.equal(isManagedVllmDefaultPlatform("linux"), false);
+    assert.equal(isManagedVllmDefaultPlatform("jetson"), false);
+    assert.equal(isManagedVllmDefaultPlatform(null), false);
+    assert.equal(isManagedVllmDefaultPlatform(undefined), false);
   });
 });

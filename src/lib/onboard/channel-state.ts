@@ -2,25 +2,41 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as onboardSession from "../state/onboard-session";
-import * as registry from "../state/registry";
+import {
+  getRegistrySandboxMessagingAuthority,
+  readMessagingPlanFromEnv,
+} from "./messaging-channel-setup";
+import {
+  type RegistryMessagingAuthority,
+  resolveMessagingPlanAuthority,
+} from "../messaging/plan-authority";
+import { getDisabledChannelsFromPlan } from "./messaging-plan-session";
 
-type DisabledChannelsSession = Pick<onboardSession.Session, "disabledChannels">;
+type DisabledChannelsSession = Pick<onboardSession.Session, "messagingPlan" | "sandboxName">;
 
 export type DisabledChannelsDeps = {
   loadSession: () => DisabledChannelsSession | null;
-  getRegistryDisabledChannels: (sandboxName: string) => string[];
+  readMessagingPlanFromEnv?: () => onboardSession.Session["messagingPlan"];
+  getRegistryMessagingAuthority(sandboxName: string): RegistryMessagingAuthority;
 };
 
 export function resolveDisabledChannels(
   sandboxName: string,
   deps?: DisabledChannelsDeps,
 ): string[] {
-  // `rebuild` destroys the registry entry before `onboard --resume` reaches
-  // createSandbox, so the session mirror is authoritative when present.
-  const sessionDisabledChannels = (deps?.loadSession ?? onboardSession.loadSession)()
-    ?.disabledChannels;
-  if (Array.isArray(sessionDisabledChannels)) {
-    return sessionDisabledChannels;
-  }
-  return (deps?.getRegistryDisabledChannels ?? registry.getDisabledChannels)(sandboxName);
+  const registry = (deps?.getRegistryMessagingAuthority ?? getRegistrySandboxMessagingAuthority)(
+    sandboxName,
+  );
+  const session = registry.authoritative
+    ? null
+    : (deps?.loadSession ?? onboardSession.loadSession)();
+  const result = resolveMessagingPlanAuthority({
+    sandboxName,
+    registry,
+    stagedPlan: registry.authoritative
+      ? null
+      : (deps?.readMessagingPlanFromEnv ?? readMessagingPlanFromEnv)(),
+    sessionPlan: session?.sandboxName === sandboxName ? session.messagingPlan : null,
+  });
+  return getDisabledChannelsFromPlan(result.plan);
 }

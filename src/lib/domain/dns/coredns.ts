@@ -7,11 +7,18 @@ export function dockerHostRuntime(dockerHost: string | undefined): ContainerRunt
   if (!dockerHost) return null;
   if (
     dockerHost.includes("/.colima/default/docker.sock") ||
-    dockerHost.includes("/.config/colima/default/docker.sock")
+    dockerHost.includes("/.config/colima/default/docker.sock") ||
+    // Some Colima profiles place the socket at the top level rather than under
+    // `default/` (#3503). The shared socket candidate list offers that layout,
+    // so the runtime label has to recognise it too.
+    dockerHost.includes("/.colima/docker.sock")
   ) {
     return "colima";
   }
-  if (dockerHost.includes("/podman/machine/podman.sock") || dockerHost.includes("/podman/podman.sock")) {
+  if (
+    dockerHost.includes("/podman/machine/podman.sock") ||
+    dockerHost.includes("/podman/podman.sock")
+  ) {
     return "podman";
   }
   if (dockerHost.includes("/.docker/run/docker.sock")) return "docker-desktop";
@@ -23,7 +30,8 @@ export function firstNonLoopbackNameserver(resolvConf: string): string | null {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const [kind, value] = trimmed.split(/\s+/);
-    const isLoopback = value === "::1" || value === "localhost" || Boolean(value?.startsWith("127."));
+    const isLoopback =
+      value === "::1" || value === "localhost" || Boolean(value?.startsWith("127."));
     if (kind === "nameserver" && value && !isLoopback) return value;
   }
   return null;

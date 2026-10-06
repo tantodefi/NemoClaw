@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.nemoclaw.chad-failreport</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/r/.nemoclaw/source/scripts/chad-smithers/run-workflow.sh</string>
+    <string>workflows/fail-only-report.jsx</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/Users/r/.local/bin:/Users/r/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <!-- Hourly. Green runs stay silent; an LLM turn is spent only on a red check. -->
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/r/.nemoclaw/openwebui/chad-failreport.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/r/.nemoclaw/openwebui/chad-failreport.err.log</string>
+</dict>
+</plist>

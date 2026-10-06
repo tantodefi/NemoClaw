@@ -1,11 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { redactProxyCredentials, warnIfHostProxyMissesLoopback } from "./http-proxy-preflight";
 
-describe("redactProxyCredentials (#2616)", () => {
+function withStderrColorDepth<T>(colorDepth: number, callback: () => T): T {
+  const stderr = Object.assign(Object.create(process.stderr), {
+    getColorDepth: () => colorDepth,
+    isTTY: true,
+  }) as typeof process.stderr;
+  const getStderr = vi.spyOn(process, "stderr", "get").mockReturnValue(stderr);
+  vi.stubEnv("NO_COLOR", "");
+  try {
+    return callback();
+  } finally {
+    getStderr.mockRestore();
+    vi.unstubAllEnvs();
+  }
+}
+
+describe("redactProxyCredentials", () => {
   it("returns plain proxy URLs unchanged", () => {
     expect(redactProxyCredentials("http://127.0.0.1:8118")).toBe("http://127.0.0.1:8118");
     expect(redactProxyCredentials("http://corp-proxy.example.com:3128")).toBe(
@@ -35,7 +50,7 @@ describe("redactProxyCredentials (#2616)", () => {
   });
 });
 
-describe("warnIfHostProxyMissesLoopback (#2616)", () => {
+describe("warnIfHostProxyMissesLoopback", () => {
   it("does not warn when no HTTP_PROXY is set", () => {
     const lines: string[] = [];
     const fired = warnIfHostProxyMissesLoopback({}, (line) => lines.push(line));
@@ -43,49 +58,61 @@ describe("warnIfHostProxyMissesLoopback (#2616)", () => {
     expect(lines).toEqual([]);
   });
 
-  it("does not warn when NO_PROXY already includes localhost", () => {
+  it("does not warn when NO_PROXY includes loopback and the managed inference hostname", () => {
     const lines: string[] = [];
     const fired = warnIfHostProxyMissesLoopback(
-      { http_proxy: "http://127.0.0.1:8118", NO_PROXY: "localhost,127.0.0.1" },
+      {
+        http_proxy: "http://127.0.0.1:8118",
+        NO_PROXY: "localhost,127.0.0.1,inference.local",
+      },
       (line) => lines.push(line),
     );
     expect(fired).toBe(false);
     expect(lines).toEqual([]);
   });
 
-  it("warns when NO_PROXY only has localhost (127.0.0.1 still proxied) (CodeRabbit #3801)", () => {
+  it("warns when NO_PROXY has loopback but is missing the managed inference hostname", () => {
+    const lines: string[] = [];
+    const fired = warnIfHostProxyMissesLoopback(
+      { http_proxy: "http://127.0.0.1:8118", NO_PROXY: "localhost,127.0.0.1" },
+      (line) => lines.push(line),
+    );
+    expect(fired).toBe(true);
+    expect(lines.join("\n")).toContain("inference.local");
+  });
+
+  it("warns when NO_PROXY only has localhost (127.0.0.1 still proxied)", () => {
     const lines: string[] = [];
     const fired = warnIfHostProxyMissesLoopback(
       { http_proxy: "http://127.0.0.1:8118", NO_PROXY: "localhost" },
       (line) => lines.push(line),
     );
     expect(fired).toBe(true);
-    expect(lines.join("\n")).toContain("export NO_PROXY=localhost,127.0.0.1");
+    expect(lines.join("\n")).toContain("export NO_PROXY=localhost,127.0.0.1,inference.local");
   });
 
-  it("warns when NO_PROXY only has 127.0.0.1 (localhost still proxied) (CodeRabbit #3801)", () => {
+  it("warns when NO_PROXY only has 127.0.0.1 (localhost still proxied)", () => {
     const lines: string[] = [];
     const fired = warnIfHostProxyMissesLoopback(
       { http_proxy: "http://127.0.0.1:8118", NO_PROXY: "127.0.0.1" },
       (line) => lines.push(line),
     );
     expect(fired).toBe(true);
-    expect(lines.join("\n")).toContain("export NO_PROXY=localhost,127.0.0.1");
+    expect(lines.join("\n")).toContain("export NO_PROXY=localhost,127.0.0.1,inference.local");
   });
 
-  it("warns when HTTP_PROXY is set without NO_PROXY=localhost", () => {
+  it("warns when HTTP_PROXY is set without NO_PROXY", () => {
     const lines: string[] = [];
-    const fired = warnIfHostProxyMissesLoopback(
-      { http_proxy: "http://127.0.0.1:8118" },
-      (line) => lines.push(line),
+    const fired = warnIfHostProxyMissesLoopback({ http_proxy: "http://127.0.0.1:8118" }, (line) =>
+      lines.push(line),
     );
     expect(fired).toBe(true);
     expect(lines.join("\n")).toContain("HTTP_PROXY/http_proxy is set");
     expect(lines.join("\n")).toContain("Detected proxy: http://127.0.0.1:8118");
-    expect(lines.join("\n")).toContain("export NO_PROXY=localhost,127.0.0.1");
+    expect(lines.join("\n")).toContain("export NO_PROXY=localhost,127.0.0.1,inference.local");
   });
 
-  it("redacts credentials in the proxy URL it logs (CodeRabbit #3801)", () => {
+  it("redacts credentials in the proxy URL it logs", () => {
     const lines: string[] = [];
     warnIfHostProxyMissesLoopback(
       { http_proxy: "http://alice:s3cret@proxy.example.com:3128" },
@@ -98,13 +125,42 @@ describe("warnIfHostProxyMissesLoopback (#2616)", () => {
     expect(joined).toContain("proxy.example.com:3128");
   });
 
+  it("colors only the warning line on color-capable stderr and keeps proxy credentials redacted", () => {
+    withStderrColorDepth(24, () => {
+      const lines: string[] = [];
+      warnIfHostProxyMissesLoopback(
+        { http_proxy: "http://alice:s3cret@proxy.example.com:3128" },
+        (line) => lines.push(line),
+      );
+
+      expect(lines[0]).toBe(
+        "  \x1b[33m⚠ HTTP_PROXY/http_proxy is set without " +
+          "NO_PROXY=localhost,127.0.0.1,inference.local.\x1b[39m",
+      );
+      expect(lines.slice(1).join("\n")).not.toContain("\x1b[");
+      expect(lines.join("\n")).not.toContain("alice");
+      expect(lines.join("\n")).not.toContain("s3cret");
+      expect(lines.join("\n")).toContain("****@proxy.example.com:3128");
+    });
+  });
+
   it("respects uppercase HTTP_PROXY too", () => {
     const lines: string[] = [];
-    const fired = warnIfHostProxyMissesLoopback(
-      { HTTP_PROXY: "http://corp-proxy:3128" },
-      (line) => lines.push(line),
+    const fired = warnIfHostProxyMissesLoopback({ HTTP_PROXY: "http://corp-proxy:3128" }, (line) =>
+      lines.push(line),
     );
     expect(fired).toBe(true);
     expect(lines.join("\n")).toContain("corp-proxy:3128");
+  });
+
+  it("surfaces the managed inference hostname in the suggested NO_PROXY export", () => {
+    const lines: string[] = [];
+    warnIfHostProxyMissesLoopback({ http_proxy: "http://127.0.0.1:8118" }, (line) =>
+      lines.push(line),
+    );
+    const joined = lines.join("\n");
+    expect(joined).toContain("inference.local");
+    expect(joined).toContain("export NO_PROXY=localhost,127.0.0.1,inference.local");
+    expect(joined).toContain("export no_proxy=localhost,127.0.0.1,inference.local");
   });
 });

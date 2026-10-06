@@ -1,0 +1,135 @@
+{
+  "$schema": "./model-registry.schema.json",
+  "_comment": "Single source of truth for per-model limits. Consumed by generate-openclaw-config.py, Dockerfile defaults, and (future) routing layer. Update here, regenerate downstream artifacts.",
+  "_last_verified": "2026-04-30",
+  "_roster_comment": "Fusion-roster models flagged _estimated:true (added 2026-06-19) carry CONSERVATIVE context/output estimates: NVIDIA's /v1/models API exposes no limits (only id/object/created/owned_by), so preflight/clamp treat them as a SAFE-LOW ceiling that can't over-request. Verify against each model card and clear _estimated when confirmed.",
+  "models": {
+    "moonshotai/kimi-k2.5": {
+      "displayName": "Kimi K2.5 (DEPRECATED 2026-04-29)",
+      "contextWindow": 262144,
+      "maxOutputTokens": 32768,
+      "reasoningSupported": true,
+      "reasoningSafe": false,
+      "reasoningSafeReason": "K2.5 emits tool calls in a format that the openclaw harness can't round-trip when reasoning=true; agent loops on empty toolUse stops. See project_chad_cron_pattern memory.",
+      "providers": ["nvidia-prod-gateway"],
+      "tier": "frontier",
+      "modality": ["text"],
+      "_deprecated": "Removed from NVIDIA Endpoints catalog 2026-04-29 (returns 410 GONE on inference). Upstream NemoClaw PR #2735 dropped it from CLOUD_MODEL_OPTIONS. Entry retained for historical task-profiles inheritance comments."
+    },
+    "nvidia/nemotron-3-super-120b-a12b": {
+      "displayName": "Nemotron 3 Super 120B",
+      "contextWindow": 262144,
+      "maxOutputTokens": 32768,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["nvidia-prod"],
+      "tier": "frontier",
+      "modality": ["text"],
+      "_note": "Cheap-tier cloud model since 2026-04-30 (replacing the deprecated Kimi K2.5). MoE: ~120B total / ~12B active. Hosted on integrate.api.nvidia.com via the NVIDIA_API_KEY. Fast; used for single-turn cron/draft work."
+    },
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+      "displayName": "Nemotron 3 Ultra 550B",
+      "contextWindow": 262144,
+      "maxOutputTokens": 32768,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "reasoningSafeReason": "VERIFIED 2026-06-13: with reasoning ON (system 'detailed thinking on') Ultra emits a STANDARD OpenAI tool_call with valid-JSON args and completes a 2-turn round-trip (finish_reason=stop, answer reflected the tool result) against integrate.api.nvidia.com. This is the exact round-trip Kimi K2.5 failed (K2.5 used a non-standard tool-call format) — Ultra does not have that defect. Test: scripts/chad-smithers/ harness-retest, results in docs/design/smithers-moshi-integration.md §harness-retest.",
+      "providers": ["nvidia-prod"],
+      "tier": "frontier",
+      "modality": ["text"],
+      "_note": "Newest + most capable NVIDIA open model (released 2026-06-04, Computex). 550B total / ~55B active, hybrid Mamba-Transformer MoE built for long-running autonomous agents (orchestration, coding, deep research). Hosted on integrate.api.nvidia.com via NVIDIA_API_KEY, OpenAI-compatible, free. Capable-tier default for the Smithers router (scripts/chad-smithers)."
+    },
+    "google/gemma-3-4b": {
+      "displayName": "Gemma 3 4B (lmstudio fallback)",
+      "contextWindow": 131072,
+      "maxOutputTokens": 8192,
+      "reasoningSupported": false,
+      "reasoningSafe": false,
+      "providers": ["lmstudio"],
+      "tier": "edge",
+      "modality": ["text"],
+      "_note": "Local fallback, Jetson-class. Ceiling for cron tasks running offline."
+    },
+    "claude-opus-4-7": {
+      "displayName": "Claude Opus 4.7",
+      "contextWindow": 200000,
+      "maxOutputTokens": 64000,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["anthropic"],
+      "tier": "frontier",
+      "modality": ["text", "vision"],
+      "requiresAuthContext": true,
+      "_note": "Premium endpoint. Hits Anthropic Messages API directly. Routed via chad-premium-client; access gated by chad-auth-context (dashboard senderId, terminal token, tantodefi@proton.me sender, or @supachad mention)."
+    },
+    "claude-sonnet-4-6": {
+      "displayName": "Claude Sonnet 4.6",
+      "contextWindow": 200000,
+      "maxOutputTokens": 64000,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["anthropic"],
+      "tier": "balanced",
+      "modality": ["text", "vision"],
+      "requiresAuthContext": true,
+      "_note": "Default premium model for /premium and chad-premium. Cheaper than Opus, still frontier-grade reasoning."
+    },
+    "claude-haiku-4-5-20251001": {
+      "displayName": "Claude Haiku 4.5",
+      "contextWindow": 200000,
+      "maxOutputTokens": 64000,
+      "reasoningSupported": true,
+      "reasoningSafe": true,
+      "providers": ["anthropic"],
+      "tier": "fast",
+      "modality": ["text", "vision"],
+      "requiresAuthContext": true,
+      "_note": "Used by chad-premium-client --probe for cheap connectivity check."
+    },
+
+    "openai/gpt-oss-120b": {
+      "displayName": "GPT-OSS 120B", "contextWindow": 131072, "maxOutputTokens": 32768,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "deepseek-ai/deepseek-v4-pro": {
+      "displayName": "DeepSeek V4 Pro", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "deepseek-ai/deepseek-v4-flash": {
+      "displayName": "DeepSeek V4 Flash", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "balanced", "modality": ["text"], "_estimated": true
+    },
+    "meta/llama-4-maverick-17b-128e-instruct": {
+      "displayName": "Llama 4 Maverick 17B-128E", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": false, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true,
+      "_note": "Llama 4 supports a very large context upstream (≫131072); conservative serve-side estimate used until verified."
+    },
+    "moonshotai/kimi-k2.6": {
+      "displayName": "Kimi K2.6", "contextWindow": 262144, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true,
+      "_note": "Successor to the deprecated K2.5. Assumed reasoningSafe under Smithers' own tool loop (NOT the openclaw harness that K2.5 broke); verify before any openclaw-side use."
+    },
+    "qwen/qwen3.5-397b-a17b": {
+      "displayName": "Qwen 3.5 397B-A17B", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "z-ai/glm-5.1": {
+      "displayName": "GLM 5.1", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "minimaxai/minimax-m3": {
+      "displayName": "MiniMax M3", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "frontier", "modality": ["text"], "_estimated": true
+    },
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+      "displayName": "Nemotron 3 Nano Omni 30B-A3B (reasoning)", "contextWindow": 131072, "maxOutputTokens": 16384,
+      "reasoningSupported": true, "reasoningSafe": true, "providers": ["nvidia-prod"], "tier": "balanced", "modality": ["text"], "_estimated": true
+    }
+  },
+  "defaults": {
+    "primary": "nvidia/nemotron-3-super-120b-a12b",
+    "fallback": "google/gemma-3-4b",
+    "outsource": "claude-opus-4-7",
+    "unknownModel": { "contextWindow": 131072, "maxOutputTokens": 8192, "_note": "Conservative fallback for any model not explicitly listed — preflight/clamp use this so an unknown id is still bounded." }
+  }
+}

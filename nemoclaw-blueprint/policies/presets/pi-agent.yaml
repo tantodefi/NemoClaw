@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: pi-agent
+  description: "Pi coding agent — NVIDIA inference endpoints for the pi subagent binary"
+
+network_policies:
+  # ── Pi coding agent inference ──────────────────────────────────
+  # The pi binary (@mariozechner/pi-coding-agent) uses the same NVIDIA
+  # endpoints as the base nvidia policy, but the base policy only allows
+  # the openclaw/claude binaries. This preset adds the pi binary and
+  # node (pi runs on Node.js) so the coding agent subagent can reach
+  # NVIDIA inference.
+  pi_agent_nvidia:
+    name: pi_agent_nvidia
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/pi }
+      - { path: "/sandbox/node_modules/.bin/pi" }
+      - { path: "/sandbox/**/node_modules/.bin/pi" }
+      - { path: "/sandbox/.local/bin/pi" }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }

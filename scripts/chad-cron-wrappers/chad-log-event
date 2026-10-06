@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-log-event — append one structured event to today's memory.
+#
+# Writes two artifacts:
+#   1. <memory>/events-<UTC-date>.jsonl  — one JSON object per line
+#                                          (queryable, ingested into the brain
+#                                          as the events/<date> page)
+#   2. <memory>/<UTC-date>.md            — one human-readable line under the
+#                                          "## Events" heading (preserves the
+#                                          existing daily journal habit)
+#
+# Usage:
+#   chad-log-event <kind> <source> <summary> [ref]
+#
+# Args:
+#   kind     short event tag — mail-in, mail-sent, draft, action, error, cron, …
+#   source   originator/wrapper that fired the event (chad-mail-check, etc.)
+#   summary  one-line human description; quote it
+#   ref      optional reference (slug, message-id, log path)
+#
+# Example:
+#   chad-log-event mail-in chad-mail-check \
+#     "tjcooke@protonmail.com: Squat depth question" \
+#     "msg-id:abc123"
+
+set -euo pipefail
+
+if [ "$#" -lt 3 ]; then
+  echo "usage: chad-log-event <kind> <source> <summary> [ref]" >&2
+  exit 64
+fi
+
+. /usr/local/share/chad/_chad-paths.sh
+
+KIND="$1"
+SOURCE="$2"
+SUMMARY="$3"
+REF="${4:-}"
+
+TODAY="$(date -u +%Y-%m-%d)"
+TS="$(date -u +%FT%TZ)"
+EVENTS_FILE="${CHAD_MEMORY_DIR}/events-${TODAY}.jsonl"
+JOURNAL_FILE="${CHAD_MEMORY_DIR}/${TODAY}.md"
+
+mkdir -p "$CHAD_MEMORY_DIR"
+
+# Use python3 for json.dumps so embedded quotes/newlines in summary survive.
+python3 - "$TS" "$KIND" "$SOURCE" "$SUMMARY" "$REF" >>"$EVENTS_FILE" <<'PY'
+import json, sys
+ts, kind, source, summary, ref = sys.argv[1:6]
+obj = {"ts": ts, "kind": kind, "source": source, "summary": summary}
+if ref:
+    obj["ref"] = ref
+print(json.dumps(obj, ensure_ascii=False))
+PY
+
+# Append a one-line summary to the daily journal under "## Events" so the
+# existing dream cycle (which puts memory/<date> into the brain) carries the
+# human-readable thread of the day.
+if [ ! -f "$JOURNAL_FILE" ]; then
+  printf '# %s\n' "$TODAY" >"$JOURNAL_FILE"
+fi
+if ! grep -q '^## Events$' "$JOURNAL_FILE" 2>/dev/null; then
+  printf '\n## Events\n\n' >>"$JOURNAL_FILE"
+fi
+printf -- '- %s · **%s** · %s — %s%s\n' \
+  "$TS" "$KIND" "$SOURCE" "$SUMMARY" \
+  "${REF:+ (ref: $REF)}" \
+  >>"$JOURNAL_FILE"

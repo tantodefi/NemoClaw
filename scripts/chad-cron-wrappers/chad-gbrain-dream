@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-gbrain-dream — Daily gbrain maintenance + workspace sync.
+#
+# Replaces the multi-step prompt previously sent to the embedded model.
+# The cron prompt now just calls this and reports its output.
+#
+# Steps:
+#   1. Ensure today's memory file exists
+#   2. Sync workspace docs into the brain (parallel `gbrain put`)
+#   3. gbrain embed --stale (vectorize new content)
+#   4. gbrain extract links --source db
+#   5. gbrain extract timeline --source db
+#   6. gbrain doctor
+#   7. Append "## Brain maintenance" summary to today's memory file
+#
+# Designed to finish in well under 60s so the embedded model's exec tool
+# returns a "completed" status (not "still running"). All gbrain put calls
+# run in parallel; each is hard-capped via `timeout` so a slow embedding
+# call can't hang the whole job.
+
+set -uo pipefail
+
+WORKSPACE="/sandbox/.openclaw/workspace"
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+LOG="$(mktemp)"
+RESULTS="$(mktemp -d)"
+TS="$(date -u +%FT%TZ)"
+PUT_TIMEOUT=20
+
+put_doc_async() {
+  local name="$1"
+  local src="${WORKSPACE}/${name}.md"
+  local slug
+  slug="system/$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+  local result_file="${RESULTS}/${name}"
+  if [ ! -f "$src" ]; then
+    echo "skipped (missing): ${slug}" >"$result_file"
+    return 0
+  fi
+  if timeout "$PUT_TIMEOUT" gbrain put "$slug" --content "$(cat "$src")" >>"$LOG" 2>&1; then
+    echo "ok: ${slug}" >"$result_file"
+  else
+    echo "FAILED: ${slug}" >"$result_file"
+  fi
+}
+
+run_step() {
+  local label="$1"
+  shift
+  if timeout 60 "$@" >>"$LOG" 2>&1; then
+    echo "${label}: ok"
+  else
+    echo "${label}: FAILED (exit $?)"
+  fi
+}
+
+# Fire off all workspace puts in parallel.
+for doc in SOUL USER AGENTS MEMORY HEARTBEAT TOOLS EMAIL-POLICY IDENTITY; do
+  put_doc_async "$doc" &
+done
+
+# Today's memory log (read its current content before any wrapper-write happens below).
+today="$(basename "$MEMORY_FILE" .md)"
+(
+  if timeout "$PUT_TIMEOUT" gbrain put "memory/${today}" --content "$(cat "$MEMORY_FILE")" >>"$LOG" 2>&1; then
+    echo "ok: memory/${today}" >"${RESULTS}/__memory"
+  else
+    echo "FAILED: memory/${today}" >"${RESULTS}/__memory"
+  fi
+) &
+
+# Today's structured event log — a parallel JSONL stream of cron + agent
+# actions. Ingesting it as its own brain page keeps the events/<date> slug
+# queryable independently of the human journal.
+EVENTS_FILE="${WORKSPACE}/memory/events-${today}.jsonl"
+(
+  if [ -s "$EVENTS_FILE" ]; then
+    if timeout "$PUT_TIMEOUT" gbrain put "events/${today}" --content "$(cat "$EVENTS_FILE")" >>"$LOG" 2>&1; then
+      echo "ok: events/${today}" >"${RESULTS}/__events"
+    else
+      echo "FAILED: events/${today}" >"${RESULTS}/__events"
+    fi
+  else
+    echo "skipped (no events): events/${today}" >"${RESULTS}/__events"
+  fi
+) &
+
+wait
+
+{
+  echo ""
+  echo "## Brain maintenance — ${TS}"
+  echo ""
+  echo "### Workspace sync"
+  for f in "$RESULTS"/*; do
+    echo "  $(cat "$f")"
+  done
+  echo ""
+  echo "### Maintenance"
+  run_step "extract timeline" gbrain extract timeline --source db
+  echo ""
+  echo "### Doctor"
+  timeout 10 gbrain doctor 2>&1 | tail -3 || echo "doctor: FAILED or timed out"
+} >>"$MEMORY_FILE"
+
+# Detach slow steps. embed --stale walks all pages (~1s/page over 1000+);
+# extract links is LLM-driven (60s+). They write their own logs and the
+# next dream cycle picks up wherever they left off. nohup + disown so they
+# survive shell exit.
+TS_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
+EMBED_LOG="/tmp/chad-gbrain-embed-${TS_TAG}.log"
+LINK_LOG="/tmp/chad-gbrain-extract-links-${TS_TAG}.log"
+nohup bash -c "gbrain embed --stale" >"$EMBED_LOG" 2>&1 </dev/null &
+disown 2>/dev/null || true
+nohup bash -c "gbrain extract links --source db" >"$LINK_LOG" 2>&1 </dev/null &
+disown 2>/dev/null || true
+{
+  echo "embed --stale: detached (log: ${EMBED_LOG})"
+  echo "extract links: detached (log: ${LINK_LOG})"
+} >>"$MEMORY_FILE"
+
+# ── Dream digest ────────────────────────────────────────────────────
+# Surface "what changed in the brain since yesterday" so the morning
+# email-check + signal-detector pass can actually reason against fresh
+# state. Without this, dreams are write-only — every day starts blind
+# to yesterday's deltas.
+#
+# The digest writes to a separate file (memory/dream-digest-<date>.md)
+# so signal-detector picks it up via mtime-sort without re-parsing the
+# full per-day journal. If gbrain doctor reports anomalies (warnings or
+# errors), they land in feedback_brain_health_<date>.md to trip the
+# self-improve signal feed.
+DIGEST_FILE="${WORKSPACE}/memory/dream-digest-${today}.md"
+HEALTH_FILE="${WORKSPACE}/memory/feedback_brain_health_${today}.md"
+{
+  echo "# Dream digest — ${today}"
+  echo ""
+  echo "_Auto-generated by chad-gbrain-dream at ${TS}._"
+  echo ""
+  echo "## Yesterday → today"
+  echo ""
+  yesterday="$(date -u -d 'yesterday' +%Y-%m-%d 2>/dev/null \
+               || date -u -v-1d +%Y-%m-%d 2>/dev/null \
+               || echo '')"
+  if [ -n "$yesterday" ]; then
+    echo "Pages added/updated since ${yesterday}:"
+    # gbrain doesn't expose `--since`; list newest and post-filter for
+    # date-suffixed slugs >= yesterday, plus every chat/<uuid> page
+    # (they were upserted by chad-webui-ingest in the last 25h).
+    timeout 10 gbrain list --limit 500 2>/dev/null \
+      | awk -F'\t' -v y="$yesterday" '
+          $1 ~ "^memory/" || $1 ~ "^events/" {
+            d = $1; sub("^[^/]*/", "", d)
+            if (d >= y) print "  - " $1
+          }
+          $1 ~ "^chat/" { print "  - " $1 }
+        ' | head -30 \
+      || echo "_(gbrain list unavailable)_"
+  else
+    echo "_(date arithmetic unavailable on this host)_"
+  fi
+  echo ""
+  echo "## Doctor"
+  echo ""
+  echo '```'
+  timeout 10 gbrain doctor 2>&1 | tail -25 || echo "doctor: FAILED or timed out"
+  echo '```'
+  echo ""
+  echo "## Stats"
+  echo ""
+  echo '```'
+  timeout 5 gbrain stats 2>&1 | head -15 || echo "stats: FAILED"
+  echo '```'
+  echo ""
+  # Embed coverage — surface the Embedded/Chunks ratio so a silently-stalled
+  # `gbrain embed --stale` background job is visible the next morning.
+  echo "## Embed coverage"
+  echo ""
+  STATS_RAW="$(timeout 5 gbrain stats 2>/dev/null || true)"
+  STATS_CHUNKS="$(printf '%s\n' "$STATS_RAW" | awk '/^Chunks:/ {print $2; exit}')"
+  STATS_EMBEDDED="$(printf '%s\n' "$STATS_RAW" | awk '/^Embedded:/ {print $2; exit}')"
+  if [ -n "$STATS_CHUNKS" ] && [ -n "$STATS_EMBEDDED" ] && [ "$STATS_CHUNKS" -gt 0 ] 2>/dev/null; then
+    PCT="$(awk -v e="$STATS_EMBEDDED" -v c="$STATS_CHUNKS" 'BEGIN {printf "%.1f", (e/c)*100}')"
+    STALE="$(( STATS_CHUNKS - STATS_EMBEDDED ))"
+    if awk -v p="$PCT" 'BEGIN {exit !(p < 95.0)}'; then
+      echo "- ⚠ Embedded ${STATS_EMBEDDED}/${STATS_CHUNKS} chunks (${PCT}%). ${STALE} stale — \`gbrain embed --stale\` may be falling behind."
+      EMBED_STALE="true"
+    else
+      echo "- ✓ Embedded ${STATS_EMBEDDED}/${STATS_CHUNKS} chunks (${PCT}%)."
+      EMBED_STALE="false"
+    fi
+  else
+    echo "- _(stats parse failed; raw: $(printf '%s' "$STATS_RAW" | head -1))_"
+    EMBED_STALE="unknown"
+  fi
+} >"$DIGEST_FILE"
+
+# Stale-embed feedback file — parallel to the brain_health one, so
+# chad-self-improve and signal-detector can flag recurring drift.
+if [ "${EMBED_STALE:-false}" = "true" ]; then
+  STALE_FILE="${WORKSPACE}/memory/feedback_embed_staleness_${today}.md"
+  {
+    echo "# Embed staleness — ${today}"
+    echo ""
+    echo "_Auto-generated by chad-gbrain-dream when Embedded/Chunks < 95%._"
+    echo ""
+    echo "- Embedded: ${STATS_EMBEDDED} / ${STATS_CHUNKS} (${PCT}%)"
+    echo "- Stale chunks: ${STALE}"
+    echo "- Embed log: ${EMBED_LOG}"
+    echo ""
+    echo "If this recurs across multiple days, raise the detached \`gbrain embed --stale\`"
+    echo "timeout, run it more frequently, or investigate why it isn't catching up."
+  } >"$STALE_FILE"
+fi
+
+# If doctor reports any [WARN] or [FAIL] lines, mirror them into a
+# feedback memory file. chad-self-improve picks up feedback_*.md as
+# existing rules, and the *researcher* is told to look for repeating
+# brain-health issues across days.
+if timeout 10 gbrain doctor 2>&1 | grep -qE '\[(WARN|FAIL|ERROR)\]'; then
+  {
+    echo "# Brain health — ${today}"
+    echo ""
+    echo "_Auto-generated by chad-gbrain-dream when gbrain doctor surfaced WARN/FAIL/ERROR lines._"
+    echo ""
+    echo '```'
+    timeout 10 gbrain doctor 2>&1 | grep -E '\[(WARN|FAIL|ERROR)\]' || true
+    echo '```'
+    echo ""
+    echo "If this file recurs across multiple days, the next chad-self-improve run"
+    echo "will surface it as a proposal."
+  } >"$HEALTH_FILE"
+fi
+
+rm -rf "$RESULTS" "$LOG"
+echo "gbrain dream complete → ${MEMORY_FILE}, digest → ${DIGEST_FILE}"

@@ -156,7 +156,7 @@ JSON
   log "[cli] comparing: $NODE bin/nemoclaw.js --dump-commands"
   # shellcheck disable=SC2016
   # log text: backticks are documentation markers, not command substitution
-  log '[cli]        vs: docs/reference/commands.mdx (### `nemoclaw …` headings only)'
+  log '[cli]        vs: docs/reference/commands.mdx (### `nemoclaw …` or `$$nemoclaw …` headings)'
 
   log "[cli] phase 1/2: dump canonical command list from registry"
   if ! HOME="$_cli_home" "$NODE" "$CLI_JS" --dump-commands >"$_tmp/help.txt" 2>"$_tmp/help.err"; then
@@ -172,18 +172,33 @@ JSON
 
   # shellcheck disable=SC2016
   # log text: backticks are documentation markers, not command substitution
-  log '[cli] phase 2/2: extract ### `nemoclaw …` headings from commands reference'
-  # Allow optional MyST suffix on the same line, e.g. ### `nemoclaw onboard` {#anchor}
-  # Strip argument placeholders (<arg>, [optional]) to match canonical usage signatures.
-  grep -E '^### `nemoclaw ' "$COMMANDS_MD" | LC_ALL=C perl -CS -ne '
-    if (/^### `([^`]+)`\s*(?:\{[^}]+\})?\s*$/) {
+  log '[cli] phase 2/2: extract ### `nemoclaw …` / `$$nemoclaw …` headings from commands reference'
+  # Preserve placeholders that are part of the canonical help signature, but
+  # keep accepting docs-only suffixes such as `snapshot restore [selector]`.
+  grep -E '^### `(\$\$)?nemoclaw ' "$COMMANDS_MD" | LC_ALL=C perl -CS -ne '
+    BEGIN {
+      my $help_path = shift @ARGV;
+      open my $help_fh, "<", $help_path or die "open help list: $!";
+      while (my $line = <$help_fh>) {
+        chomp $line;
+        $help{$line} = 1;
+      }
+      close $help_fh;
+    }
+    if (/^### `([^`]+)`\s*$/) {
       my $c = $1;
-      while ($c =~ s/\s*\[[^\]]*\]\s*$//) {}
-      while ($c =~ s/\s+<[^>]+>\s*$//) {}
+      $c =~ s/^\$\$nemoclaw\b/nemoclaw/;
       $c =~ s/\s+$//;
+      while (!$help{$c}) {
+        my $changed = 0;
+        $changed ||= ($c =~ s/\s*\[[^\]]*\]\s*$//);
+        $changed ||= ($c =~ s/\s+<[^>]+>\s*$//);
+        $c =~ s/\s+$//;
+        last unless $changed;
+      }
       print "$c\n";
     }
-  ' | LC_ALL=C sort -u >"$_tmp/doc.txt"
+  ' "$_tmp/help.txt" | LC_ALL=C sort -u >"$_tmp/doc.txt"
 
   local _n_doc
   _n_doc="$(wc -l <"$_tmp/doc.txt" | tr -d " ")"
@@ -204,27 +219,28 @@ JSON
   log "[cli] command-level parity OK (${_n_help} nemoclaw command(s))"
 
   # ── Phase 3/3: flag-level parity (NemoClaw#3224) ──────────────────────────
-  # For each command, run its `--help`, extract every long-form flag mentioned,
-  # and confirm each appears within that command's own section in
+  # Read the compiled oclif metadata that renders `--help`, then confirm each
+  # public long-form flag appears within that command's own section in
   # commands.mdx (between its `### \`nemoclaw <cmd>\`` heading and the next
-  # ### heading). Two help formats coexist: oclif global commands use a
-  # USAGE/FLAGS layout; `nemoclaw <name> ...` commands use a custom
-  # Options: section. Greping the full help output handles both formats.
+  # ### heading). Commands with custom help fall back to their rendered output.
+  # All other commands avoid a separate cold CLI start.
   # Section-scoped grep avoids false negatives where a flag like `--yes`
   # appears in many sections but is missing from the one being audited.
   # Word-boundary regex avoids false positives where `--yes` is contained
   # in `--yes-i-accept-third-party-software`. Skips global -h/--help/--version.
   #
-  # The check runs with an isolated HOME that contains a fake
-  # `placeholder-sandbox` registry entry. That keeps CI deterministic and lets
-  # sandbox-scoped commands print `--help` without touching the user's real
-  # ~/.nemoclaw state.
   log "[cli] phase 3/3: flag-level parity"
+
+  if ! HOME="$_cli_home" "$NODE" "$CLI_JS" --dump-command-flags >"$_tmp/flags.txt" 2>"$_tmp/flags.err"; then
+    cat "$_tmp/flags.err" >&2
+    rm -rf "$_tmp"
+    return 1
+  fi
 
   # Awk extractor: print lines belonging to the section whose heading
   # canonicalizes to <cmd> after the same trailing-placeholder strip phase 2
   # applies (`### \`nemoclaw foo <ARG>\`` → `nemoclaw foo`). Stops at the
-  # next ### heading. MyST anchors after the closing backtick are tolerated.
+  # next ### heading.
   extract_md_section() {
     local cmd="$1"
     local md="$2"
@@ -239,6 +255,12 @@ JSON
         bt = index(line, "`")
         if (bt > 0) {
           cand = substr(line, 1, bt - 1)
+          sub(/^\$\$nemoclaw/, "nemoclaw", cand)
+          sub(/[[:space:]]+$/, "", cand)
+          if (cand == target) {
+            in_sec = 1
+            next
+          }
           while (sub(/[[:space:]]*\[[^]]*\][[:space:]]*$/, "", cand)) {}
           while (sub(/[[:space:]]+<[^>]+>[[:space:]]*$/, "", cand)) {}
           sub(/[[:space:]]+$/, "", cand)
@@ -277,8 +299,12 @@ JSON
         $mode = "flags";
         next;
       }
-      if (/^\s*(ARGUMENTS|DESCRIPTION|EXAMPLES)\s*$/i || /^\s*$/) {
+      if (/^\s*(ARGUMENTS|DESCRIPTION|EXAMPLES)\s*$/i) {
         $mode = "";
+        next;
+      }
+      if (/^\s*$/) {
+        $mode = "" if $mode eq "usage";
         next;
       }
       emit_flags($_) if $mode;
@@ -293,41 +319,25 @@ JSON
     # `nemoclaw onboard`) that is iterated separately. Re-invoking them
     # with `--help` would just trigger flag-value parsing errors.
     case "$cmd_line" in *" --"*) continue ;; esac
-    # `--dump-commands` lines start with `nemoclaw `; strip that since we
-    # re-invoke via `node bin/nemoclaw.js`. Then replace <name> with a
-    # sandbox name that passes name validation (lowercase, starts with
-    # letter, only letters/digits/hyphens — underscores are rejected).
-    local invoke
-    invoke="${cmd_line#nemoclaw }"
-    invoke="${invoke//<name>/placeholder-sandbox}"
-    # Read into an array so each space-separated token is a distinct argv
-    # element to node — avoids SC2086 and any quoting surprises.
-    local -a _invoke_args
-    read -ra _invoke_args <<<"$invoke"
-    # Redirect stdin to /dev/null. The outer `while read` is consuming
-    # `$_tmp/help.txt` via `done <` redirection; any inner command that
-    # touches stdin (some node startup paths do) would eat subsequent
-    # lines, silently truncating the iteration. Negative-tested by
-    # mutating commands.mdx and confirming drift is now reported.
-    #
-    # Capture exit code separately so a real failure (broken command path,
-    # crashed loader, etc.) propagates instead of being swallowed by
-    # `|| true`.
-    local _help_text _help_err _help_rc=0
-    _help_err="$(mktemp)"
-    _help_text="$(HOME="$_cli_home" "$NODE" "$CLI_JS" "${_invoke_args[@]}" --help </dev/null 2>"$_help_err")" || _help_rc=$?
-    if [[ "$_help_rc" -ne 0 ]]; then
-      cat "$_help_err" >&2
-      rm -f "$_help_err"
+    local _command_metadata _flag_rc=0
+    _command_metadata="$(LC_ALL=C awk -F '\t' -v target="$cmd_line" '
+      $1 == target {
+        print $2 "\t" $3
+        found = 1
+        exit
+      }
+      END { if (!found) exit 1 }
+    ' "$_tmp/flags.txt")" || _flag_rc=$?
+    if [[ "$_flag_rc" -ne 0 ]]; then
+      echo "check-docs: [cli] missing compiled flag metadata for '$cmd_line'" >&2
       rm -rf "$_tmp"
       return 1
     fi
-    rm -f "$_help_err"
-    [[ -z "$_help_text" ]] && continue
 
-    local _flags
-    _flags="$(extract_help_flags "$_help_text")"
-    [[ -z "$_flags" ]] && continue
+    local _help_source _flag_line _flags
+    _help_source="${_command_metadata%%$'\t'*}"
+    _flag_line="${_command_metadata#*$'\t'}"
+    _flags="$(printf '%s\n' "$_flag_line" | tr ' ' '\n' | grep -v '^$' | LC_ALL=C sort -u || true)"
 
     local _section
     _section="$(extract_md_section "$cmd_line" "$COMMANDS_MD")"
@@ -335,6 +345,71 @@ JSON
       # Phase 2 already enforces the heading exists; if the section is
       # somehow empty here, fall back to the full doc rather than skipping.
       _section="$(cat "$COMMANDS_MD")"
+    fi
+
+    # Extract documented flags before selecting the help source. Commands
+    # that implement custom help can advertise flags outside oclif metadata.
+    local _doc_flags
+    _doc_flags="$(
+      printf '%s\n' "$_section" \
+        | LC_ALL=C perl -CS -ne '
+            sub emit_flags {
+              my ($line) = @_;
+              while ($line =~ /--([a-z][a-z0-9-]+)/g) { print "--$1\n"; }
+            }
+
+            if (/^```/) {
+              $in_fence = !$in_fence;
+              $in_nemoclaw_command = 0;
+              next;
+            }
+            if ($in_fence) {
+              # Ignore flags belonging to shell tools shown alongside the
+              # CLI, while preserving flags on multiline NemoClaw examples.
+              if ($in_nemoclaw_command || /(?:^|\s)(?:\$\$)?nemoclaw(?:\s|$)/) {
+                emit_flags($_);
+                $in_nemoclaw_command = /\\\s*$/ ? 1 : 0;
+              }
+            } else {
+              while (/`--([a-z][a-z0-9-]+)/g) { print "--$1\n"; }
+            }
+          ' \
+        | grep -vxE -- '--help|--version' \
+        | LC_ALL=C sort -u || true
+    )"
+
+    local _needs_rendered_help=0
+    if [[ "$_help_source" == "rendered" ]]; then
+      _needs_rendered_help=1
+    else
+      while IFS= read -r flag; do
+        [[ -z "$flag" ]] && continue
+        if ! grep -qxF -- "$flag" <<<"$_flags"; then
+          _needs_rendered_help=1
+          break
+        fi
+      done <<<"$_doc_flags"
+    fi
+
+    if [[ "$_needs_rendered_help" -eq 1 ]]; then
+      local invoke
+      invoke="${cmd_line#nemoclaw }"
+      invoke="${invoke//<name>/placeholder-sandbox}"
+      local -a _invoke_args
+      read -ra _invoke_args <<<"$invoke"
+      local _help_text _help_rc=0
+      _help_text="$(HOME="$_cli_home" "$NODE" "$CLI_JS" "${_invoke_args[@]}" --help </dev/null 2>"$_tmp/command-help.err")" || _help_rc=$?
+      if [[ "$_help_rc" -ne 0 ]]; then
+        cat "$_tmp/command-help.err" >&2
+        rm -rf "$_tmp"
+        return 1
+      fi
+      _flags="$(extract_help_flags "$_help_text")"
+      # Preserve the existing custom-help contract: a help screen with no
+      # parseable usage or flag section does not participate in flag parity.
+      [[ -z "$_flags" ]] && continue
+    elif [[ -z "$_flags" && -z "$_doc_flags" ]]; then
+      continue
     fi
 
     while IFS= read -r flag; do
@@ -349,29 +424,8 @@ JSON
       fi
     done <<<"$_flags"
 
-    # Reverse direction: extract long flags mentioned in the doc section
-    # and confirm each appears in the actual --help. Catches stale docs
-    # (flag removed from CLI but still listed in commands.mdx).
-    #
-    # Scoping rule: inside fenced code blocks (where USAGE lines live like
-    # `[--non-interactive]`), any `--foo` counts. Outside fences, only
-    # backtick-bounded `\`--foo\`` mentions count, so prose references to
-    # other tools (e.g. `\`openshell gateway start --recreate\``) don't get
-    # mistaken for nemoclaw flag documentation.
-    local _doc_flags
-    _doc_flags="$(
-      printf '%s\n' "$_section" \
-        | LC_ALL=C perl -CS -ne '
-            if (/^```/) { $in_fence = !$in_fence; next; }
-            if ($in_fence) {
-              while (/--([a-z][a-z0-9-]+)/g) { print "--$1\n"; }
-            } else {
-              while (/`--([a-z][a-z0-9-]+)/g) { print "--$1\n"; }
-            }
-          ' \
-        | grep -vxE -- '--help|--version' \
-        | LC_ALL=C sort -u || true
-    )"
+    # Reverse direction catches stale docs after the metadata or rendered-help
+    # selection above establishes the command's public flag set.
     while IFS= read -r flag; do
       [[ -z "$flag" ]] && continue
       if ! grep -qxF -- "$flag" <<<"$_flags"; then
@@ -407,10 +461,11 @@ run_install_check() {
   local BOOTSTRAP_SH="$REPO_ROOT/install.sh"
   local PAYLOAD_SH="$REPO_ROOT/scripts/install.sh"
 
-  # The providers list has moved between layouts; tolerate both the legacy
-  # flat path and the post-refactor layered path.
+  # The provider definition has moved between layouts. Prefer the shared
+  # selection-key owner, then tolerate both legacy provider-module paths.
   local PROVIDERS_TS=""
   for _candidate in \
+    "$REPO_ROOT/src/lib/onboard/inference-providers/provider-selection-keys.ts" \
     "$REPO_ROOT/src/lib/onboard/providers.ts" \
     "$REPO_ROOT/src/lib/onboard-providers.ts"; do
     if [[ -f "$_candidate" ]]; then
@@ -429,12 +484,25 @@ run_install_check() {
   fi
 
   log "[install] comparing: NEMOCLAW_PROVIDER values in install.sh + scripts/install.sh"
-  log "[install]        vs: ${PROVIDERS_TS#"$REPO_ROOT"/} canonical 'Valid values' list"
+  log "[install]        vs: ${PROVIDERS_TS#"$REPO_ROOT"/} canonical provider list"
 
-  # The canonical values live in a single error-message line that lists every
-  # accepted NEMOCLAW_PROVIDER input. Extract the comma-separated payload.
+  # Read the shared TypeScript owner when present. Legacy layouts keep the
+  # canonical values in one error-message line.
   local _canonical
-  _canonical="$(grep -oE 'Valid values: [^"]+' "$PROVIDERS_TS" | head -1 | sed 's/^Valid values: //')"
+  if [[ "$PROVIDERS_TS" == */provider-selection-keys.ts ]]; then
+    _canonical="$(
+      "$NODE" --no-warnings --input-type=module -e '
+        import { pathToFileURL } from "node:url";
+        const source = await import(pathToFileURL(process.argv[1]).href);
+        const prefix = "Valid values: ";
+        const value = source.NON_INTERACTIVE_PROVIDER_VALID_VALUES;
+        if (typeof value !== "string" || !value.startsWith(prefix)) process.exit(1);
+        process.stdout.write(value.slice(prefix.length));
+      ' "$PROVIDERS_TS"
+    )"
+  else
+    _canonical="$(grep -oE 'Valid values: [^"]+' "$PROVIDERS_TS" | head -1 | sed 's/^Valid values: //')"
+  fi
   if [[ -z "$_canonical" ]]; then
     echo "check-docs: [install] could not locate canonical provider list in $PROVIDERS_TS" >&2
     return 1
@@ -510,7 +578,9 @@ run_install_check() {
     local v
     v="$(echo "$_raw" | tr -d '[:space:]')"
     [[ -z "$v" ]] && continue
-    case "$v" in install-* | start-windows-ollama) continue ;; esac
+    case "$v" in
+      install-vllm | install-ollama | install-windows-ollama | start-windows-ollama) continue ;;
+    esac
     if ! grep -qxF -- "$v" <<<"$_bootstrap_values"; then
       echo "check-docs: [install] provider \"$v\" canonical but absent from $BOOTSTRAP_SH bootstrap_usage" >&2
       _drift=1
@@ -530,7 +600,7 @@ run_install_check() {
     printf '%s\n' "$_canonical" \
       | tr ',' '\n' \
       | sed 's/[[:space:]]//g' \
-      | grep -vxE 'install-.*|start-windows-ollama' \
+      | grep -vxE 'install-vllm|install-ollama|install-windows-ollama|start-windows-ollama' \
       | grep -E '^[a-zA-Z][a-zA-Z0-9-]*$' \
       | LC_ALL=C sort -u
   )"
@@ -549,6 +619,42 @@ run_install_check() {
         _drift=1
       fi
     done <<<"$_payload_values"
+  fi
+
+  local COMMANDS_REF="$REPO_ROOT/docs/reference/commands.mdx"
+  if [[ ! -f "$COMMANDS_REF" ]]; then
+    echo "check-docs: [install] missing $COMMANDS_REF" >&2
+    return 1
+  fi
+
+  local _doc_provider_row _doc_provider_values
+  _doc_provider_row="$(grep -F "| \`NEMOCLAW_PROVIDER\` |" "$COMMANDS_REF" || true)"
+  if [[ -z "$_doc_provider_row" ]]; then
+    echo "check-docs: [install] no NEMOCLAW_PROVIDER row found in ${COMMANDS_REF#"$REPO_ROOT"/}" >&2
+    _drift=1
+  else
+    _doc_provider_values="$(
+      printf '%s\n' "$_doc_provider_row" \
+        | awk -F '|' '{ print $3 }' \
+        | grep -oE "\`[a-zA-Z][a-zA-Z0-9-]*\`" \
+        | tr -d '`' \
+        | grep -vxE 'install-vllm|install-ollama|install-windows-ollama|start-windows-ollama' \
+        | LC_ALL=C sort -u
+    )"
+    while IFS= read -r v; do
+      [[ -z "$v" ]] && continue
+      if ! grep -qxF -- "$v" <<<"$_doc_provider_values"; then
+        echo "check-docs: [install] provider \"$v\" canonical but absent from ${COMMANDS_REF#"$REPO_ROOT"/} NEMOCLAW_PROVIDER row" >&2
+        _drift=1
+      fi
+    done <<<"$_canonical_values"
+    while IFS= read -r v; do
+      [[ -z "$v" ]] && continue
+      if ! grep -qxF -- "$v" <<<"$_canonical_values"; then
+        echo "check-docs: [install] provider \"$v\" appears in ${COMMANDS_REF#"$REPO_ROOT"/} NEMOCLAW_PROVIDER row but is not canonical" >&2
+        _drift=1
+      fi
+    done <<<"$_doc_provider_values"
   fi
 
   if [[ "$_drift" -ne 0 ]]; then
@@ -633,12 +739,296 @@ extract_targets() {
       next;
     }
 
-    while ($visible =~ /\!?\[[^\]]*\]\(([^)\s]+)(?:\s+["'"'"'][^)"'"'"']*["'"'"'])?\)/g) { print $line . "\t" . $1 . "\n"; }
-    while ($visible =~ /<(https?:[^>\s]+)>/g) { print $line . "\t" . $1 . "\n"; }
+    my $scan = $visible;
+    $scan =~ s/`[^`]*`//g;
+    while ($scan =~ /\!?\[[^\]]*\]\(([^)\s]+)(?:\s+["'"'"'][^)"'"'"']*["'"'"'])?\)/g) { print $line . "\t" . $1 . "\n"; }
+    while ($scan =~ /<(https?:[^>\s]+)>/g) { print $line . "\t" . $1 . "\n"; }
+    while ($scan =~ /\bhref=(["'"'"'])([^"'"'"'\s]+)\1/g) { print $line . "\t" . $2 . "\n"; }
     END {
       die "malformed HTML comment\n" if $in_comment;
     }
   ' -- "$1"
+}
+
+FERN_ROUTE_INDEX_LOADED=0
+FERN_ROUTE_INDEX=""
+
+load_fern_route_index() {
+  [[ "$FERN_ROUTE_INDEX_LOADED" -eq 1 ]] && return 0
+  FERN_ROUTE_INDEX_LOADED=1
+
+  local nav_yml="${CHECK_DOCS_FERN_NAV_YML:-$REPO_ROOT/docs/index.yml}"
+  [[ -f "$nav_yml" ]] || return 0
+  if ! command -v "$NODE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Build a lightweight route index from Fern navigation without requiring npm
+  # dependencies. Each emitted row is: <docs source path> TAB <canonical route>.
+  # The parser intentionally handles the subset used by docs/index.yml:
+  # variants, native changelogs, nested sections with slugs, and pages/sections
+  # with path+slug.
+  local _fern_route_index_err
+  _fern_route_index_err="$(mktemp)"
+  if ! FERN_ROUTE_INDEX="$(
+    "$NODE" - "$nav_yml" <<'NODE' 2>"$_fern_route_index_err"
+const fs = require("node:fs");
+const navPath = process.argv[2];
+const lines = fs.readFileSync(navPath, "utf8").split(/\r?\n/);
+
+let variant = "";
+let stack = [];
+let current = null;
+const rows = [];
+
+function clean(value) {
+  let out = value.trim();
+  const hash = out.indexOf(" #");
+  if (hash >= 0) out = out.slice(0, hash).trim();
+  if ((out.startsWith('"') && out.endsWith('"')) || (out.startsWith("'") && out.endsWith("'"))) {
+    out = out.slice(1, -1);
+  }
+  return out;
+}
+
+function maybeEmit(item) {
+  if (!item || item.emitted || !variant || !item.slug || item.indent <= 6) return;
+  const route = ["user-guide", variant, ...item.parent, item.slug].join("/");
+  if (item.type === "changelog") {
+    const changelogPath = item.path.replace(/^\.\//, "").replace(/\/$/, "");
+    rows.push(`${changelogPath}/overview.mdx\t${route}`);
+    item.emitted = true;
+    return;
+  }
+  if (!item.path) return;
+  rows.push(`${item.path}\t${route}`);
+  const sourcePath = agentVariantSourcePath(item.path);
+  if (sourcePath && sourcePath !== item.path) {
+    rows.push(`${sourcePath}\t${route}`);
+  }
+  item.emitted = true;
+}
+
+function agentVariantSourcePath(navPath) {
+  const match = navPath.match(/^_build\/agent-variants\/(.+)\.(?:openclaw|hermes|deepagents|pi)\.generated\.mdx$/);
+  return match ? `${match[1]}.mdx` : null;
+}
+
+function maybePushSection(item) {
+  if (!item || item.pushed || item.type !== "section" || !item.slug || item.indent <= 6) return;
+  stack.push({ indent: item.indent, slug: item.slug });
+  item.pushed = true;
+}
+
+for (const line of lines) {
+  const itemMatch = line.match(/^(\s*)-\s+(page|section|link|title|changelog):(?:\s*(.*?))?\s*$/);
+  if (itemMatch) {
+    const indent = itemMatch[1].length;
+    const type = itemMatch[2];
+    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
+    if (indent === 6 && type === "title") {
+      variant = "";
+      stack = [];
+    }
+    current = {
+      indent,
+      type,
+      parent: stack.map((part) => part.slug),
+      path: type === "changelog" ? clean(itemMatch[3] || "") : "",
+      slug: "",
+      emitted: false,
+      pushed: false,
+    };
+    continue;
+  }
+
+  const propMatch = line.match(/^(\s*)(path|slug):\s*(.+?)\s*$/);
+  if (!propMatch || !current) continue;
+  const indent = propMatch[1].length;
+  if (indent !== current.indent + 2) continue;
+
+  const key = propMatch[2];
+  const value = clean(propMatch[3]);
+  if (current.indent === 6 && key === "slug") {
+    variant = value;
+    stack = [];
+    continue;
+  }
+  if (key === "path") current.path = value;
+  if (key === "slug") current.slug = value;
+  maybeEmit(current);
+  maybePushSection(current);
+}
+
+if (rows.length === 0) {
+  throw new Error(`no Fern routes found in ${navPath}`);
+}
+process.stdout.write(rows.join("\n"));
+NODE
+  )"; then
+    echo "check-docs: [links] failed to parse Fern navigation ${nav_yml#"$REPO_ROOT"/}: $(tr '\n' ' ' <"$_fern_route_index_err" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')" >&2
+    rm -f "$_fern_route_index_err"
+    return 1
+  fi
+  rm -f "$_fern_route_index_err"
+}
+
+normalize_fern_route_path() {
+  local input="$1" part
+  input="${input#/}"
+  case "$input" in
+    nemoclaw/latest/*) input="${input#nemoclaw/latest/}" ;;
+    nemoclaw/*) input="${input#nemoclaw/}" ;;
+    latest/*) input="${input#latest/}" ;;
+  esac
+  input="${input%.mdx}"
+  input="${input%.md}"
+
+  local -a parts=() out=()
+  local IFS='/'
+  read -r -a parts <<<"$input"
+  unset IFS
+  for part in "${parts[@]}"; do
+    case "$part" in
+      "" | .) ;;
+      ..)
+        if [[ "${#out[@]}" -eq 0 ]]; then
+          return 1
+        fi
+        unset 'out[${#out[@]}-1]'
+        ;;
+      *) out+=("$part") ;;
+    esac
+  done
+
+  local joined
+  joined="$(
+    IFS=/
+    printf '%s' "${out[*]}"
+  )"
+  printf '%s' "$joined"
+}
+
+fern_route_exists() {
+  local route="$1" candidate
+  if ! load_fern_route_index; then
+    return 3
+  fi
+  [[ -n "$FERN_ROUTE_INDEX" ]] || return 1
+
+  route="$(normalize_fern_route_path "$route")" || return 1
+  local -a candidates=("$route")
+  case "$route" in
+    openclaw)
+      candidates+=("user-guide/openclaw/home")
+      ;;
+    hermes)
+      candidates+=("user-guide/hermes/home")
+      ;;
+    user-guide/openclaw | user-guide/hermes)
+      candidates+=("$route/home")
+      ;;
+    openclaw/* | hermes/*)
+      candidates+=("user-guide/$route")
+      ;;
+    user-guide/*) ;;
+    about/* | get-started/* | inference/* | manage-sandboxes/* | network-policy/* | deployment/* | monitoring/* | security/* | reference/* | resources/*)
+      candidates+=("user-guide/openclaw/$route")
+      ;;
+  esac
+  if [[ "$route" == get-started/quickstart-hermes ]]; then
+    candidates+=("user-guide/hermes/get-started/quickstart-hermes")
+  elif [[ "$route" == get-started/hermes/* ]]; then
+    candidates+=("user-guide/hermes/get-started/${route#get-started/hermes/}")
+  fi
+
+  local _source indexed_route
+  for candidate in "${candidates[@]}"; do
+    while IFS=$'\t' read -r _source indexed_route || [[ -n "${indexed_route:-}" ]]; do
+      [[ "$indexed_route" == "$candidate" ]] && return 0
+    done <<<"$FERN_ROUTE_INDEX"
+  done
+  return 1
+}
+
+fern_relative_ref_exists() {
+  local md_path="$1" stripped="$2"
+  local abs_md="$md_path" source_rel current route
+  [[ "$abs_md" == /* ]] || abs_md="$REPO_ROOT/$abs_md"
+  case "$abs_md" in
+    "$REPO_ROOT/docs/"*) source_rel="${abs_md#"$REPO_ROOT/docs/"}" ;;
+    *) return 1 ;;
+  esac
+
+  if ! load_fern_route_index; then
+    return 3
+  fi
+  [[ -n "$FERN_ROUTE_INDEX" ]] || return 1
+
+  while IFS=$'\t' read -r _source current || [[ -n "${current:-}" ]]; do
+    [[ "$_source" == "$source_rel" ]] || continue
+    route="${current%/*}/$stripped"
+    local _fern_rc
+    set +e
+    fern_route_exists "$route"
+    _fern_rc=$?
+    set -e
+    if [[ "$_fern_rc" -eq 0 ]]; then
+      return 0
+    elif [[ "$_fern_rc" -eq 3 ]]; then
+      return 3
+    fi
+  done <<<"$FERN_ROUTE_INDEX"
+  return 1
+}
+
+source_ref_exists() {
+  local base_dir="$1" stripped="$2" candidate
+  local -a candidates=("$stripped")
+  if [[ "$stripped" == */ ]]; then
+    candidates+=("${stripped}index.mdx" "${stripped}index.md")
+  else
+    candidates+=("$stripped.mdx" "$stripped.md" "$stripped/index.mdx" "$stripped/index.md")
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    if (cd "$base_dir" && [[ -e "$candidate" ]]); then
+      return 0
+    fi
+  done
+  return 1
+}
+
+site_source_ref_exists() {
+  local stripped="$1"
+  local site_path="${stripped#/}"
+  local -a site_paths=("$site_path")
+  case "$site_path" in
+    nemoclaw/latest/*) site_paths+=("${site_path#nemoclaw/latest/}") ;;
+    nemoclaw/*) site_paths+=("${site_path#nemoclaw/}") ;;
+    latest/*) site_paths+=("${site_path#latest/}") ;;
+  esac
+  case "$site_path" in
+    user-guide/openclaw/*) site_paths+=("${site_path#user-guide/openclaw/}") ;;
+    user-guide/hermes/*) site_paths+=("${site_path#user-guide/hermes/}") ;;
+    openclaw/*) site_paths+=("${site_path#openclaw/}") ;;
+    hermes/*) site_paths+=("${site_path#hermes/}") ;;
+  esac
+
+  local route_path
+  for route_path in "${site_paths[@]}"; do
+    if source_ref_exists "$REPO_ROOT/docs" "$route_path"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+has_markdown_extension() {
+  case "$1" in
+    *.md | *.mdx) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 check_local_ref() {
@@ -661,21 +1051,42 @@ check_local_ref() {
   fi
 
   if [[ "$stripped" == /* ]]; then
-    local site_path="${stripped#/}"
-    local candidate
-    for candidate in \
-      "$REPO_ROOT/docs/$site_path" \
-      "$REPO_ROOT/docs/$site_path.mdx" \
-      "$REPO_ROOT/docs/$site_path.md" \
-      "$REPO_ROOT/docs/$site_path/index.mdx" \
-      "$REPO_ROOT/docs/$site_path/index.md"; do
-      [[ -e "$candidate" ]] && return 0
-    done
+    local _fern_rc
+    set +e
+    fern_route_exists "$stripped"
+    _fern_rc=$?
+    set -e
+    if [[ "$_fern_rc" -eq 0 ]] && has_markdown_extension "$stripped"; then
+      echo "check-docs: [links] route-style link should omit .md/.mdx extension in $md_path:$line_no -> $target" >&2
+      return 1
+    fi
+    if [[ "$_fern_rc" -eq 0 ]]; then
+      return 0
+    elif [[ "$_fern_rc" -eq 3 ]]; then
+      return 1
+    fi
+    if site_source_ref_exists "$stripped"; then
+      return 0
+    fi
     echo "check-docs: [links] broken site route in $md_path:$line_no -> $target" >&2
     return 1
   fi
 
-  if (cd "$(dirname "$md_path")" && [[ -e "$stripped" ]]); then
+  local _fern_relative_rc
+  set +e
+  fern_relative_ref_exists "$md_path" "$stripped"
+  _fern_relative_rc=$?
+  set -e
+  if [[ "$_fern_relative_rc" -eq 0 ]] && has_markdown_extension "$stripped"; then
+    echo "check-docs: [links] route-style link should omit .md/.mdx extension in $md_path:$line_no -> $target" >&2
+    return 1
+  fi
+  if [[ "$_fern_relative_rc" -eq 0 ]]; then
+    return 0
+  elif [[ "$_fern_relative_rc" -eq 3 ]]; then
+    return 1
+  fi
+  if source_ref_exists "$(dirname "$md_path")" "$stripped"; then
     return 0
   fi
   echo "check-docs: [links] broken local link in $md_path:$line_no -> $target" >&2
@@ -787,7 +1198,7 @@ run_links_check() {
   local failures=0
   declare -a REMOTE_URLS=()
 
-  log "[links] phase 1/2: local file targets for [](url) / ![]() / <https://> (code fences skipped)"
+  log "[links] phase 1/2: local file targets and Fern routes for [](url) / ![]() / <https://> (code fences skipped)"
   for md in "${DOC_FILES[@]}"; do
     if [[ ! -f "$md" ]]; then
       echo "check-docs: [links] missing file: $md" >&2
@@ -825,7 +1236,7 @@ run_links_check() {
     log "[links] phase 1 failed"
     return 1
   fi
-  log "[links] phase 1 OK (local paths resolve from each .md directory)"
+  log "[links] phase 1 OK (local paths and Fern routes resolve)"
 
   local _n_raw _deduped _unique _i _u url
   _n_raw="${#REMOTE_URLS[@]}"

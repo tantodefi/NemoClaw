@@ -9,7 +9,9 @@ import {
   promptInputModel,
   promptManualModelId,
   promptRemoteModel,
-} from "../../../dist/lib/inference/model-prompts";
+  promptVllmModel,
+} from "./model-prompts";
+import { modelsForPlatform, VLLM_MODELS } from "./vllm-models";
 
 function promptSequence(responses: string[]) {
   const queue = [...responses];
@@ -31,14 +33,77 @@ describe("model prompt helpers", () => {
     expect(result).toBe("llama");
   });
 
-  it("returns DeepSeek V4 Pro from the default cloud model menu", async () => {
-    const promptFn = promptSequence(["7"]);
+  it("returns Nemotron 3 Super from the default cloud model menu", async () => {
+    const promptFn = promptSequence(["2"]);
     const result = await promptCloudModel({
       promptFn,
       writeLine: vi.fn(),
     });
 
-    expect(result).toBe("deepseek-ai/deepseek-v4-pro");
+    expect(result).toBe("nvidia/nemotron-3-super-120b-a12b");
+  });
+
+  it("uses the effective live catalog default when the user presses enter", async () => {
+    const result = await promptCloudModel({
+      promptFn: promptSequence([""]),
+      writeLine: vi.fn(),
+      defaultModelId: "live/default",
+      cloudModelOptions: [
+        { id: "live/first", label: "First" },
+        { id: "live/default", label: "Default" },
+      ],
+    });
+
+    expect(result).toBe("live/default");
+  });
+
+  it("keeps a separate safe custom model as the Other prefill (#5827)", async () => {
+    const promptFn = promptSequence(["2", ""]);
+    const validateNvidiaEndpointModelFn = vi.fn((model: string) => ({
+      ok: model === "custom/provider-model",
+    }));
+    const result = await promptCloudModel({
+      promptFn,
+      writeLine: vi.fn(),
+      defaultModelId: "live/default",
+      manualDefaultModelId: "custom/provider-model",
+      cloudModelOptions: [{ id: "live/default", label: "Default" }],
+      getCredentialFn: () => "nvapi-test",
+      validateNvidiaEndpointModelFn,
+    });
+
+    expect(result).toBe("custom/provider-model");
+    expect(promptFn).toHaveBeenNthCalledWith(1, "  Choose model [1]: ");
+    expect(promptFn).toHaveBeenNthCalledWith(
+      2,
+      "  NVIDIA Endpoints model id [custom/provider-model]: ",
+    );
+    expect(validateNvidiaEndpointModelFn).toHaveBeenCalledWith(
+      "custom/provider-model",
+      "nvapi-test",
+    );
+  });
+
+  it("does not render or accept an unsafe manual-entry default (#5827)", async () => {
+    const promptFn = promptSequence(["2", "safe/provider-model"]);
+    const validateNvidiaEndpointModelFn = vi.fn((model: string) => ({
+      ok: model === "safe/provider-model",
+    }));
+    const result = await promptCloudModel({
+      promptFn,
+      writeLine: vi.fn(),
+      defaultModelId: "live/default",
+      manualDefaultModelId: "bad\n  1) spoof",
+      cloudModelOptions: [{ id: "live/default", label: "Default" }],
+      getCredentialFn: () => "nvapi-test",
+      validateNvidiaEndpointModelFn,
+    });
+
+    expect(result).toBe("safe/provider-model");
+    expect(promptFn).toHaveBeenNthCalledWith(2, "  NVIDIA Endpoints model id: ");
+    expect(promptFn.mock.calls.flat().join("\n")).not.toContain("spoof");
+    expect(validateNvidiaEndpointModelFn).toHaveBeenCalledOnce();
+    expect(validateNvidiaEndpointModelFn).toHaveBeenCalledWith("safe/provider-model", "nvapi-test");
   });
 
   it("validates manual cloud model ids against the saved NVIDIA key", async () => {
@@ -74,8 +139,38 @@ describe("model prompt helpers", () => {
 
     expect(result).toBe(BACK_TO_SELECTION);
     expect(errorLine).toHaveBeenCalledWith(
-      "  NVIDIA_API_KEY is required before validating a custom NVIDIA Endpoints model.",
+      "  NVIDIA_INFERENCE_API_KEY is required before validating a custom NVIDIA Endpoints model.",
     );
+  });
+
+  it("supports provider-specific catalog labels, credentials, and manual validation (#5826)", async () => {
+    const promptFn = promptSequence(["2", "moonshotai/kimi-k2.6"]);
+    const writeLine = vi.fn();
+    const getCredentialFn = vi.fn((envName: string) =>
+      envName === "OPENROUTER_API_KEY" ? "sk-or-test" : null,
+    );
+    const validateCloudModelFn = vi.fn((model: string, apiKey: string) => ({
+      ok: model === "moonshotai/kimi-k2.6" && apiKey === "sk-or-test",
+    }));
+
+    const result = await promptCloudModel({
+      promptFn,
+      writeLine,
+      cloudModelMenuLabel: "OpenRouter cloud models",
+      cloudModelOptions: [{ id: "nvidia/nemotron-3-ultra-550b-a55b", label: "Nemotron" }],
+      manualCredentialEnv: "OPENROUTER_API_KEY",
+      manualCredentialMissingMessage:
+        "  OPENROUTER_API_KEY is required before validating a custom OpenRouter model.",
+      manualModelLabel: "OpenRouter",
+      getCredentialFn,
+      validateCloudModelFn,
+    });
+
+    expect(result).toBe("moonshotai/kimi-k2.6");
+    expect(writeLine).toHaveBeenCalledWith("  OpenRouter cloud models:");
+    expect(promptFn).toHaveBeenNthCalledWith(2, "  OpenRouter model id: ");
+    expect(getCredentialFn).toHaveBeenCalledWith("OPENROUTER_API_KEY");
+    expect(validateCloudModelFn).toHaveBeenCalledWith("moonshotai/kimi-k2.6", "sk-or-test");
   });
 
   it("defers transient manual validation failures back to the caller flow", async () => {
@@ -107,6 +202,37 @@ describe("model prompt helpers", () => {
     });
 
     expect(result).toBe("gpt-5.4-mini");
+  });
+
+  it("offers Gemini 3.6 Flash and excludes Gemini 2.5 Flash (#9298)", async () => {
+    await expect(
+      promptRemoteModel("Google Gemini", "gemini", "gemini-3.6-flash", null, {
+        promptFn: promptSequence([""]),
+        writeLine: vi.fn(),
+      }),
+    ).resolves.toBe("gemini-3.6-flash");
+
+    const promptFn = promptSequence(["7", "gemini-custom"]);
+    const writeLine = vi.fn();
+    const result = await promptRemoteModel("Google Gemini", "gemini", "gemini-3.6-flash", null, {
+      promptFn,
+      writeLine,
+    });
+
+    expect(result).toBe("gemini-custom");
+    expect(promptFn).toHaveBeenNthCalledWith(1, "  Choose model [1]: ");
+    expect(writeLine.mock.calls.map(([line]) => line)).toEqual([
+      "",
+      "  Google Gemini models:",
+      "    1) gemini-3.6-flash",
+      "    2) gemini-3.1-pro-preview",
+      "    3) gemini-3.1-flash-lite-preview",
+      "    4) gemini-3-flash-preview",
+      "    5) gemini-2.5-pro",
+      "    6) gemini-2.5-flash-lite",
+      "    7) Other...",
+      "",
+    ]);
   });
 
   it("treats non-numeric curated selections as manual-entry fallback", async () => {
@@ -168,17 +294,11 @@ describe("model prompt helpers", () => {
   it("keeps a safe current remote default that is not in the curated list", async () => {
     const writeLine = vi.fn();
     const promptFn = promptSequence([""]);
-    const result = await promptRemoteModel(
-      "OpenAI",
-      "openai",
-      "custom/provider-model",
-      null,
-      {
-        promptFn,
-        writeLine,
-        remoteModelOptions: { openai: ["model-1", "model-2", "model-3"] },
-      },
-    );
+    const result = await promptRemoteModel("OpenAI", "openai", "custom/provider-model", null, {
+      promptFn,
+      writeLine,
+      remoteModelOptions: { openai: ["model-1", "model-2", "model-3"] },
+    });
 
     expect(result).toBe("custom/provider-model");
     expect(promptFn).toHaveBeenCalledWith("  Choose model [5]: ");
@@ -231,5 +351,141 @@ describe("model prompt helpers", () => {
     expect(errorLine).toHaveBeenCalledWith(
       "  Could not validate model against /models: auth failed",
     );
+  });
+});
+
+describe("promptVllmModel", () => {
+  const sparkModels = modelsForPlatform("spark");
+  const sparkDefault = VLLM_MODELS.find((m) => m.envValue === "qwen3.6-35b-a3b-nvfp4")!;
+  const gatedModel = VLLM_MODELS.find((m) => m.envValue === "deepseek-r1-distill-70b")!;
+  const stationModels = modelsForPlatform("station");
+  const stationDefault = VLLM_MODELS.find((m) => m.envValue === "deepseek-v4-flash")!;
+
+  it("returns the profile default when the user presses Enter", async () => {
+    const promptFn = promptSequence([""]);
+    const result = await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine: vi.fn(),
+      env: {} as NodeJS.ProcessEnv,
+    });
+    expect(result).toEqual(sparkDefault);
+  });
+
+  it("annotates the default as recommended and shows the HF id on a second line", async () => {
+    const promptFn = promptSequence([""]);
+    const writeLine = vi.fn();
+    await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine,
+      env: {} as NodeJS.ProcessEnv,
+    });
+    const lines = writeLine.mock.calls.map((args) => String(args[0]));
+    expect(lines).toContain("  vLLM models for DGX Spark:");
+    expect(
+      lines.some(
+        (line) => line.includes(sparkDefault.label) && line.includes("recommended, default"),
+      ),
+    ).toBe(true);
+    expect(lines).toContain(`       ${sparkDefault.id}`);
+  });
+
+  it("renders the default first followed by registry order", async () => {
+    const promptFn = promptSequence([""]);
+    const writeLine = vi.fn();
+    await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine,
+      env: {} as NodeJS.ProcessEnv,
+    });
+    const numbered = writeLine.mock.calls
+      .map((args) => String(args[0]))
+      .filter((line) => /^ {4}\d+\) /.test(line));
+    expect(numbered[0]).toContain(sparkDefault.label);
+    const expectedOrder = [sparkDefault, ...sparkModels.filter((m) => m.id !== sparkDefault.id)];
+    expectedOrder.forEach((model, index) => {
+      expect(numbered[index]).toContain(model.label);
+    });
+  });
+
+  it("returns a non-default registry entry when the user picks its number", async () => {
+    const promptFn = promptSequence(["2"]);
+    const result = await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine: vi.fn(),
+      env: {} as NodeJS.ProcessEnv,
+    });
+    expect(result).not.toEqual(sparkDefault);
+    expect(sparkModels).toContainEqual(result);
+  });
+
+  it("re-prompts when the user enters a number outside the menu", async () => {
+    const promptFn = promptSequence(["99", ""]);
+    const errorLine = vi.fn();
+    const result = await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine: vi.fn(),
+      errorLine,
+      env: {} as NodeJS.ProcessEnv,
+    });
+    expect(result).toEqual(sparkDefault);
+    expect(errorLine).toHaveBeenCalledWith(
+      expect.stringMatching(/Pick a number between 1 and \d+/),
+    );
+  });
+
+  it("rejects malformed input like '2abc' instead of silently treating it as 2", async () => {
+    const promptFn = promptSequence(["2abc", " 1x ", ""]);
+    const errorLine = vi.fn();
+    const result = await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine: vi.fn(),
+      errorLine,
+      env: {} as NodeJS.ProcessEnv,
+    });
+    expect(result).toEqual(sparkDefault);
+    const messages = errorLine.mock.calls.map((args) => String(args[0]));
+    expect(messages.filter((m) => /Pick a number between 1 and \d+/.test(m))).toHaveLength(2);
+  });
+
+  it("re-prompts when the user picks a gated model without an HF token", async () => {
+    const gatedIndex = sparkModels.findIndex((m) => m.id === gatedModel.id);
+    expect(gatedIndex).toBeGreaterThanOrEqual(0);
+    const orderedGatedPosition = (() => {
+      const ordered = [sparkDefault, ...sparkModels.filter((m) => m.id !== sparkDefault.id)];
+      return ordered.findIndex((m) => m.id === gatedModel.id) + 1;
+    })();
+    const promptFn = promptSequence([String(orderedGatedPosition), ""]);
+    const errorLine = vi.fn();
+    const result = await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine: vi.fn(),
+      errorLine,
+      env: {} as NodeJS.ProcessEnv,
+    });
+    expect(result).toEqual(sparkDefault);
+    const messages = errorLine.mock.calls.map((args) => String(args[0]));
+    expect(messages.some((m) => /gated on Hugging Face/.test(m))).toBe(true);
+  });
+
+  it("accepts a gated model when HUGGING_FACE_HUB_TOKEN is set", async () => {
+    const ordered = [sparkDefault, ...sparkModels.filter((m) => m.id !== sparkDefault.id)];
+    const gatedPosition = ordered.findIndex((m) => m.id === gatedModel.id) + 1;
+    const promptFn = promptSequence([String(gatedPosition)]);
+    const result = await promptVllmModel("DGX Spark", sparkModels, sparkDefault, {
+      promptFn,
+      writeLine: vi.fn(),
+      env: { HUGGING_FACE_HUB_TOKEN: "hf_abc" } as NodeJS.ProcessEnv,
+    });
+    expect(result).toEqual(gatedModel);
+  });
+
+  it("returns BACK_TO_SELECTION when the user types back", async () => {
+    const promptFn = promptSequence(["back"]);
+    const result = await promptVllmModel("DGX Station", stationModels, stationDefault, {
+      promptFn,
+      writeLine: vi.fn(),
+      env: {} as NodeJS.ProcessEnv,
+    });
+    expect(result).toEqual(BACK_TO_SELECTION);
   });
 });

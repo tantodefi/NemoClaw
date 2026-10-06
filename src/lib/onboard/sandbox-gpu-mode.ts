@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { GpuDetection } from "../inference/nim";
+import type { SandboxGpuProofResult } from "../state/registry";
+import { normalizeSandboxGpuDeviceForCdi } from "./sandbox-gpu-create";
 
 export type SandboxGpuMode = "auto" | "1" | "0";
 export type SandboxGpuFlag = "enable" | "disable" | null;
@@ -9,9 +11,14 @@ export type SandboxGpuFlag = "enable" | "disable" | null;
 export type SandboxGpuConfig = {
   mode: SandboxGpuMode;
   hostGpuDetected: boolean;
+  hostGpuPlatform: GpuDetection["platform"] | null;
   sandboxGpuEnabled: boolean;
   sandboxGpuDevice: string | null;
   errors: string[];
+  // Outcome of the live direct sandbox GPU proof, populated after onboarding
+  // runs the verifier so it can be persisted to the registry (#4231). Absent
+  // until the proof runs; never overwrites a stored proof on reuse paths.
+  sandboxGpuProof?: SandboxGpuProofResult | null;
 };
 
 export type ResumeSandboxGpuOverrides = {
@@ -40,8 +47,6 @@ export function resolveSandboxGpuMode(args: {
   flag?: SandboxGpuFlag;
 }): SandboxGpuMode {
   let mode: SandboxGpuMode = args.envMode ?? "auto";
-  // GPU sandbox passthrough does not currently work on Jetson; disable by default
-  if (args.gpu?.platform === "jetson" && args.envMode === null) mode = "0";
   if (args.flag === "enable") mode = "1";
   if (args.flag === "disable") mode = "0";
   return mode;
@@ -65,7 +70,15 @@ export function resolveSandboxGpuConfig(
 
   let mode = resolveSandboxGpuMode({ envMode, gpu, flag: options.flag });
 
-  const requestedDevice = (options.device ?? env.NEMOCLAW_SANDBOX_GPU_DEVICE ?? "").trim() || null;
+  let requestedDevice = (options.device ?? env.NEMOCLAW_SANDBOX_GPU_DEVICE ?? "").trim() || null;
+  if (requestedDevice) {
+    try {
+      normalizeSandboxGpuDeviceForCdi(requestedDevice);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+      requestedDevice = null;
+    }
+  }
   if (requestedDevice && mode !== "1") {
     errors.push(
       "NEMOCLAW_SANDBOX_GPU_DEVICE requires sandbox GPU mode 1; " +
@@ -82,6 +95,7 @@ export function resolveSandboxGpuConfig(
   return {
     mode,
     hostGpuDetected,
+    hostGpuPlatform: gpu?.platform ?? null,
     sandboxGpuEnabled: mode === "1" || (mode === "auto" && hostGpuDetected),
     sandboxGpuDevice,
     errors,

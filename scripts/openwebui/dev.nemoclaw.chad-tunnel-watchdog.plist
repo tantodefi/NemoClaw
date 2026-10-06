@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Liveness watchdog for dev.nemoclaw.chad-tunnel. Probes /healthz through the
+  tunnel every 60 s; two consecutive failures → `launchctl kickstart -k`.
+  Catches the "half-open" wedge where the outer ssh process is alive but the
+  multiplexed forwarded channel is dead, which ServerAlive can't detect.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.nemoclaw.chad-tunnel-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/r/.nemoclaw/source/scripts/openwebui/chad-tunnel-watchdog</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/tmp/chad-tunnel-watchdog.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/chad-tunnel-watchdog.err.log</string>
+</dict>
+</plist>

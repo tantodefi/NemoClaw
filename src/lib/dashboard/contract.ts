@@ -7,13 +7,16 @@
  */
 
 import { DASHBOARD_PORT } from "../core/ports";
-import { isLoopbackHostname } from "../core/url-utils";
+import { isLoopbackDashboardUrl } from "./url";
 
 export interface PlatformHints {
   chatUiUrl?: string;
   port?: number;
   isWsl?: boolean;
   wslHostAddress?: string | null;
+  dashboardHealthEndpoint?: string;
+  gatewayPort?: number;
+  gatewayHealthEndpoint?: string;
   /**
    * Explicit operator opt-in to bind the dashboard forward on all interfaces.
    * Only `"0.0.0.0"` enables remote bind; anything else (including
@@ -26,9 +29,20 @@ export interface PlatformHints {
 
 export interface DashboardDeliveryChain {
   accessUrl: string;
+  /**
+   * Reachable URLs that are not the primary `accessUrl` but should be offered
+   * as fallbacks. On WSL2 this holds the `hostname -I` host IP: loopback is
+   * the primary URL because WSL forwards Windows' `127.0.0.1` into the VM by
+   * default, but when that forwarding is unavailable the host IP is the only
+   * address reachable from a Windows browser. (#6171)
+   */
+  fallbackUrls: string[];
   corsOrigins: string[];
   forwardTarget: string;
   healthEndpoint: string;
+  dashboardHealthEndpoint: string;
+  gatewayPort: number;
+  gatewayHealthEndpoint: string;
   port: number;
   bindAddress: string;
   shouldDisableDeviceAuth: boolean;
@@ -54,10 +68,25 @@ function isLoopbackUrl(chatUiUrl: string): boolean {
   const raw = String(chatUiUrl || "").trim();
   if (!raw) return true;
   try {
-    return isLoopbackHostname(new URL(ensureScheme(raw)).hostname);
+    return isLoopbackDashboardUrl(ensureScheme(raw));
   } catch {
     return /localhost|::1|127(?:\.\d{1,3}){3}/i.test(raw);
   }
+}
+
+function normalizeEndpointPath(value: string | undefined, fallback: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return fallback;
+  if (raw.startsWith("/")) return raw;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    try {
+      const path = new URL(raw).pathname;
+      if (path) return path;
+    } catch {
+      // Treat malformed URL-like values as path fragments below.
+    }
+  }
+  return `/${raw}`;
 }
 
 /** Build the complete dashboard delivery chain from platform hints. */
@@ -65,33 +94,68 @@ export function buildChain(hints?: PlatformHints): DashboardDeliveryChain {
   const h = hints || {};
   const chatUiUrl = String(h.chatUiUrl || "").trim();
   const rawPort = h.port ?? resolvePort(chatUiUrl, DASHBOARD_PORT);
-  const port = Number.isFinite(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : DASHBOARD_PORT;
+  const port =
+    Number.isFinite(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : DASHBOARD_PORT;
   const hasNonLoopbackUrl = chatUiUrl !== "" && !isLoopbackUrl(chatUiUrl);
 
   let accessUrl: string;
+  const fallbackUrls: string[] = [];
   if (hasNonLoopbackUrl) {
     accessUrl = ensureScheme(chatUiUrl);
-  } else if (h.isWsl && h.wslHostAddress) {
-    accessUrl = `http://${h.wslHostAddress}:${port}`;
   } else {
+    // Loopback is the primary URL on every host, including WSL: modern WSL2
+    // forwards Windows' `127.0.0.1` into the VM, and the dashboard forward
+    // already binds `0.0.0.0` (see `forwardTarget` below). The WSL host IP is
+    // kept as a fallback for setups where that forwarding is unavailable. (#6171)
     accessUrl = `http://127.0.0.1:${port}`;
+    if (h.isWsl && h.wslHostAddress) {
+      fallbackUrls.push(`http://${h.wslHostAddress}:${port}`);
+    }
   }
 
   // #3259 — operator opt-in via NEMOCLAW_DASHBOARD_BIND=0.0.0.0 for remote-SSH-deployed
   // hosts (Brev, cloud workstations). Only "0.0.0.0" is honored; arbitrary IPs are
   // rejected silently to keep the surface narrow.
   const remoteBindOptIn = h.bindOverride === "0.0.0.0";
-  const forwardTarget =
-    h.isWsl || hasNonLoopbackUrl || remoteBindOptIn ? `0.0.0.0:${port}` : String(port);
+  const forwardTarget = h.isWsl || remoteBindOptIn ? `0.0.0.0:${port}` : String(port);
   const bindAddress = forwardTarget.includes(":") ? "0.0.0.0" : "127.0.0.1";
   const loopbackOrigin = `http://127.0.0.1:${port}`;
-  const accessOrigin = (() => { try { return new URL(accessUrl).origin; } catch { return null; } })();
-  const corsOrigins = accessOrigin && accessOrigin !== loopbackOrigin
-    ? [loopbackOrigin, accessOrigin] : [loopbackOrigin];
+  const toOrigin = (value: string): string | null => {
+    try {
+      return new URL(value).origin;
+    } catch {
+      return null;
+    }
+  };
+  const extraOrigins = [accessUrl, ...fallbackUrls]
+    .map(toOrigin)
+    .filter((origin): origin is string => origin !== null && origin !== loopbackOrigin);
+  const corsOrigins = [loopbackOrigin, ...new Set(extraOrigins)];
 
   const shouldDisableDeviceAuth = hasNonLoopbackUrl || (h.isWsl ?? false) || remoteBindOptIn;
+  const dashboardHealthEndpoint = normalizeEndpointPath(h.dashboardHealthEndpoint, "/health");
+  const gatewayPort =
+    Number.isFinite(h.gatewayPort) && h.gatewayPort! >= 1 && h.gatewayPort! <= 65535
+      ? Number(h.gatewayPort)
+      : port;
+  const gatewayHealthEndpoint = normalizeEndpointPath(
+    h.gatewayHealthEndpoint,
+    dashboardHealthEndpoint,
+  );
 
-  return { accessUrl, corsOrigins, forwardTarget, healthEndpoint: "/health", port, bindAddress, shouldDisableDeviceAuth };
+  return {
+    accessUrl,
+    fallbackUrls,
+    corsOrigins,
+    forwardTarget,
+    healthEndpoint: dashboardHealthEndpoint,
+    dashboardHealthEndpoint,
+    gatewayPort,
+    gatewayHealthEndpoint,
+    port,
+    bindAddress,
+    shouldDisableDeviceAuth,
+  };
 }
 
 /** Build the list of control UI URLs. Callers pass chatUiUrl explicitly. */
@@ -108,4 +172,22 @@ export function buildControlUiUrls(
     urls.push(`${chatUi}/${hash}`);
   }
   return [...new Set(urls)];
+}
+
+export function buildFallbackControlUiUrls(
+  token: string | null,
+  port: number,
+  fallbackUrls: string[],
+): string[] {
+  return fallbackUrls.flatMap((fallback) => {
+    let url: URL;
+    try {
+      url = new URL(fallback);
+    } catch {
+      return [];
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return [];
+    url.port = String(port);
+    return buildControlUiUrls(token, port, url.toString()).slice(1);
+  });
 }

@@ -2,31 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
-const DIST_AUTH = path.join(
-  import.meta.dirname,
-  "..",
-  "..",
-  "dist",
-  "lib",
-  "hermes-provider-auth.js",
-);
-const DIST_BROKER = path.join(
-  import.meta.dirname,
-  "..",
-  "..",
-  "dist",
-  "lib",
-  "hermes-tool-gateway-broker.js",
-);
+const SOURCE_AUTH = path.join(import.meta.dirname, "hermes-provider-auth.ts");
+const SOURCE_BROKER = path.join(import.meta.dirname, "hermes-tool-gateway-broker.ts");
 
-function clearDistModule(modulePath: string): void {
+function clearSourceModule(modulePath: string): void {
   try {
     delete require.cache[require.resolve(modulePath)];
   } catch {
@@ -35,24 +21,64 @@ function clearDistModule(modulePath: string): void {
 }
 
 function loadAuth(): Record<string, any> {
-  clearDistModule(DIST_AUTH);
-  return require(DIST_AUTH);
+  clearSourceModule(SOURCE_AUTH);
+  return require(SOURCE_AUTH);
 }
 
 function loadAuthWithBrokerStub(brokerStub: Record<string, any>): Record<string, any> {
-  clearDistModule(DIST_AUTH);
-  clearDistModule(DIST_BROKER);
-  const broker = require(DIST_BROKER);
+  clearSourceModule(SOURCE_AUTH);
+  clearSourceModule(SOURCE_BROKER);
+  const broker = require(SOURCE_BROKER);
   Object.assign(broker, brokerStub);
-  return require(DIST_AUTH);
+  return require(SOURCE_AUTH);
 }
 
 afterEach(() => {
-  clearDistModule(DIST_AUTH);
-  clearDistModule(DIST_BROKER);
+  clearSourceModule(SOURCE_AUTH);
+  clearSourceModule(SOURCE_BROKER);
 });
 
 describe("Hermes provider OpenShell credential handoff", () => {
+  it("inspects exact OpenShell credential key bindings without exposing values", async () => {
+    const auth = loadAuth();
+    const binding = await auth.inspectHermesProviderBinding(() => ({
+      status: 0,
+      stdout:
+        "Name: hermes-provider\nType: openai\nCredential keys: NOUS_API_KEY\nConfig keys: OPENAI_BASE_URL\n",
+      stderr: "",
+    }));
+    expect(binding).toEqual({ exists: true, credentialKeys: ["NOUS_API_KEY"] });
+  });
+
+  it("fails closed when OpenShell provider details omit credential metadata", async () => {
+    const auth = loadAuth();
+    await expect(
+      auth.inspectHermesProviderBinding(() => ({ status: 0, stdout: "Provider: exists" })),
+    ).resolves.toEqual({ exists: true, credentialKeys: null });
+  });
+
+  it("registers the OpenAI provider without a compatibility-profile mutation (#11229)", async () => {
+    const auth = loadAuth();
+    const runOpenshell = vi
+      .fn()
+      .mockReturnValueOnce({ status: 1, stdout: "", stderr: "provider not found" })
+      .mockReturnValueOnce({ status: 0, stdout: "", stderr: "" });
+
+    await auth.registerHermesInferenceProvider("nous-key", runOpenshell);
+
+    expect(runOpenshell.mock.calls.map(([args]) => args)).toEqual([
+      ["provider", "get", "hermes-provider"],
+      expect.arrayContaining([
+        "provider",
+        "create",
+        "--name",
+        "hermes-provider",
+        "--type",
+        "openai",
+      ]),
+    ]);
+  });
+
   it("registers Nous API-key inference in OpenShell without host-side persistence", async () => {
     const originalHome = process.env.HOME;
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-hermes-api-key-"));
@@ -64,10 +90,13 @@ describe("Hermes provider OpenShell credential handoff", () => {
         apiKey: "nous-key-1",
         runOpenshell: (args: string[], opts: { env?: Record<string, string> } = {}) => {
           calls.push({ args, env: opts.env });
-          if (args[0] === "provider" && args[1] === "get") {
-            return { status: 1, stdout: "", stderr: "" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
+          return args[1] === "get"
+            ? {
+                status: 1,
+                stdout: "",
+                stderr: "provider 'hermes-provider' not found",
+              }
+            : { status: 0, stdout: "", stderr: "" };
         },
       });
 
@@ -138,10 +167,13 @@ describe("Hermes provider OpenShell credential handoff", () => {
         noBrowser: true,
         runOpenshell: (args: string[], opts: { env?: Record<string, string> } = {}) => {
           providerCalls.push({ args, env: opts.env });
-          if (args[0] === "provider" && args[1] === "get") {
-            return { status: 1, stdout: "", stderr: "" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
+          return args[1] === "get"
+            ? {
+                status: 1,
+                stdout: "",
+                stderr: "provider 'hermes-provider' not found",
+              }
+            : { status: 0, stdout: "", stderr: "" };
         },
       });
 
@@ -149,9 +181,7 @@ describe("Hermes provider OpenShell credential handoff", () => {
       expect(state.credential_env).toBe("OPENAI_API_KEY");
       expect(state.inference_base_url).toBe("https://staging.nous.example/v1");
       expect(fetchCalls.some((call) => call.auth === "Bearer access-2")).toBe(true);
-      expect(
-        providerCalls.some((call) => call.env?.OPENAI_API_KEY === "agent-key-1"),
-      ).toBe(true);
+      expect(providerCalls.some((call) => call.env?.OPENAI_API_KEY === "agent-key-1")).toBe(true);
       expect(
         providerCalls.some((call) =>
           call.args.includes("OPENAI_BASE_URL=https://staging.nous.example/v1"),
@@ -172,7 +202,7 @@ describe("Hermes provider OpenShell credential handoff", () => {
       process.env.HOME = tmp;
       const brokerCalls: Array<{ sandboxName?: string; refreshToken?: string }> = [];
       const auth = loadAuthWithBrokerStub({
-        registerHermesToolGatewayRefreshProvider: (
+        registerHermesToolGatewayRefreshProvider: async (
           sandboxName: string,
           refreshToken: string,
         ) => {
@@ -226,10 +256,13 @@ describe("Hermes provider OpenShell credential handoff", () => {
         noBrowser: true,
         runOpenshell: (args: string[], opts: { env?: Record<string, string> } = {}) => {
           providerCalls.push({ args, env: opts.env });
-          if (args[0] === "provider" && args[1] === "get") {
-            return { status: 1, stdout: "", stderr: "" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
+          return args[1] === "get"
+            ? {
+                status: 1,
+                stdout: "",
+                stderr: "provider 'hermes-provider' not found",
+              }
+            : { status: 0, stdout: "", stderr: "" };
         },
         toolGatewayPresets: ["nous-web", "nous-audio"],
       });

@@ -3,10 +3,20 @@
 
 import { describe, expect, it } from "vitest";
 
-import { classifyNemoclawShim, DEV_SHIM_MARKER, isDevShimContents, isInstallerManagedWrapperContents } from "./shims";
+import {
+  classifyNemoclawShim,
+  DEV_SHIM_MARKER,
+  isDevShimContents,
+  isInstallerManagedWrapperContents,
+} from "./shims";
 
 function wrapper(extra = ""): string {
-  return ["#!/usr/bin/env bash", 'export PATH="/tmp/node-bin:$PATH"', 'exec "/tmp/prefix/bin/nemoclaw" "$@"', extra]
+  return [
+    "#!/usr/bin/env bash",
+    'export PATH="/tmp/node-bin:$PATH"',
+    'exec "/tmp/prefix/bin/nemoclaw" "$@"',
+    extra,
+  ]
     .filter((line) => line !== undefined)
     .join("\n");
 }
@@ -22,10 +32,52 @@ describe("uninstall shim classification", () => {
   it("recognizes installer-managed wrapper files", () => {
     const contents = wrapper("");
     expect(isInstallerManagedWrapperContents(contents)).toBe(true);
-    expect(classifyNemoclawShim({ contents, exists: true, isFile: true, isSymlink: false })).toMatchObject({
+    expect(
+      classifyNemoclawShim({ contents, exists: true, isFile: true, isSymlink: false }),
+    ).toMatchObject({
       kind: "managed-wrapper",
       remove: true,
     });
+  });
+
+  it("recognizes installer-managed wrappers with an idempotent Node PATH", () => {
+    const contents = [
+      "#!/usr/bin/env bash",
+      '[[ "$(command -v node 2>/dev/null)" == "/tmp/node-bin/node" ]] || export PATH="/tmp/node-bin:$PATH"',
+      'exec "/tmp/prefix/bin/nemoclaw" "$@"',
+    ].join("\n");
+
+    expect(isInstallerManagedWrapperContents(contents)).toBe(true);
+    expect(
+      classifyNemoclawShim({ contents, exists: true, isFile: true, isSymlink: false }),
+    ).toMatchObject({
+      kind: "managed-wrapper",
+      remove: true,
+    });
+  });
+
+  it("recognizes agent-alias wrapper shims by bin name (#6098)", () => {
+    const hermesWrapper = [
+      "#!/usr/bin/env bash",
+      'export PATH="/tmp/node-bin:$PATH"',
+      'exec "/tmp/prefix/bin/nemohermes" "$@"',
+    ].join("\n");
+    // Matches when classified as its own bin, and the default (nemoclaw) does not.
+    expect(isInstallerManagedWrapperContents(hermesWrapper, "nemohermes")).toBe(true);
+    expect(isInstallerManagedWrapperContents(hermesWrapper)).toBe(false);
+    expect(
+      classifyNemoclawShim(
+        { contents: hermesWrapper, exists: true, isFile: true, isSymlink: false },
+        "nemohermes",
+      ),
+    ).toMatchObject({ kind: "managed-wrapper", remove: true });
+    // A nemoclaw wrapper must not be treated as a managed nemohermes shim.
+    expect(
+      classifyNemoclawShim(
+        { contents: wrapper(""), exists: true, isFile: true, isSymlink: false },
+        "nemohermes",
+      ),
+    ).toMatchObject({ kind: "preserve-foreign-file", remove: false });
   });
 
   it("recognizes dev-install shims from npm-link-or-shim", () => {
@@ -38,7 +90,9 @@ describe("uninstall shim classification", () => {
     ].join("\n");
 
     expect(isDevShimContents(contents)).toBe(true);
-    expect(classifyNemoclawShim({ contents, exists: true, isFile: true, isSymlink: false })).toMatchObject({
+    expect(
+      classifyNemoclawShim({ contents, exists: true, isFile: true, isSymlink: false }),
+    ).toMatchObject({
       kind: "managed-dev-shim",
       remove: true,
     });
@@ -62,6 +116,16 @@ describe("uninstall shim classification", () => {
         isSymlink: false,
       }),
     ).toMatchObject({ kind: "preserve-foreign-file", remove: false });
+
+    expect(
+      isInstallerManagedWrapperContents(
+        [
+          "#!/usr/bin/env bash",
+          '[[ "$(command -v node 2>/dev/null)" == "/tmp/other-node-bin/node" ]] || export PATH="/tmp/node-bin:$PATH"',
+          'exec "/tmp/prefix/bin/nemoclaw" "$@"',
+        ].join("\n"),
+      ),
+    ).toBe(false);
   });
 
   it("treats missing and non-regular paths as no-remove cases", () => {

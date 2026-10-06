@@ -14,7 +14,7 @@ export default class SandboxLogsCommand extends NemoClawCommand {
   static id = "sandbox:logs";
   static strict = true;
   static summary = "Stream sandbox logs";
-  static description = "Show OpenClaw gateway logs and OpenShell audit logs for a sandbox.";
+  static description = "Show agent runtime logs and OpenShell audit logs for a sandbox.";
   static usage = ["<name> [--follow] [--tail <lines>|-n <lines>] [--since <duration>]"];
   static examples = [
     "<%= config.bin %> sandbox logs alpha",
@@ -44,7 +44,7 @@ export default class SandboxLogsCommand extends NemoClawCommand {
 
   public async run(): Promise<void> {
     const { args, flags } = await this.parse(SandboxLogsCommand);
-    showSandboxLogs(args.sandboxName, {
+    await showSandboxLogs(args.sandboxName, {
       follow: flags.follow === true,
       lines: String(flags.tail),
       since: flags.since ?? null,

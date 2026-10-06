@@ -6,20 +6,18 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { parseDuration } from "./domain/duration";
 import { parseGatewayTokenArgs, runGatewayTokenCommand } from "./gateway-token-command";
-import { resolveDefaultSandboxName, runStartCommand, runStopCommand } from "./tunnel/service-command";
+import {
+  resolveDefaultSandboxName,
+  runStartCommand,
+  runStopCommand,
+} from "./tunnel/service-command";
 import { getVersion } from "./core/version";
 
 // Narrow coverage guard for small helper modules that are otherwise only
 // exercised through subprocess CLI flows in this migration stack.
 describe("small CLI helper coverage", () => {
-  it("parses durations and rejects invalid values", () => {
-    expect(parseDuration("5m")).toBe(300);
-    expect(() => parseDuration("31m")).toThrow(/exceeds maximum/);
-  });
-
-  it("parses and runs gateway-token helpers", () => {
+  it("parses and runs gateway-token helpers", async () => {
     expect(parseGatewayTokenArgs(["--quiet", "extra"])).toEqual({
       options: { quiet: true },
       unknown: ["extra"],
@@ -27,7 +25,7 @@ describe("small CLI helper coverage", () => {
 
     const output: string[] = [];
     const warnings: string[] = [];
-    runGatewayTokenCommand(
+    await runGatewayTokenCommand(
       "alpha",
       { quiet: false },
       {
@@ -39,13 +37,17 @@ describe("small CLI helper coverage", () => {
     expect(output).toEqual(["token-123"]);
     expect(warnings.join("\n")).toContain("Treat this token like a password");
 
-    expect(() =>
+    await expect(
       runGatewayTokenCommand(
         "alpha",
         {},
-        { fetchToken: () => null, log: () => undefined, error: (message) => warnings.push(message) },
+        {
+          fetchToken: () => null,
+          log: () => undefined,
+          error: (message) => warnings.push(message),
+        },
       ),
-    ).toThrow(/Could not retrieve/);
+    ).rejects.toThrow(/Could not retrieve/);
   });
 
   it("resolves service command sandbox names", async () => {

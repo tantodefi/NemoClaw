@@ -1,24 +1,44 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { makeMessagingPlan } from "../../../test/helpers/messaging-plan-fixtures";
+import { decisionSelected } from "./onboard-checkpoint-decision";
 
 const require = createRequire(import.meta.url);
-const distPath = require.resolve("../../../dist/lib/state/onboard-session");
-const eventsDistPath = require.resolve("../../../dist/lib/onboard/machine/events");
+const distPath = require.resolve("./onboard-session");
+const eventsDistPath = require.resolve("../onboard/machine/events");
 const originalHome = process.env.HOME;
-type OnboardSessionModule = typeof import("../../../dist/lib/state/onboard-session");
-type OnboardMachineEventsModule = typeof import("../../../dist/lib/onboard/machine/events");
-type OnboardMachineEvent = import("../../../dist/lib/onboard/machine/events").OnboardMachineEvent;
+type OnboardSessionModule = typeof import("./onboard-session");
+type OnboardMachineEventsModule = typeof import("../onboard/machine/events");
+type OnboardMachineEvent = import("../onboard/machine/events").OnboardMachineEvent;
 type LoadedSession = NonNullable<ReturnType<OnboardSessionModule["loadSession"]>>;
 type DebugSummary = NonNullable<ReturnType<OnboardSessionModule["summarizeForDebug"]>>;
+type NullableSessionUpdateKey = import("./onboard-session").NullableSessionUpdateKey;
 let session: OnboardSessionModule;
 let machineEvents: OnboardMachineEventsModule;
 let tmpDir: string;
+
+const _nullableSessionUpdateKeyAcceptsNullableFields: Record<
+  Extract<"model" | "credentialEnv" | "webSearchConfig", NullableSessionUpdateKey>,
+  true
+> = {
+  model: true,
+  credentialEnv: true,
+  webSearchConfig: true,
+};
+const _nullableSessionUpdateKeyRejectsNonNullableFields: Record<
+  Extract<"status" | "gpuPassthrough" | "metadata", NullableSessionUpdateKey>,
+  never
+> = {};
+void _nullableSessionUpdateKeyAcceptsNullableFields;
+void _nullableSessionUpdateKeyRejectsNonNullableFields;
 
 function requireLoadedSession(
   loaded: ReturnType<OnboardSessionModule["loadSession"]>,
@@ -49,8 +69,8 @@ beforeEach(() => {
   process.env.HOME = tmpDir;
   delete require.cache[distPath];
   delete require.cache[eventsDistPath];
-  session = require("../../../dist/lib/state/onboard-session");
-  machineEvents = require("../../../dist/lib/onboard/machine/events");
+  session = require("./onboard-session");
+  machineEvents = require("../onboard/machine/events");
   machineEvents.clearOnboardMachineEventListeners();
   session.clearSession();
   session.releaseOnboardLock();
@@ -74,15 +94,110 @@ describe("onboard session", () => {
   });
 
   it("creates and persists a session with restrictive permissions", () => {
-    const created = session.createSession({ mode: "non-interactive" });
+    const created = session.createSession({
+      mode: "non-interactive",
+      startedAt: "2026-01-01T00:00:00.000Z",
+    });
     const saved = session.saveSession(created);
     const stat = fs.statSync(session.SESSION_FILE);
     const dirStat = fs.statSync(path.dirname(session.SESSION_FILE));
 
     expect(saved.mode).toBe("non-interactive");
+    expect(saved.toolDisclosure).toBe("progressive");
+    expect(saved.observabilityEnabled).toBe(false);
+    expect(saved.observabilityRequestedExplicitly).toBe(false);
+    expect(saved.machine).toMatchObject({
+      version: 1,
+      state: "init",
+      revision: 0,
+    });
+    expect(saved.machine.stateEnteredAt).toBe("2026-01-01T00:00:00.000Z");
     expect(fs.existsSync(session.SESSION_FILE)).toBe(true);
     expect(stat.mode & 0o777).toBe(0o600);
     expect(dirStat.mode & 0o777).toBe(0o700);
+  });
+
+  it("refuses malformed persisted APF compatibility selection without replacing it (#9833)", () => {
+    session.saveSession(session.createSession({ apfInterceptorRequested: true }));
+    const malformed = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
+    malformed.apfInterceptorRequested = "true";
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(malformed), { mode: 0o600 });
+    const refusal = /saved APF selection is invalid/u;
+    expect(() => session.loadSession()).toThrow(refusal);
+    expect(fs.readFileSync(session.SESSION_FILE, "utf8")).toContain(
+      '"apfInterceptorRequested":"true"',
+    );
+  });
+
+  it.each([true, false])(
+    "persists explicit observability intent when enabled=$enabled",
+    (observabilityEnabled) => {
+      session.saveSession(
+        session.createSession({
+          observabilityEnabled,
+          observabilityRequestedExplicitly: true,
+        }),
+      );
+      const loaded = requireLoadedSession(session.loadSession());
+      const summary = requireDebugSummary(session.summarizeForDebug());
+
+      expect(loaded.observabilityEnabled).toBe(observabilityEnabled);
+      expect(loaded.observabilityRequestedExplicitly).toBe(true);
+      expect(summary.observabilityEnabled).toBe(observabilityEnabled);
+      expect(summary.observabilityRequestedExplicitly).toBe(true);
+    },
+  );
+
+  it("defaults legacy observability intent and provenance off", () => {
+    const legacy = session.createSession() as unknown as Record<string, unknown>;
+    delete legacy.observabilityEnabled;
+    delete legacy.observabilityRequestedExplicitly;
+    const normalized = requireLoadedSession(session.normalizeSession(legacy as never));
+
+    expect(normalized.observabilityEnabled).toBe(false);
+    expect(normalized.observabilityRequestedExplicitly).toBe(false);
+  });
+
+  it("persists serving profile provenance while accepting legacy sessions (#8246)", () => {
+    const provenance = {
+      schemaVersion: 1,
+      catalogDigest: `sha256:${"1".repeat(64)}`,
+      preset: {
+        id: "vllm.dgx-spark-gb10.single.example",
+        digest: `sha256:${"2".repeat(64)}`,
+        displayName: "Example profile",
+        supportState: "experimental",
+      },
+      recipe: {
+        id: "vllm.dgx-spark-gb10.single.example",
+        digest: `sha256:${"3".repeat(64)}`,
+        backend: "vllm",
+      },
+      model: { id: "example/model", revision: "revision-1" },
+      runtimeImage: `example.invalid/vllm@sha256:${"4".repeat(64)}`,
+      estimatedImageDownloadBytes: 10,
+      estimatedModelDownloadBytes: 20,
+    } as const;
+    session.saveSession(session.createSession({ servingProfileProvenance: provenance }));
+
+    expect(requireLoadedSession(session.loadSession()).servingProfileProvenance).toEqual(
+      provenance,
+    );
+    expect(requireDebugSummary(session.summarizeForDebug()).servingProfileProvenance).toEqual(
+      provenance,
+    );
+
+    const legacy = session.createSession() as unknown as Record<string, unknown>;
+    delete legacy.servingProfileProvenance;
+    expect(
+      requireLoadedSession(session.normalizeSession(legacy as never)).servingProfileProvenance,
+    ).toBeNull();
+  });
+
+  it("fails closed on malformed persisted serving profile provenance (#8246)", () => {
+    const malformed = session.createSession() as unknown as Record<string, unknown>;
+    malformed.servingProfileProvenance = { schemaVersion: 1, catalogDigest: "latest" };
+    expect(session.normalizeSession(malformed as never)).toBeNull();
   });
 
   it("redacts credential-bearing endpoint URLs before persisting them", () => {
@@ -100,7 +215,25 @@ describe("onboard session", () => {
     expect(summary.endpointUrl).toBe(loaded.endpointUrl);
   });
 
-  it("marks steps started, completed, and failed", () => {
+  it("clears a spark Express intent once provider selection completes (#7231)", () => {
+    session.saveSession(
+      session.createSession({
+        mode: "non-interactive",
+        stationExpressIntent: { version: 1, kind: "spark", sandboxName: "my-assistant" },
+      }),
+    );
+    session.markStepComplete("provider_selection", {
+      provider: "vllm-local",
+      model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      sandboxName: "my-assistant",
+    });
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.stationExpressIntent).toBeNull();
+    expect(loaded.provider).toBe("vllm-local");
+  });
+
+  it("records step status without changing machine or terminal status", () => {
     session.saveSession(session.createSession());
     session.markStepStarted("gateway");
     let loaded = requireLoadedSession(session.loadSession());
@@ -118,15 +251,113 @@ describe("onboard session", () => {
     loaded = requireLoadedSession(session.loadSession());
     expect(loaded.steps.sandbox.status).toBe("failed");
     expect(loaded.steps.sandbox.completedAt).toBeNull();
-    expect(loaded.failure).not.toBeNull();
-    if (!loaded.failure) {
-      throw new Error("Expected failure metadata after markStepFailed()");
-    }
-    expect(loaded.failure.step).toBe("sandbox");
-    expect(loaded.failure.message).toMatch(/Sandbox creation failed/);
+    expect(loaded.steps.sandbox.error).toBe("Sandbox creation failed");
+    expect(loaded.failure).toBeNull();
+    expect(loaded.status).toBe("in_progress");
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
   });
 
-  it("emits redacted structured machine events for session step mutations", () => {
+  it("clears provider selection authority when a review is rejected", () => {
+    session.saveSession(
+      session.createSession({
+        provider: "ollama-local",
+        model: "qwen3.5:9b",
+        endpointUrl: "http://127.0.0.1:11435/v1",
+        credentialEnv: "NEMOCLAW_OLLAMA_PROXY_TOKEN",
+        sandboxName: "rejected-review",
+        sandboxPromptProgress: {
+          sandboxName: true,
+          webSearch: false,
+          messaging: false,
+          resourceProfile: false,
+        },
+      }),
+    );
+    session.markStepStarted("provider_selection");
+    session.updateSession((current) => {
+      current.checkpoint = {
+        schemaVersion: 4,
+        profile: { kind: "selected", value: "default" },
+        runtimeAuthority: { kind: "unset" },
+        sessionId: current.sessionId,
+        machineState: "init",
+        updatedAt: new Date().toISOString(),
+        sandboxIdentity: decisionSelected({ name: "rejected-review", agent: "openclaw" }),
+        webSearch: { kind: "unset" },
+        messaging: { kind: "unset" },
+        resourceProfile: { kind: "unset" },
+        gatewayAuthority: { kind: "unset" },
+        effectGroups: {},
+        bindings: { credentialEnvs: [], registeredProviders: [] },
+        sandboxRecreate: null,
+      };
+      return current;
+    });
+
+    const rejected = session.markStepRejected("provider_selection");
+
+    expect(rejected).toMatchObject({
+      provider: null,
+      model: null,
+      endpointUrl: null,
+      credentialEnv: null,
+      sandboxName: null,
+      sandboxPromptProgress: { sandboxName: false },
+      lastStepStarted: null,
+      resumable: false,
+      status: "failed",
+      failure: null,
+      steps: { provider_selection: { status: "skipped" } },
+      checkpoint: { sandboxIdentity: { kind: "unset" } },
+    });
+  });
+
+  it("can record step boundaries without mutating the machine snapshot", () => {
+    const emitted: OnboardMachineEvent[] = [];
+    machineEvents.addOnboardMachineEventListener((event) => emitted.push(event));
+    session.saveSession(session.createSession());
+
+    session.markStepStarted("preflight");
+    let loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.steps.preflight.status).toBe("in_progress");
+    expect(loaded.status).toBe("in_progress");
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepComplete("preflight", { sandboxName: "my-assistant" });
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.steps.preflight.status).toBe("complete");
+    expect(loaded.sandboxName).toBe("my-assistant");
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepFailed("gateway", "Gateway failed");
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.steps.gateway.status).toBe("failed");
+    expect(loaded.status).toBe("in_progress");
+    expect(loaded.failure).toBeNull();
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+    expect(emitted).toEqual([]);
+  });
+
+  it("leaves machine transition ownership outside step helpers", () => {
+    session.saveSession(session.createSession());
+    let loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepStarted("preflight");
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepComplete("preflight");
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepComplete("gateway");
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+    expect(requireDebugSummary(session.summarizeForDebug()).machine).toEqual(loaded.machine);
+  });
+
+  it("does not emit machine events for direct step mutations", () => {
     const emitted: OnboardMachineEvent[] = [];
     machineEvents.addOnboardMachineEventListener((event) => emitted.push(event));
 
@@ -136,48 +367,12 @@ describe("onboard session", () => {
       sandboxName: "my-assistant",
       endpointUrl:
         "https://alice:super-secret-token@example.com/v1?token=super-secret-token&keep=yes#token=super-secret-token",
-      credentialEnv: "NVIDIA_API_KEY",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
     });
     session.markStepSkipped("openclaw");
-    session.markStepFailed("sandbox", "NVIDIA_API_KEY=super-secret-token");
-    session.completeSession({ provider: "ollama-local", credentialEnv: null });
+    session.markStepFailed("sandbox", "NVIDIA_INFERENCE_API_KEY=super-secret-token");
 
-    expect(emitted.map((event) => event.type)).toEqual([
-      "state.entered",
-      "context.updated",
-      "state.completed",
-      "state.skipped",
-      "state.failed",
-      "onboard.failed",
-      "context.updated",
-      "onboard.completed",
-    ]);
-    expect(emitted[0]).toMatchObject({
-      version: 1,
-      sessionId: "session-1",
-      state: "gateway",
-      step: "gateway",
-      error: null,
-    });
-    expect(emitted[1].context).toMatchObject({
-      sandboxName: "my-assistant",
-      credentialEnv: "NVIDIA_API_KEY",
-    });
-    expect(emitted[1].context.endpointOrigin).toBe("https://example.com");
-    expect(emitted[1].metadata.fields).toEqual([
-      "sandboxName",
-      "endpointUrl",
-      "credentialEnv",
-    ]);
-    expect(emitted[4]).toMatchObject({
-      type: "state.failed",
-      state: "sandbox",
-      step: "sandbox",
-      error: "NVIDIA_API_KEY=<REDACTED>",
-    });
-    expect(emitted[5]).toMatchObject({ type: "onboard.failed", state: "failed" });
-    expect(emitted.at(-1)).toMatchObject({ type: "onboard.completed", state: "complete" });
-    expect(JSON.stringify(emitted)).not.toContain("super-secret-token");
+    expect(emitted).toEqual([]);
 
     const persisted = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
     expect(persisted.events).toBeUndefined();
@@ -215,11 +410,8 @@ describe("onboard session", () => {
     session.completeSession();
     session.completeSession();
 
-    expect(emitted.map((event) => event.type)).toEqual([
-      "state.skipped",
-      "onboard.completed",
-    ]);
-    expect(emitted).toHaveLength(2);
+    expect(emitted.map((event) => event.type)).toEqual(["onboard.completed"]);
+    expect(emitted).toHaveLength(1);
   });
 
   it("persists safe provider metadata without persisting secrets", () => {
@@ -232,10 +424,10 @@ describe("onboard session", () => {
       model: "nvidia/test-model",
       sandboxName: "my-assistant",
       endpointUrl: "https://example.com/v1",
-      credentialEnv: "NVIDIA_API_KEY",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
       preferredInferenceApi: "openai-completions",
+      compatibleEndpointReasoning: "true",
       nimContainer: "nim-123",
-      policyPresets: ["pypi", "npm"],
       apiKey: "nvapi-secret",
       metadata: {
         gatewayName: "nemoclaw",
@@ -249,10 +441,13 @@ describe("onboard session", () => {
     expect(loaded.model).toBe("nvidia/test-model");
     expect(loaded.sandboxName).toBe("my-assistant");
     expect(loaded.endpointUrl).toBe("https://example.com/v1");
-    expect(loaded.credentialEnv).toBe("NVIDIA_API_KEY");
+    expect(loaded.credentialEnv).toBe("NVIDIA_INFERENCE_API_KEY");
     expect(loaded.preferredInferenceApi).toBe("openai-completions");
+    expect(loaded.compatibleEndpointReasoning).toBe("true");
     expect(loaded.nimContainer).toBe("nim-123");
-    expect(loaded.policyPresets).toEqual(["pypi", "npm"]);
+    expect(requireDebugSummary(session.summarizeForDebug()).compatibleEndpointReasoning).toBe(
+      "true",
+    );
     expect("apiKey" in loaded).toBe(false);
     expect(loaded.metadata.gatewayName).toBe("nemoclaw");
     expect("token" in loaded.metadata).toBe(false);
@@ -267,7 +462,7 @@ describe("onboard session", () => {
   // disk and the next rebuild preflight demanded a credential the current
   // sandbox did not need.
 
-  it("clears credentialEnv when provider-selection update passes null (GH #2625)", () => {
+  it("clears credentialEnv when a provider-selection update passes null (#2625)", () => {
     // Seed with a prior remote-provider onboard state.
     session.saveSession(session.createSession());
     session.markStepComplete("provider_selection", {
@@ -316,6 +511,56 @@ describe("onboard session", () => {
     expect(loaded.provider).toBe("openai");
   });
 
+  // Session secret boundary from #6225. Endpoint query coverage for #6224
+  // lives in onboard-session-redaction.test.ts.
+
+  it("round-trips writer-shaped legacy migration hashes and drops non-string entries (#6225)", () => {
+    // Digest shape mirrors legacyValueHash() in src/lib/onboard.ts, the only
+    // production writer of this map. This test covers session filtering and
+    // persistence; the writer owns converting credential values to digests.
+    const legacyValue = "nvapi-sentinel6225-legacy-value-do-not-persist";
+    const digest = createHash("sha256").update(legacyValue).digest("hex");
+    session.saveSession(session.createSession());
+    expect(
+      JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8")).migratedLegacyValueHashes,
+    ).toBeNull();
+
+    session.markStepComplete("provider_selection", {
+      migratedLegacyValueHashes: {
+        NVIDIA_API_KEY: digest,
+        BROKEN_NUMERIC: 123,
+        BROKEN_NULL: null,
+      } as unknown as Record<string, string>,
+    });
+
+    const raw = fs.readFileSync(session.SESSION_FILE, "utf8");
+    expect(raw).toContain(digest);
+    expect(raw).not.toContain("BROKEN_NUMERIC");
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.migratedLegacyValueHashes).toEqual({ NVIDIA_API_KEY: digest });
+    expect(loaded.migratedLegacyValueHashes?.NVIDIA_API_KEY).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("serializes missing and explicit-null credentialEnv identically (#6228)", () => {
+    // #6228 contract gap: the schema cannot distinguish "never prompted",
+    // "user declined", and "explicitly cleared" once they become null.
+    session.saveSession(session.createSession());
+    const unset = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8")).credentialEnv;
+
+    session.markStepComplete("provider_selection", {
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+    });
+    session.markStepComplete("provider_selection", { credentialEnv: null });
+    const declined = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8")).credentialEnv;
+
+    expect(unset).toBeNull();
+    expect(declined).toBeNull();
+    expect(declined).toBe(unset);
+    expect(requireLoadedSession(session.loadSession()).credentialEnv).toBeNull();
+  });
+
+  // Focused endpoint secret-persistence coverage lives in onboard-session-redaction.test.ts.
+
   it("only persists known Hermes auth methods", () => {
     session.saveSession(session.createSession());
     session.markStepComplete("provider_selection", {
@@ -338,8 +583,51 @@ describe("onboard session", () => {
     expect(loaded.hermesAuthMethod).toBeNull();
   });
 
+  it("classifies nullable string update intent explicitly", () => {
+    const unchanged = session.getNullableStringUpdateIntent(undefined);
+    const malformed = session.getNullableStringUpdateIntent(42);
+    const clear = session.getNullableStringUpdateIntent(null);
+    const normalizedClear = session.getNullableStringUpdateIntent(
+      "https://secret.example",
+      () => null,
+    );
+    const set = session.getNullableStringUpdateIntent("model");
+
+    expect(unchanged).toEqual({ kind: "unchanged" });
+    expect(malformed).toEqual({ kind: "unchanged" });
+    expect(clear).toEqual({ kind: "clear" });
+    expect(normalizedClear).toEqual({ kind: "clear" });
+    expect(set).toEqual({ kind: "set", value: "model" });
+    expect(session.hasSessionUpdateValue(unchanged)).toBe(false);
+    expect(session.hasSessionUpdateValue(clear)).toBe(true);
+    expect(session.isSessionUpdateClear(clear)).toBe(true);
+    expect(session.isSessionUpdateClear(set)).toBe(false);
+  });
+
+  it("applies nullable session update intent to safe updates", () => {
+    const safe: Partial<LoadedSession> = {};
+
+    session.applyNullableSessionUpdate(
+      safe,
+      "model",
+      session.getNullableStringUpdateIntent("model-a"),
+    );
+    session.applyNullableSessionUpdate(
+      safe,
+      "credentialEnv",
+      session.getNullableStringUpdateIntent(null),
+    );
+    session.applyNullableSessionUpdate(
+      safe,
+      "provider",
+      session.getNullableStringUpdateIntent(undefined),
+    );
+
+    expect(safe).toEqual({ model: "model-a", credentialEnv: null });
+  });
+
   it("accepts null as an explicit clear for every nullable string field", () => {
-    // All six nullable fields that travel through filterSafeUpdates must
+    // All nullable fields that travel through filterSafeUpdates must
     // support the null-clear contract. If any regresses to the old
     // string-only guard, the test below catches it.
     session.saveSession(session.createSession());
@@ -350,6 +638,7 @@ describe("onboard session", () => {
       endpointUrl: "https://api.openai.com/v1",
       credentialEnv: "OPENAI_API_KEY",
       preferredInferenceApi: "openai-completions",
+      compatibleEndpointReasoning: "true",
       nimContainer: "nim-abc",
     });
 
@@ -360,6 +649,7 @@ describe("onboard session", () => {
       endpointUrl: null,
       credentialEnv: null,
       preferredInferenceApi: null,
+      compatibleEndpointReasoning: null,
       nimContainer: null,
     });
 
@@ -370,6 +660,7 @@ describe("onboard session", () => {
     expect(loaded.endpointUrl).toBeNull();
     expect(loaded.credentialEnv).toBeNull();
     expect(loaded.preferredInferenceApi).toBeNull();
+    expect(loaded.compatibleEndpointReasoning).toBeNull();
     expect(loaded.nimContainer).toBeNull();
   });
 
@@ -396,116 +687,141 @@ describe("onboard session", () => {
     expect(loaded.nimContainer).toBeNull();
   });
 
-  it("persists messagingChannels across save/load roundtrips", () => {
+  it("persists messagingPlan across save/load roundtrips", () => {
     const created = session.createSession();
-    created.messagingChannels = ["telegram", "slack"];
-    session.saveSession(created);
-
-    const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.messagingChannels).toEqual(["telegram", "slack"]);
-  });
-
-  it("filters non-string entries out of persisted messagingChannels", () => {
-    const created = session.createSession();
-    fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
-    fs.writeFileSync(
-      session.SESSION_FILE,
-      JSON.stringify({
-        ...created,
-        messagingChannels: ["telegram", 42, null, "discord"],
-      }),
-    );
-
-    const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.messagingChannels).toEqual(["telegram", "discord"]);
-  });
-
-  it("persists disabledChannels across save/load roundtrips", () => {
-    // Regression: `channels stop X` followed by rebuild must carry the paused
-    // set through the destroy/recreate window. The Session mirror is the only
-    // place this can survive, because rebuild destroys the registry entry
-    // before `onboard --resume` reads it back.
-    const created = session.createSession();
-    created.disabledChannels = ["telegram"];
-    session.saveSession(created);
-
-    const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.disabledChannels).toEqual(["telegram"]);
-  });
-
-  it("filters non-string entries out of persisted disabledChannels", () => {
-    const created = session.createSession();
-    fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
-    fs.writeFileSync(
-      session.SESSION_FILE,
-      JSON.stringify({
-        ...created,
-        disabledChannels: ["telegram", 42, null, "discord"],
-      }),
-    );
-
-    const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.disabledChannels).toEqual(["telegram", "discord"]);
-  });
-
-  it("defaults disabledChannels to null for fresh sessions", () => {
-    const fresh = session.createSession();
-    expect(fresh.disabledChannels).toBeNull();
-  });
-
-  it("filterSafeUpdates passes through disabledChannels and accepts explicit null clear", () => {
-    session.saveSession(session.createSession());
-    session.markStepComplete("provider_selection", { disabledChannels: ["discord"] });
-    expect(requireLoadedSession(session.loadSession()).disabledChannels).toEqual(["discord"]);
-
-    session.markStepComplete("provider_selection", { disabledChannels: null });
-    expect(requireLoadedSession(session.loadSession()).disabledChannels).toBeNull();
-  });
-
-  it("defaults messagingChannels to null for fresh sessions", () => {
-    const fresh = session.createSession();
-    expect(fresh.messagingChannels).toBeNull();
-  });
-
-  it("persists messagingChannelConfig across save/load roundtrips", () => {
-    const created = session.createSession();
-    created.messagingChannelConfig = {
-      TELEGRAM_ALLOWED_IDS: "123,456",
-      TELEGRAM_REQUIRE_MENTION: "1",
-    };
-    session.saveSession(created);
-
-    const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.messagingChannelConfig).toEqual({
-      TELEGRAM_ALLOWED_IDS: "123,456",
-      TELEGRAM_REQUIRE_MENTION: "1",
+    created.messagingPlan = makeMessagingPlan({
+      channels: ["telegram", "slack"],
+      disabledChannels: ["slack"],
     });
+    session.saveSession(created);
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.messagingPlan).toMatchObject({
+      schemaVersion: 1,
+      sandboxName: "my-assistant",
+      agent: "openclaw",
+      workflow: "onboard",
+      disabledChannels: ["slack"],
+      channels: [
+        expect.objectContaining({ channelId: "telegram", configured: true, disabled: false }),
+        expect.objectContaining({ channelId: "slack", configured: true, disabled: true }),
+      ],
+    });
+    expect(loaded.messagingPlan?.channels[0]?.inputs.map((input) => input.inputId)).toContain(
+      "botToken",
+    );
   });
 
-  it("filters malformed messagingChannelConfig entries on load", () => {
+  it("writes compact messagingPlan derived fields to onboard-session.json", () => {
+    const created = session.createSession();
+    created.messagingPlan = {
+      ...makeMessagingPlan({ channels: ["telegram"] }),
+      channels: [
+        {
+          ...makeMessagingPlan({ channels: ["telegram"] }).channels[0],
+          hooks: [
+            {
+              channelId: "telegram",
+              id: "telegram-token-paste",
+              phase: "enroll",
+              handler: "common.tokenPaste",
+            },
+          ],
+        },
+      ],
+      agentRender: [
+        {
+          channelId: "telegram",
+          renderId: "telegram-openclaw-channel",
+          hookId: "telegram-openclaw-channel",
+          handler: "common.staticOutputs",
+          kind: "json-fragment",
+          agent: "openclaw",
+          target: "openclaw.json",
+          path: "channels.telegram",
+          value: { enabled: true },
+          templateRefs: [],
+        },
+      ],
+    };
+
+    session.saveSession(created);
+
+    const raw = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf-8"));
+    expect(raw.messagingPlan.networkPolicy).toBeUndefined();
+    expect(raw.messagingPlan.agentRender).toBeUndefined();
+    expect(raw.messagingPlan.buildSteps).toBeUndefined();
+    expect(raw.messagingPlan.runtimeSetup).toBeUndefined();
+    expect(raw.messagingPlan.stateUpdates).toBeUndefined();
+    expect(raw.messagingPlan.healthChecks).toBeUndefined();
+    expect(raw.messagingPlan.channels[0].displayName).toBeUndefined();
+    expect(raw.messagingPlan.channels[0].authMode).toBeUndefined();
+    expect(raw.messagingPlan.channels[0].active).toBe(true);
+    expect(raw.messagingPlan.channels[0].selected).toBeUndefined();
+    expect(raw.messagingPlan.channels[0].hooks).toBeUndefined();
+    const reloadedPlan = requireLoadedSession(session.loadSession()).messagingPlan;
+    expect(reloadedPlan?.agentRender).toEqual([]);
+    expect(reloadedPlan?.channels[0]?.hooks).toEqual([]);
+  });
+
+  it("drops malformed persisted messagingPlan on load", () => {
     const created = session.createSession();
     fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
     fs.writeFileSync(
       session.SESSION_FILE,
       JSON.stringify({
         ...created,
-        messagingChannelConfig: {
-          TELEGRAM_ALLOWED_IDS: "123",
-          TELEGRAM_REQUIRE_MENTION: "true",
-          DISCORD_REQUIRE_MENTION: "0",
-          NVIDIA_API_KEY: "not-channel-config",
+        messagingPlan: {
+          ...makeMessagingPlan({ channels: ["telegram"] }),
+          disabledChannels: ["telegram", 42, null],
         },
       }),
     );
 
     const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.messagingChannelConfig).toEqual({
-      TELEGRAM_ALLOWED_IDS: "123",
-      DISCORD_REQUIRE_MENTION: "0",
+    expect(loaded.messagingPlan).toBeNull();
+  });
+
+  it("persists disabled channel state inside messagingPlan", () => {
+    // Regression: `channels stop X` followed by rebuild must carry the paused
+    // set through the destroy/recreate window. The session plan is the only
+    // place this can survive, because rebuild destroys the registry entry
+    // before `onboard --resume` reads it back.
+    const created = session.createSession();
+    created.messagingPlan = makeMessagingPlan({
+      channels: ["telegram"],
+      disabledChannels: ["telegram"],
+    });
+    session.saveSession(created);
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.messagingPlan?.disabledChannels).toEqual(["telegram"]);
+    expect(loaded.messagingPlan?.channels[0]).toMatchObject({
+      channelId: "telegram",
+      active: false,
+      disabled: true,
     });
   });
 
-  it("#1737: persists telegramConfig across save/load roundtrips (requireMention=true)", () => {
+  it("filterSafeUpdates passes through messagingPlan and accepts explicit null clear", () => {
+    session.saveSession(session.createSession());
+    const plan = makeMessagingPlan({ channels: ["discord"] });
+    session.markStepComplete("provider_selection", { messagingPlan: plan });
+    expect(requireLoadedSession(session.loadSession()).messagingPlan).toMatchObject({
+      sandboxName: "my-assistant",
+      channels: [expect.objectContaining({ channelId: "discord", configured: true })],
+    });
+
+    session.markStepComplete("provider_selection", { messagingPlan: null });
+    expect(requireLoadedSession(session.loadSession()).messagingPlan).toBeNull();
+  });
+
+  it("defaults messagingPlan to null for fresh sessions", () => {
+    const fresh = session.createSession();
+    expect(fresh.messagingPlan).toBeNull();
+  });
+
+  it("persists telegramConfig across save/load roundtrips with requireMention=true (#1737)", () => {
     const created = session.createSession();
     created.telegramConfig = { requireMention: true };
     session.saveSession(created);
@@ -514,7 +830,7 @@ describe("onboard session", () => {
     expect(loaded.telegramConfig).toEqual({ requireMention: true });
   });
 
-  it("#1737: persists telegramConfig across save/load roundtrips (requireMention=false)", () => {
+  it("persists telegramConfig across save/load roundtrips with requireMention=false (#1737)", () => {
     const created = session.createSession();
     created.telegramConfig = { requireMention: false };
     session.saveSession(created);
@@ -523,7 +839,7 @@ describe("onboard session", () => {
     expect(loaded.telegramConfig).toEqual({ requireMention: false });
   });
 
-  it("#1737: rejects malformed telegramConfig on load", () => {
+  it("rejects malformed telegramConfig on load (#1737)", () => {
     // Simulate a hand-edited session file with garbage in telegramConfig.
     // Going through saveSession() would re-normalize the value before it
     // hits disk, so write raw JSON directly to exercise the load-time
@@ -538,7 +854,7 @@ describe("onboard session", () => {
     expect(loaded.telegramConfig).toBeNull();
   });
 
-  it("#1737: defaults telegramConfig to null for fresh sessions", () => {
+  it("defaults telegramConfig to null for fresh sessions (#1737)", () => {
     const fresh = session.createSession();
     expect(fresh.telegramConfig).toBeNull();
   });
@@ -598,11 +914,45 @@ describe("onboard session", () => {
     });
 
     let loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.webSearchConfig).toEqual({ fetchEnabled: true });
+    expect(loaded.webSearchConfig).toEqual({ fetchEnabled: true, provider: "brave" });
 
     session.completeSession({ webSearchConfig: null });
     loaded = requireLoadedSession(session.loadSession());
     expect(loaded.webSearchConfig).toBeNull();
+  });
+
+  it("round-trips an explicit Tavily web search provider", () => {
+    session.saveSession(
+      session.createSession({
+        webSearchConfig: { fetchEnabled: true, provider: "tavily" },
+      }),
+    );
+
+    expect(requireLoadedSession(session.loadSession()).webSearchConfig).toEqual({
+      fetchEnabled: true,
+      provider: "tavily",
+    });
+  });
+
+  it("migrates provider-less enabled web search state to Brave when loading", () => {
+    session.saveSession(session.createSession());
+    const persisted = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
+    persisted.webSearchConfig = { fetchEnabled: true };
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(persisted));
+
+    expect(requireLoadedSession(session.loadSession()).webSearchConfig).toEqual({
+      fetchEnabled: true,
+      provider: "brave",
+    });
+  });
+
+  it("fails closed for an invalid persisted web search provider", () => {
+    session.saveSession(session.createSession());
+    const persisted = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
+    persisted.webSearchConfig = { fetchEnabled: true, provider: "unexpected" };
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(persisted));
+
+    expect(requireLoadedSession(session.loadSession()).webSearchConfig).toBeNull();
   });
 
   it("does not clear existing metadata when updates omit whitelisted metadata fields", () => {
@@ -623,6 +973,68 @@ describe("onboard session", () => {
     expect("token" in loaded.metadata).toBe(false);
   });
 
+  it("round-trips secret-free read-only host mount metadata", () => {
+    const hostMounts = [
+      { source: "/srv/project", target: "/sandbox/project", readOnly: true as const },
+    ];
+    session.saveSession(
+      session.createSession({
+        metadata: { gatewayName: "nemoclaw", fromDockerfile: null, hostMounts },
+      }),
+    );
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.metadata.hostMounts).toEqual(hostMounts);
+    expect(loaded.metadata.hostMounts).not.toBe(hostMounts);
+  });
+
+  it("preserves a fail-closed marker for malformed host mount metadata", () => {
+    const malformed = session.createSession();
+    fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
+    fs.writeFileSync(
+      session.SESSION_FILE,
+      JSON.stringify({
+        ...malformed,
+        metadata: {
+          ...malformed.metadata,
+          hostMounts: [
+            { source: "/srv/project", target: "/sandbox/project", readOnly: true },
+            { source: "/srv/private", target: "/sandbox/private", readOnly: false },
+          ],
+        },
+      }),
+    );
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(session.hasInvalidSessionHostMounts(loaded)).toBe(true);
+    expect(loaded.metadata.hostMounts).toBeUndefined();
+  });
+
+  it("preserves a fail-closed marker for terminal-control host mount metadata", () => {
+    const malformed = session.createSession();
+    fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
+    fs.writeFileSync(
+      session.SESSION_FILE,
+      JSON.stringify({
+        ...malformed,
+        metadata: {
+          ...malformed.metadata,
+          hostMounts: [
+            {
+              source: "/srv/project",
+              target: "/sandbox/project\u2028forged",
+              readOnly: true,
+            },
+          ],
+        },
+      }),
+    );
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(session.hasInvalidSessionHostMounts(loaded)).toBe(true);
+    expect(loaded.metadata.hostMounts).toBeUndefined();
+  });
+
   it("drops non-string gatewayName during normalization", () => {
     fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
     fs.writeFileSync(
@@ -637,6 +1049,31 @@ describe("onboard session", () => {
     fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
     fs.writeFileSync(session.SESSION_FILE, "not-json");
     expect(session.loadSession()).toBeNull();
+  });
+
+  it("keeps completed legacy checkpoint sessions readable as status evidence", () => {
+    const completed = session.createSession({ sessionId: "legacy-completed" });
+    completed.status = "complete";
+    completed.resumable = false;
+    completed.machine = {
+      version: 1,
+      state: "complete",
+      stateEnteredAt: completed.updatedAt,
+      revision: 8,
+    };
+    const raw = JSON.parse(JSON.stringify(completed)) as Record<string, unknown>;
+    raw.checkpoint = { schemaVersion: 3, sessionId: completed.sessionId };
+    fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(raw, null, 2), { mode: 0o600 });
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded).toMatchObject({
+      sessionId: "legacy-completed",
+      status: "complete",
+      resumable: false,
+      machine: { state: "complete", revision: 8 },
+      checkpoint: null,
+    });
   });
 
   it("acquires and releases the onboard lock", () => {
@@ -715,7 +1152,7 @@ describe("onboard session", () => {
     }
   });
 
-  it("regression #1281: stale-cleanup race does not unlink a fresh lock claimed by another process", () => {
+  it("does not unlink a fresh lock claimed by another process during a stale-cleanup race (#1281)", () => {
     // Reproduces the race: the lock file we read as 'stale' gets replaced
     // with a fresh claim from a faster concurrent process between our
     // read and our unlink. The slower process must NOT unlink the fresh
@@ -736,8 +1173,8 @@ describe("onboard session", () => {
     //      ORIGINAL stale lock (dead PID 999999), isProcessAlive
     //      returns false, and acquireOnboardLock enters the stale-
     //      cleanup path calling unlinkIfInodeMatches.
-    //    - stat #2 (inside unlinkIfInodeMatches): BEFORE the actual
-    //      stat, swap the file for a fresh claim. stat #2 then sees
+    //    - stat #1 (inside unlinkIfInodeMatches): BEFORE the actual
+    //      stat, swap the file for a fresh claim. stat #1 then sees
     //      a different inode → must skip the unlink.
     //
     //    CodeRabbit correctly flagged the original test: swapping on
@@ -747,10 +1184,10 @@ describe("onboard session", () => {
     const originalStatSync = fs.statSync;
     const statSpy = vi.spyOn(fs, "statSync").mockImplementation((...args) => {
       statCallCount += 1;
-      // Just before stat #2 (inside unlinkIfInodeMatches), simulate
+      // Just before stat #1 (inside unlinkIfInodeMatches), simulate
       // the race: a concurrent fast process unlinks the stale lock
-      // and writes a fresh claim. stat #2 then sees a new inode.
-      if (statCallCount === 2) {
+      // and writes a fresh claim. stat #1 then sees a new inode.
+      if (statCallCount === 1) {
         // Write the fresh claim to a temp file first, then rename over
         // the stale lock. This guarantees a different inode even on
         // tmpfs/overlayfs which can reuse inodes after unlink+recreate.
@@ -770,9 +1207,9 @@ describe("onboard session", () => {
     });
 
     try {
-      // The acquire call will see EEXIST (stale lock present), stat it,
-      // then the swap happens, then the second stat (inside the cleanup
-      // helper) sees a different inode → must NOT unlink.
+      // The acquire call will see EEXIST (stale lock present), read it
+      // through a pinned descriptor, then the stat inside the cleanup
+      // helper sees a different inode → must NOT unlink.
       const result = session.acquireOnboardLock("nemoclaw onboard --resume");
       // The fresh lock that the simulated concurrent process wrote
       // should still be on disk after acquireOnboardLock returns.
@@ -795,31 +1232,25 @@ describe("onboard session", () => {
     }
   });
 
-  it("treats recent malformed lock as transient and does not remove it", () => {
-    fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
-    // Write a malformed lock with the current timestamp (< 30 s old).
-    fs.writeFileSync(session.LOCK_FILE, "{not-json", { mode: 0o600 });
+  it.each(["", "{not-json"])(
+    "preserves a fresh incomplete lock and reclaims abandoned debris: %j",
+    (contents) => {
+      fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
+      fs.writeFileSync(session.LOCK_FILE, contents, { mode: 0o600 });
+      expect(session.acquireOnboardLock("nemoclaw onboard --resume")).toMatchObject({
+        acquired: false,
+        stale: true,
+      });
+      expect(fs.readFileSync(session.LOCK_FILE, "utf8")).toBe(contents);
 
-    const acquired = session.acquireOnboardLock("nemoclaw onboard --resume");
-    expect(acquired.acquired).toBe(false);
-    expect(acquired.stale).toBe(true);
-    // Recent malformed lock is preserved because another process may be mid-write.
-    expect(fs.existsSync(session.LOCK_FILE)).toBe(true);
-  });
-
-  it("removes a stale malformed lock file older than 30 seconds (#2765)", () => {
-    fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
-    fs.writeFileSync(session.LOCK_FILE, "{not-json", { mode: 0o600 });
-    const past = new Date(Date.now() - 60_000);
-    fs.utimesSync(session.LOCK_FILE, past, past);
-
-    const acquired = session.acquireOnboardLock("nemoclaw onboard --resume");
-    expect(acquired.acquired).toBe(true);
-    expect(fs.existsSync(session.LOCK_FILE)).toBe(true);
-    const written = JSON.parse(fs.readFileSync(session.LOCK_FILE, "utf8"));
-    expect(written.pid).toBe(process.pid);
-    session.releaseOnboardLock();
-  });
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(session.LOCK_FILE, past, past);
+      expect(session.acquireOnboardLock("nemoclaw onboard --resume").acquired).toBe(true);
+      expect(JSON.parse(fs.readFileSync(session.LOCK_FILE, "utf8")).pid).toBe(process.pid);
+      session.releaseOnboardLock();
+      expect(fs.existsSync(session.LOCK_FILE)).toBe(false);
+    },
+  );
 
   it("does not remove a fresh lock that replaces stale malformed lock debris during cleanup", () => {
     fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
@@ -832,7 +1263,7 @@ describe("onboard session", () => {
     const statSpy = vi.spyOn(fs, "statSync").mockImplementation((...args) => {
       if (args[0] === session.LOCK_FILE) {
         statCallCount += 1;
-        if (statCallCount === 3) {
+        if (statCallCount === 1) {
           const tmpClaim = session.LOCK_FILE + ".race-tmp";
           fs.writeFileSync(
             tmpClaim,
@@ -860,81 +1291,90 @@ describe("onboard session", () => {
     }
   });
 
-  it("ignores malformed lock files when releasing the onboard lock", () => {
+  it("preserves a foreign lock that uses the local PID when no descriptor is held", () => {
     fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
-    fs.writeFileSync(session.LOCK_FILE, "{not-json", { mode: 0o600 });
+    const contents = JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      command: "foreign owner",
+      processGeneration: "foreign-generation",
+      hostIdentity: "foreign-host",
+      pidNamespaceIdentity: "foreign-namespace",
+    });
+    fs.writeFileSync(session.LOCK_FILE, contents, { mode: 0o600 });
 
     session.releaseOnboardLock();
-    expect(fs.existsSync(session.LOCK_FILE)).toBe(true);
+    expect(fs.readFileSync(session.LOCK_FILE, "utf8")).toBe(contents);
   });
 
   it("redacts sensitive values from persisted failure messages", () => {
     session.saveSession(session.createSession());
     session.markStepFailed(
       "inference",
-      "provider auth failed with NVIDIA_API_KEY=nvapi-secret Bearer topsecret sk-secret-value-that-is-long-enough ghp_1234567890123456789012345",
+      "provider auth failed with NVIDIA_INFERENCE_API_KEY=nvapi-secret Bearer topsecret sk-secret-value-that-is-long-enough ghp_1234567890123456789012345",
     );
 
     const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.steps.inference.error).toContain("NVIDIA_API_KEY=<REDACTED>");
+    expect(loaded.steps.inference.error).toContain("NVIDIA_INFERENCE_API_KEY=<REDACTED>");
     expect(loaded.steps.inference.error).toContain("Bearer <REDACTED>");
     expect(loaded.steps.inference.error).not.toContain("nvapi-secret");
     expect(loaded.steps.inference.error).not.toContain("topsecret");
     expect(loaded.steps.inference.error).not.toContain("sk-secret-value-that-is-long-enough");
     expect(loaded.steps.inference.error).not.toContain("ghp_1234567890123456789012345");
-    expect(loaded.failure).not.toBeNull();
-    if (!loaded.failure) {
-      throw new Error("Expected failure metadata after markStepFailed()");
-    }
-    expect(loaded.failure.message).toBe(loaded.steps.inference.error);
+    expect(loaded.failure).toBeNull();
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
   });
 
-  it("round-trips null messagingChannels through normalizeSession", () => {
+  it("round-trips null messagingPlan through normalizeSession", () => {
     const created = session.createSession();
-    expect(created.messagingChannels).toBeNull();
+    expect(created.messagingPlan).toBeNull();
     const saved = session.saveSession(created);
     const loaded = requireLoadedSession(session.loadSession());
-    expect(saved.messagingChannels).toBeNull();
-    expect(loaded.messagingChannels).toBeNull();
+    expect(saved.messagingPlan).toBeNull();
+    expect(loaded.messagingPlan).toBeNull();
   });
 
-  it("round-trips messagingChannels=['telegram'] through normalizeSession", () => {
-    const created = session.createSession({ messagingChannels: ["telegram"] });
-    expect(created.messagingChannels).toEqual(["telegram"]);
+  it("round-trips messagingPlan through normalizeSession", () => {
+    const plan = makeMessagingPlan({ channels: ["telegram"] });
+    const created = session.createSession({ messagingPlan: plan });
+    expect(created.messagingPlan).toEqual(plan);
     const saved = session.saveSession(created);
     const loaded = requireLoadedSession(session.loadSession());
-    expect(saved.messagingChannels).toEqual(["telegram"]);
-    expect(loaded.messagingChannels).toEqual(["telegram"]);
+    expect(saved.messagingPlan).toEqual(plan);
+    expect(loaded.messagingPlan).toMatchObject({
+      sandboxName: "my-assistant",
+      channels: [expect.objectContaining({ channelId: "telegram", configured: true })],
+    });
   });
 
-  it("filterSafeUpdates preserves messagingChannels field", () => {
+  it("filterSafeUpdates preserves messagingPlan field", () => {
     session.saveSession(session.createSession());
+    const plan = makeMessagingPlan({ channels: ["slack", "discord"] });
     session.markStepComplete("provider_selection", {
-      messagingChannels: ["slack", "discord"],
+      messagingPlan: plan,
     });
 
     const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.messagingChannels).toEqual(["slack", "discord"]);
+    expect(loaded.messagingPlan).toMatchObject({
+      sandboxName: "my-assistant",
+      channels: [
+        expect.objectContaining({ channelId: "slack", configured: true }),
+        expect.objectContaining({ channelId: "discord", configured: true }),
+      ],
+    });
   });
 
-  it("filterSafeUpdates preserves sanitized messagingChannelConfig", () => {
+  it("filterSafeUpdates ignores malformed messagingPlan values", () => {
     session.saveSession(session.createSession());
     session.markStepComplete("provider_selection", {
-      messagingChannelConfig: {
-        TELEGRAM_ALLOWED_IDS: "123",
-        TELEGRAM_REQUIRE_MENTION: "1",
-        DISCORD_REQUIRE_MENTION: "invalid",
-      },
-    });
+      messagingPlan: { sandboxName: "my-assistant" },
+    } as unknown as Parameters<OnboardSessionModule["markStepComplete"]>[1]);
 
     const loaded = requireLoadedSession(session.loadSession());
-    expect(loaded.messagingChannelConfig).toEqual({
-      TELEGRAM_ALLOWED_IDS: "123",
-      TELEGRAM_REQUIRE_MENTION: "1",
-    });
+    expect(loaded.messagingPlan).toBeNull();
   });
 
-  it("#1737: filterSafeUpdates routes telegramConfig through markStepComplete", () => {
+  it("routes telegramConfig through markStepComplete in filterSafeUpdates (#1737)", () => {
     session.saveSession(session.createSession());
     session.markStepComplete("provider_selection", {
       telegramConfig: { requireMention: true },
@@ -949,7 +1389,7 @@ describe("onboard session", () => {
     expect(cleared.telegramConfig).toBeNull();
   });
 
-  it("#1737: filterSafeUpdates drops malformed telegramConfig values", () => {
+  it("drops malformed telegramConfig values in filterSafeUpdates (#1737)", () => {
     session.saveSession(session.createSession());
     // Non-boolean requireMention — must not leak through.
     session.markStepComplete("provider_selection", {
@@ -990,20 +1430,11 @@ describe("onboard session", () => {
     expect(loaded.wechatConfig).toBeNull();
   });
 
-  it("createSession with messagingChannels override", () => {
-    const created = session.createSession({ messagingChannels: ["telegram", "slack"] });
-    expect(created.messagingChannels).toEqual(["telegram", "slack"]);
+  it("creates a session with a messagingPlan override", () => {
+    const plan = makeMessagingPlan({ channels: ["telegram", "slack"] });
+    const created = session.createSession({ messagingPlan: plan });
+    expect(created.messagingPlan).toEqual(plan);
     expect(created.provider).toBeNull();
-  });
-
-  it("filters non-string array entries in createSession overrides", () => {
-    const created = session.createSession({
-      policyPresets: ["pypi", 7, null, "npm"] as unknown as string[],
-      messagingChannels: ["telegram", 42, null, "discord"] as unknown as string[],
-    });
-
-    expect(created.policyPresets).toEqual(["pypi", "npm"]);
-    expect(created.messagingChannels).toEqual(["telegram", "discord"]);
   });
 
   it("summarizes the session for debug output", () => {
@@ -1021,8 +1452,16 @@ describe("onboard session", () => {
   });
 
   it("keeps debug summaries redacted when failures were sanitized", () => {
-    session.saveSession(session.createSession({ sandboxName: "my-assistant" }));
-    session.markStepFailed("provider_selection", "Bearer abcdefghijklmnopqrstuvwxyz");
+    session.saveSession(
+      session.createSession({
+        sandboxName: "my-assistant",
+        failure: {
+          step: "provider_selection",
+          message: "Bearer abcdefghijklmnopqrstuvwxyz",
+          recordedAt: "2026-04-01T00:00:00.000Z",
+        },
+      }),
+    );
     const summary = requireDebugSummary(session.summarizeForDebug());
 
     expect(summary.failure).not.toBeNull();

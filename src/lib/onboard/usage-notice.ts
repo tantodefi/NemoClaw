@@ -6,8 +6,12 @@ import os from "node:os";
 import path from "node:path";
 
 import noticeConfig from "../../../bin/lib/usage-notice.json";
+import { GATEWAY_PORT } from "../core/ports";
+import { writeConfigFile } from "../state/config-io";
+import { nemoclawStateRoot } from "../state/state-root";
 
-export const NOTICE_ACCEPT_FLAG = "--yes-i-accept-third-party-software";
+export const NOTICE_ACCEPT_FLAG_NAME = "yes-i-accept-third-party-software";
+export const NOTICE_ACCEPT_FLAG = `--${NOTICE_ACCEPT_FLAG_NAME}`;
 export const NOTICE_ACCEPT_ENV = "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE";
 const OSC8_OPEN = "\u001B]8;;";
 const OSC8_CLOSE = "\u001B]8;;\u001B\\";
@@ -51,7 +55,10 @@ function parseJson<T>(text: string): T {
 }
 
 export function getUsageNoticeStateFile(): string {
-  return path.join(process.env.HOME || os.homedir(), ".nemoclaw", "usage-notice.json");
+  return path.join(
+    nemoclawStateRoot(process.env.HOME || os.homedir(), GATEWAY_PORT),
+    "usage-notice.json",
+  );
 }
 
 export function loadUsageNoticeConfig(): NoticeConfig {
@@ -79,15 +86,10 @@ export function hasAcceptedUsageNotice(version: string): boolean {
 
 export function saveUsageNoticeAcceptance(version: string): void {
   const stateFile = getUsageNoticeStateFile();
-  const dir = path.dirname(stateFile);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(dir, 0o700);
-  fs.writeFileSync(
-    stateFile,
-    JSON.stringify({ acceptedVersion: version, acceptedAt: new Date().toISOString() }, null, 2),
-    { mode: 0o600 },
-  );
-  fs.chmodSync(stateFile, 0o600);
+  writeConfigFile(stateFile, {
+    acceptedVersion: version,
+    acceptedAt: new Date().toISOString(),
+  });
 }
 
 export function supportsTerminalHyperlinks(): boolean {
@@ -167,7 +169,8 @@ export async function ensureUsageNoticeConsent({
   }
 
   // credentials is still CJS
-  const ask: PromptFn = promptFn ?? (require("../credentials/store") as { prompt: PromptFn }).prompt;
+  const ask: PromptFn =
+    promptFn ?? (require("../credentials/store") as { prompt: PromptFn }).prompt;
   let answer: string;
   try {
     answer = String(await ask(`  ${config.interactivePrompt}`))

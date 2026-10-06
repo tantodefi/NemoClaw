@@ -6,20 +6,27 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  cleanupFailedLocalAdapterStartup,
+  ensureLocalAdapterStateDir,
   isLocalAdapterProcess,
   killLocalAdapterPid,
+  type LocalAdapterProcessOptions,
+  LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES,
   loadLocalAdapterPid,
   localAdapterTokenHash,
   persistLocalAdapterPid,
   probeLocalAdapterHealth,
   readLocalAdapterJsonFile,
   readLocalAdapterTextFile,
+  spawnDetachedNodeAdapter,
+  waitForLocalAdapterHealth,
   writeLocalAdapterJsonFile,
   writeLocalAdapterSecretFile,
-} from "../../../dist/lib/inference/local-adapter-lifecycle";
+} from "./local-adapter-lifecycle";
+import { isOllamaAuthProxyCommandLine } from "./ollama/process";
 
 const tempDirs: string[] = [];
 const servers: http.Server[] = [];
@@ -37,6 +44,7 @@ afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+  vi.unstubAllEnvs();
 });
 
 function tempDir(): string {
@@ -56,7 +64,36 @@ function listen(server: http.Server): Promise<number> {
   });
 }
 
+async function waitForFileText(filePath: string, expected: string, attempts = 50): Promise<string> {
+  const actual = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  return actual === expected
+    ? actual
+    : attempts > 0
+      ? new Promise<void>((resolve) => setTimeout(resolve, 50)).then(() =>
+          waitForFileText(filePath, expected, attempts - 1),
+        )
+      : Promise.reject(new Error(`adapter did not write expected output: ${actual}`));
+}
+
 describe("local adapter lifecycle", () => {
+  it("executes detached TypeScript adapters", async () => {
+    const dir = tempDir();
+    const scriptPath = path.join(dir, "adapter.mts");
+    const outputPath = path.join(dir, "adapter-output.txt");
+    fs.writeFileSync(
+      scriptPath,
+      `import { writeFileSync } from "node:fs";\nconst answer: number = 42;\nwriteFileSync(process.env.NEMOCLAW_TEST_ADAPTER_OUTPUT ?? "", String(answer));\n`,
+    );
+
+    spawnDetachedNodeAdapter({
+      scriptPath,
+      env: { NEMOCLAW_TEST_ADAPTER_OUTPUT: outputPath },
+      buildEnv: (extraEnv) => ({ ...process.env, ...extraEnv }),
+    });
+
+    await waitForFileText(outputPath, "42");
+  });
+
   it("persists local adapter secrets, JSON state, and PIDs as private files", () => {
     const dir = tempDir();
     const tokenPath = path.join(dir, "adapter-token");
@@ -78,26 +115,79 @@ describe("local adapter lifecycle", () => {
     expect(fs.statSync(pidPath).mode & 0o777).toBe(0o600);
   });
 
-  it("guards PID cleanup by process command line", () => {
-    const pidPath = path.join(tempDir(), "adapter.pid");
-    persistLocalAdapterPid(pidPath, 789);
+  it.each(["ollama-auth-proxy.js", "ollama-auth-proxy.mts"])(
+    "guards PID cleanup for the supported %s script",
+    (scriptName) => {
+      const pidPath = path.join(tempDir(), "adapter.pid");
+      persistLocalAdapterPid(pidPath, 789);
+      const killed: string[][] = [];
+      const commandLine = `node /opt/nemoclaw/scripts/${scriptName}`;
+
+      expect(isLocalAdapterProcess(789, isOllamaAuthProxyCommandLine, () => commandLine)).toBe(
+        true,
+      );
+
+      killLocalAdapterPid({
+        pidPath,
+        processMatcher: isOllamaAuthProxyCommandLine,
+        run: (args) => {
+          killed.push(args);
+        },
+        runCapture: () => commandLine,
+      });
+
+      expect(killed).toEqual([["kill", "789"]]);
+      expect(loadLocalAdapterPid(pidPath)).toBeNull();
+    },
+  );
+
+  it.each(["ollama-auth-proxy-helper.mjs", "ollama-auth-proxy.mts.backup"])(
+    "does not clean up the near-named %s process",
+    (scriptName) => {
+      const pidPath = path.join(tempDir(), "adapter.pid");
+      persistLocalAdapterPid(pidPath, 789);
+      const killed: string[][] = [];
+
+      killLocalAdapterPid({
+        pidPath,
+        processMatcher: isOllamaAuthProxyCommandLine,
+        run: (args) => {
+          killed.push(args);
+        },
+        runCapture: () => `node /opt/nemoclaw/scripts/${scriptName}`,
+      });
+
+      expect(killed).toEqual([]);
+      expect(loadLocalAdapterPid(pidPath)).toBeNull();
+    },
+  );
+
+  it("signals the spawned child of a failed startup when its pid file was never written", () => {
+    const dir = tempDir();
+    const statePath = path.join(dir, "adapter.json");
     const killed: string[][] = [];
-
-    expect(
-      isLocalAdapterProcess(789, "ollama-auth-proxy.js", () => "node scripts/ollama-auth-proxy.js"),
-    ).toBe(true);
-
-    killLocalAdapterPid({
-      pidPath,
-      processNeedle: "ollama-auth-proxy.js",
+    const options: LocalAdapterProcessOptions & { statePath: string } = {
+      pidPath: path.join(dir, "adapter.pid"),
+      statePath,
+      processMatcher: isOllamaAuthProxyCommandLine,
       run: (args) => {
         killed.push(args);
       },
-      runCapture: () => "node scripts/ollama-auth-proxy.js",
-    });
+      runCapture: () => "node /opt/nemoclaw/scripts/ollama-auth-proxy.mts",
+    };
 
-    expect(killed).toEqual([["kill", "789"]]);
-    expect(loadLocalAdapterPid(pidPath)).toBeNull();
+    // Control: with no pid file and no spawned pid there is nothing the cleanup can identify.
+    writeLocalAdapterJsonFile(statePath, { pid: 4242 });
+    cleanupFailedLocalAdapterStartup(options);
+    expect(killed).toEqual([]);
+    expect(fs.existsSync(statePath)).toBe(false);
+
+    // A failed persistLocalAdapterPid leaves the same empty pid path, so the caller's own handle on
+    // the child it just spawned is the only way the orphan can still be reclaimed.
+    writeLocalAdapterJsonFile(statePath, { pid: 4242 });
+    cleanupFailedLocalAdapterStartup(options, 4242);
+    expect(killed).toEqual([["kill", "4242"]]);
+    expect(fs.existsSync(statePath)).toBe(false);
   });
 
   it("probes adapter health with the expected token hash", async () => {
@@ -127,5 +217,204 @@ describe("local adapter lifecycle", () => {
         expectedTokenHash: localAdapterTokenHash("other-token"),
       }),
     ).resolves.toBe(false);
+  });
+
+  it("fails closed when a chunked health response exceeds the memory budget", async () => {
+    const expectedTokenHash = localAdapterTokenHash("secret-token");
+    const payload = Buffer.from(
+      JSON.stringify({
+        tokenHash: expectedTokenHash,
+        padding: " ".repeat(LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES),
+      }),
+    );
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write(payload.subarray(0, LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES));
+      res.end(payload.subarray(LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES));
+    });
+    const port = await listen(server);
+
+    await expect(
+      probeLocalAdapterHealth({
+        host: "127.0.0.1",
+        port,
+        expectedTokenHash,
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it("accepts a valid health response at the memory budget", async () => {
+    const expectedTokenHash = localAdapterTokenHash("secret-token");
+    const emptyPayload = JSON.stringify({ tokenHash: expectedTokenHash, padding: "" });
+    const payload = Buffer.from(
+      JSON.stringify({
+        tokenHash: expectedTokenHash,
+        padding: " ".repeat(
+          LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES - Buffer.byteLength(emptyPayload),
+        ),
+      }),
+    );
+    expect(payload).toHaveLength(LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES);
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "Content-Length": String(payload.length),
+        "Content-Type": "application/json",
+      });
+      res.end(payload);
+    });
+    const port = await listen(server);
+
+    await expect(
+      probeLocalAdapterHealth({
+        host: "127.0.0.1",
+        port,
+        expectedTokenHash,
+      }),
+    ).resolves.toBe(true);
+  });
+
+  it("fails closed when a health response closes before completion", async () => {
+    const expectedTokenHash = localAdapterTokenHash("secret-token");
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "Content-Length": "128",
+        "Content-Type": "application/json",
+      });
+      res.write('{"tokenHash":"');
+      res.socket?.destroy();
+    });
+    const port = await listen(server);
+
+    await expect(
+      probeLocalAdapterHealth({
+        host: "127.0.0.1",
+        port,
+        expectedTokenHash,
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it("destroys a declared health response above the memory budget before buffering", async () => {
+    const expectedTokenHash = localAdapterTokenHash("secret-token");
+    const declaredBytes = LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES + 1;
+    const destroySpy = vi.spyOn(http.IncomingMessage.prototype, "destroy");
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "Content-Length": String(declaredBytes),
+        "Content-Type": "application/json",
+      });
+      res.end();
+    });
+    const port = await listen(server);
+
+    await expect(
+      probeLocalAdapterHealth({
+        host: "127.0.0.1",
+        port,
+        expectedTokenHash,
+      }),
+    ).resolves.toBe(false);
+    expect(
+      destroySpy.mock.calls.some((args, index) => {
+        const response = destroySpy.mock.contexts[index] as http.IncomingMessage;
+        return (
+          response.statusCode === 200 &&
+          response.headers["content-length"] === String(declaredBytes) &&
+          args.length === 0
+        );
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("ensureLocalAdapterStateDir", () => {
+  it("creates directory with owner-only permissions (0o700)", () => {
+    if (process.platform === "win32") return;
+    const dir = tempDir();
+    const stateDir = path.join(dir, "nested", "state");
+    ensureLocalAdapterStateDir(stateDir);
+    const stat = fs.statSync(stateDir);
+    expect(stat.mode & 0o777).toBe(0o700);
+  });
+
+  it("tightens permissions on an existing world-readable directory", () => {
+    if (process.platform === "win32") return;
+    const dir = tempDir();
+    const stateDir = path.join(dir, "lax");
+    fs.mkdirSync(stateDir, { mode: 0o755 });
+    ensureLocalAdapterStateDir(stateDir);
+    const stat = fs.statSync(stateDir);
+    expect(stat.mode & 0o777).toBe(0o700);
+  });
+
+  describe.skipIf(process.platform === "win32")("symlink-safe adapter state", () => {
+    it.each(["gateways", "selected port"])(
+      "rejects a symlink at the %s ancestor before writing adapter secrets (#3053)",
+      (symlinkAt) => {
+        const home = tempDir();
+        vi.stubEnv("HOME", home);
+        const controlled = path.join(home, "controlled");
+        const sharedRoot = path.join(home, ".nemoclaw");
+        const gatewaysDir = path.join(sharedRoot, "gateways");
+        const selectedDir = path.join(gatewaysDir, "9123");
+        fs.mkdirSync(controlled, { recursive: true });
+        fs.mkdirSync(symlinkAt === "gateways" ? sharedRoot : gatewaysDir, { recursive: true });
+        fs.symlinkSync(controlled, symlinkAt === "gateways" ? gatewaysDir : selectedDir);
+
+        expect(() =>
+          writeLocalAdapterSecretFile(path.join(selectedDir, "adapter-token"), "secret"),
+        ).toThrow(/symbolic link/);
+        expect(fs.existsSync(path.join(controlled, "adapter-token"))).toBe(false);
+      },
+    );
+
+    it("refuses to overwrite an adapter secret through a final-component symlink", () => {
+      const home = tempDir();
+      vi.stubEnv("HOME", home);
+      const selectedDir = path.join(home, ".nemoclaw", "gateways", "9123");
+      const controlled = path.join(home, "controlled-token");
+      fs.mkdirSync(selectedDir, { recursive: true });
+      fs.writeFileSync(controlled, "unchanged\n", { mode: 0o600 });
+      fs.symlinkSync(controlled, path.join(selectedDir, "adapter-token"));
+
+      expect(() =>
+        writeLocalAdapterSecretFile(path.join(selectedDir, "adapter-token"), "secret"),
+      ).toThrow();
+      expect(fs.readFileSync(controlled, "utf8")).toBe("unchanged\n");
+    });
+  });
+});
+
+describe("waitForLocalAdapterHealth", () => {
+  it("retries async health probes until the adapter responds", async () => {
+    let calls = 0;
+
+    await expect(
+      waitForLocalAdapterHealth(
+        async () => {
+          calls += 1;
+          return calls >= 3;
+        },
+        { attempts: 5, intervalMs: 1 },
+      ),
+    ).resolves.toBe(true);
+
+    expect(calls).toBe(3);
+  });
+
+  it("returns false after the configured attempt budget is exhausted", async () => {
+    let calls = 0;
+
+    await expect(
+      waitForLocalAdapterHealth(
+        async () => {
+          calls += 1;
+          return false;
+        },
+        { attempts: 2, intervalMs: 1 },
+      ),
+    ).resolves.toBe(false);
+
+    expect(calls).toBe(2);
   });
 });

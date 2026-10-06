@@ -18,11 +18,7 @@ function toPlainJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function setIfDefined(
-  target: SerializableCommandMetadata,
-  key: string,
-  value: unknown,
-): void {
+function setIfDefined(target: SerializableCommandMetadata, key: string, value: unknown): void {
   if (value !== undefined) target[key] = toPlainJson(value);
 }
 
@@ -36,6 +32,7 @@ async function main(): Promise<void> {
   for (const command of [...config.commands].sort((a, b) => a.id.localeCompare(b.id))) {
     const entry: SerializableCommandMetadata = {};
     setIfDefined(entry, "args", command.args);
+    setIfDefined(entry, "customHelp", (command as { customHelp?: unknown }).customHelp);
     setIfDefined(entry, "description", command.description);
     setIfDefined(entry, "deprecationOptions", command.deprecationOptions);
     setIfDefined(entry, "examples", command.examples);

@@ -17,11 +17,13 @@ import {
   dockerContainerInspectFormat,
   dockerInfoFormat,
   dockerListVolumesByPrefix,
+  dockerManifestInspect,
   dockerPull,
-  dockerRename,
   dockerRemoveVolumesByPrefix,
+  dockerRename,
   dockerRmi,
   dockerRunDetached,
+  dockerTag,
 } from "./index";
 
 describe("docker helpers", () => {
@@ -82,6 +84,54 @@ describe("docker helpers", () => {
     );
   });
 
+  it("adds sorted build args to dockerBuild argv and drops them from options", () => {
+    dockerBuild("Dockerfile.base", "sandbox-base:latest", "/repo/root", {
+      buildArgs: { Z_ARG: "last", A_ARG: "first" },
+      ignoreError: true,
+    });
+
+    expect(runMock).toHaveBeenCalledWith(
+      [
+        "docker",
+        "build",
+        "--build-arg",
+        "A_ARG=first",
+        "--build-arg",
+        "Z_ARG=last",
+        "-f",
+        "Dockerfile.base",
+        "-t",
+        "sandbox-base:latest",
+        "/repo/root",
+      ],
+      { ignoreError: true, env: { DOCKER_BUILDKIT: "1" } },
+    );
+  });
+
+  it("adds sorted image labels to dockerBuild argv and drops them from options", () => {
+    dockerBuild("Dockerfile.base", "sandbox-base:latest", "/repo/root", {
+      labels: { "com.example.z": "last", "com.example.a": "first" },
+      ignoreError: true,
+    });
+
+    expect(runMock).toHaveBeenCalledWith(
+      [
+        "docker",
+        "build",
+        "--label",
+        "com.example.a=first",
+        "--label",
+        "com.example.z=last",
+        "-f",
+        "Dockerfile.base",
+        "-t",
+        "sandbox-base:latest",
+        "/repo/root",
+      ],
+      { ignoreError: true, env: { DOCKER_BUILDKIT: "1" } },
+    );
+  });
+
   it("forces DOCKER_BUILDKIT=1 on dockerBuild so Dockerfile.base --mount works on legacy-builder hosts (#3583)", () => {
     dockerBuild("Dockerfile.base", "sandbox-base:latest", "/repo/root", {
       stdio: ["ignore", "inherit", "inherit"],
@@ -130,12 +180,29 @@ describe("docker helpers", () => {
     ]);
   });
 
+  it("prefixes docker argv for manifest inspect and tag helpers (#3885)", () => {
+    runCaptureMock.mockReturnValue('{"manifests":[]}');
+
+    dockerManifestInspect("nvcr.io/nim/nvidia/x:latest", { ignoreError: true });
+    dockerTag("nvcr.io/nim/nvidia/x@sha256:abc", "nvcr.io/nim/nvidia/x:latest");
+
+    expect(runCaptureMock).toHaveBeenCalledWith(
+      ["docker", "manifest", "inspect", "nvcr.io/nim/nvidia/x:latest"],
+      { ignoreError: true },
+    );
+    expect(runMock).toHaveBeenCalledWith(
+      ["docker", "tag", "nvcr.io/nim/nvidia/x@sha256:abc", "nvcr.io/nim/nvidia/x:latest"],
+      {},
+    );
+  });
+
   it("filters docker volume names by exact prefix", () => {
     runCaptureMock.mockReturnValue(
       [
         "openshell-cluster-nemoclaw",
         "openshell-cluster-nemoclaw-cache",
         "openshell-cluster-nemoclaw-2",
+        "openshell-cluster-nemoclaw2",
         "not-a-match",
         "",
       ].join("\n"),
@@ -150,25 +217,35 @@ describe("docker helpers", () => {
     ]);
   });
 
+  it("does not match a longer per-port gateway name with the same prefix", () => {
+    runCaptureMock.mockReturnValue(
+      [
+        "openshell-cluster-nemoclaw-8081",
+        "openshell-cluster-nemoclaw-8081-cache",
+        "openshell-cluster-nemoclaw-80810",
+      ].join("\n"),
+    );
+
+    const names = dockerListVolumesByPrefix("openshell-cluster-nemoclaw-8081");
+
+    expect(names).toEqual([
+      "openshell-cluster-nemoclaw-8081",
+      "openshell-cluster-nemoclaw-8081-cache",
+    ]);
+  });
+
   it("removes only volumes returned by the prefix probe", () => {
-    runCaptureMock.mockReturnValue("openshell-cluster-nemoclaw\nopenshell-cluster-nemoclaw-cache\n");
+    runCaptureMock.mockReturnValue(
+      "openshell-cluster-nemoclaw\nopenshell-cluster-nemoclaw-cache\n",
+    );
 
     const removed = dockerRemoveVolumesByPrefix("  openshell-cluster-nemoclaw  ", {
       ignoreError: true,
     });
 
-    expect(removed).toEqual([
-      "openshell-cluster-nemoclaw",
-      "openshell-cluster-nemoclaw-cache",
-    ]);
+    expect(removed).toEqual(["openshell-cluster-nemoclaw", "openshell-cluster-nemoclaw-cache"]);
     expect(runMock).toHaveBeenCalledWith(
-      [
-        "docker",
-        "volume",
-        "rm",
-        "openshell-cluster-nemoclaw",
-        "openshell-cluster-nemoclaw-cache",
-      ],
+      ["docker", "volume", "rm", "openshell-cluster-nemoclaw", "openshell-cluster-nemoclaw-cache"],
       { ignoreError: true },
     );
   });
@@ -183,9 +260,9 @@ describe("docker helpers", () => {
       throw new Error("docker unavailable");
     });
 
-    expect(dockerRemoveVolumesByPrefix("openshell-cluster-nemoclaw", { ignoreError: true })).toEqual(
-      [],
-    );
+    expect(
+      dockerRemoveVolumesByPrefix("openshell-cluster-nemoclaw", { ignoreError: true }),
+    ).toEqual([]);
     expect(runMock).not.toHaveBeenCalled();
   });
 

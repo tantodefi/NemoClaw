@@ -1,14 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { isNonInteractiveEnv } from "../../core/non-interactive";
+import {
+  DCODE_AUTO_APPROVAL_MODES,
+  type DcodeAutoApprovalMode,
+  isDcodeAutoApprovalMode,
+} from "../../onboard/dcode-auto-approval";
+import {
+  normalizeToolDisclosure,
+  TOOL_DISCLOSURE_VALUES,
+  type ToolDisclosure,
+} from "../../tool-disclosure";
+
 export interface DestroySandboxOptions {
   force?: boolean;
   yes?: boolean;
   /**
    * When the sandbox being destroyed is the last one, also tear down the
    * shared NemoClaw gateway (port forward, gateway pod, cluster volumes).
-   * Default `false` — gateway is preserved so the next `nemoclaw onboard`
-   * can reuse it without a full re-bootstrap. See #2166.
+   * Unattended macOS destroys default to cleanup so the host listener is
+   * released; Linux preserves the gateway for reuse. See #4662 and #2166.
    *
    * Resolution order during normalization: explicit option, then
    * `--cleanup-gateway` argv flag, then `NEMOCLAW_CLEANUP_GATEWAY=1` env
@@ -16,17 +28,35 @@ export interface DestroySandboxOptions {
    * decide whether to prompt.
    */
   cleanupGateway?: boolean;
+  /**
+   * Keep the host-global managed vLLM container running after destroying
+   * the last registered sandbox that uses Local vLLM. Resolution order during
+   * normalization: explicit option, then the `--keep-vllm` argv flag, then
+   * `NEMOCLAW_KEEP_VLLM=1`. Anything else retires the container.
+   */
+  keepVllm?: boolean;
 }
 
-function readCleanupGatewayEnv(): boolean | undefined {
-  const raw = (process.env.NEMOCLAW_CLEANUP_GATEWAY ?? "").trim().toLowerCase();
+function readBooleanEnv(name: string): boolean | undefined {
+  const raw = (process.env[name] ?? "").trim().toLowerCase();
   if (raw === "1" || raw === "true" || raw === "yes") return true;
   if (raw === "0" || raw === "false" || raw === "no") return false;
   return undefined;
 }
 
+function readCleanupGatewayEnv(): boolean | undefined {
+  return readBooleanEnv("NEMOCLAW_CLEANUP_GATEWAY");
+}
+
+function readKeepVllmEnv(): boolean | undefined {
+  return readBooleanEnv("NEMOCLAW_KEEP_VLLM");
+}
+
 export interface RebuildSandboxOptions {
+  dcodeAutoApprovalMode?: DcodeAutoApprovalMode;
   force?: boolean;
+  observabilityEnabled?: boolean;
+  toolDisclosure?: ToolDisclosure;
   verbose?: boolean;
   yes?: boolean;
 }
@@ -47,21 +77,29 @@ export function normalizeDestroySandboxOptions(
   options: string[] | DestroySandboxOptions = {},
 ): DestroySandboxOptions {
   const envCleanupGateway = readCleanupGatewayEnv();
+  const envKeepVllm = readKeepVllmEnv();
+  const nonInteractive = isNonInteractiveEnv();
   if (Array.isArray(options)) {
     const yesIdx = options.lastIndexOf("--cleanup-gateway");
     const noIdx = options.lastIndexOf("--no-cleanup-gateway");
     const cleanupGateway: boolean | undefined =
       yesIdx === -1 && noIdx === -1 ? envCleanupGateway : yesIdx > noIdx;
+    const keepVllm: boolean | undefined = options.includes("--keep-vllm") ? true : envKeepVllm;
     return {
       force: options.includes("--force"),
-      yes: options.includes("--yes"),
+      yes: options.includes("--yes") || nonInteractive,
       ...(cleanupGateway === undefined ? {} : { cleanupGateway }),
+      ...(keepVllm === undefined ? {} : { keepVllm }),
     };
   }
   return {
     ...options,
+    ...(nonInteractive ? { yes: true } : {}),
     ...(options.cleanupGateway === undefined && envCleanupGateway !== undefined
       ? { cleanupGateway: envCleanupGateway }
+      : {}),
+    ...(options.keepVllm === undefined && envKeepVllm !== undefined
+      ? { keepVllm: envKeepVllm }
       : {}),
   };
 }
@@ -69,14 +107,70 @@ export function normalizeDestroySandboxOptions(
 export function normalizeRebuildSandboxOptions(
   options: string[] | RebuildSandboxOptions = {},
 ): RebuildSandboxOptions {
+  let rawDcodeAutoApprovalMode: unknown;
+  let rawToolDisclosure: unknown;
   if (Array.isArray(options)) {
+    const observabilityIndex = options.lastIndexOf("--observability");
+    const noObservabilityIndex = options.lastIndexOf("--no-observability");
+    const observabilityEnabled =
+      observabilityIndex === -1 && noObservabilityIndex === -1
+        ? undefined
+        : observabilityIndex > noObservabilityIndex;
+    const splitIndex = options.lastIndexOf("--tool-disclosure");
+    const inline = [...options].reverse().find((value) => value.startsWith("--tool-disclosure="));
+    const toolDisclosureFlagProvided = splitIndex >= 0 || inline !== undefined;
+    rawToolDisclosure =
+      splitIndex >= 0 ? options[splitIndex + 1] : inline?.slice("--tool-disclosure=".length);
+    const toolDisclosure = normalizeToolDisclosure(rawToolDisclosure);
+    if (toolDisclosureFlagProvided && !toolDisclosure) {
+      throw new Error(`--tool-disclosure must be one of: ${TOOL_DISCLOSURE_VALUES.join(", ")}.`);
+    }
+    const dcodeAutoApprovalSplitIndex = options.lastIndexOf("--dcode-auto-approval");
+    const dcodeAutoApprovalInline = [...options]
+      .reverse()
+      .find((value) => value.startsWith("--dcode-auto-approval="));
+    const dcodeAutoApprovalFlagProvided =
+      dcodeAutoApprovalSplitIndex >= 0 || dcodeAutoApprovalInline !== undefined;
+    rawDcodeAutoApprovalMode =
+      dcodeAutoApprovalSplitIndex >= 0
+        ? options[dcodeAutoApprovalSplitIndex + 1]
+        : dcodeAutoApprovalInline?.slice("--dcode-auto-approval=".length);
+    const dcodeAutoApprovalMode = isDcodeAutoApprovalMode(rawDcodeAutoApprovalMode)
+      ? rawDcodeAutoApprovalMode
+      : undefined;
+    if (dcodeAutoApprovalFlagProvided && !dcodeAutoApprovalMode) {
+      throw new Error(
+        `--dcode-auto-approval must be one of: ${DCODE_AUTO_APPROVAL_MODES.join(", ")}.`,
+      );
+    }
     return {
+      ...(dcodeAutoApprovalMode ? { dcodeAutoApprovalMode } : {}),
       force: options.includes("--force"),
+      ...(observabilityEnabled === undefined ? {} : { observabilityEnabled }),
+      ...(toolDisclosure ? { toolDisclosure } : {}),
       verbose: options.includes("--verbose") || options.includes("-v"),
       yes: options.includes("--yes"),
     };
   }
-  return options;
+  rawDcodeAutoApprovalMode = options.dcodeAutoApprovalMode;
+  const dcodeAutoApprovalMode = isDcodeAutoApprovalMode(rawDcodeAutoApprovalMode)
+    ? rawDcodeAutoApprovalMode
+    : undefined;
+  if (rawDcodeAutoApprovalMode !== undefined && !dcodeAutoApprovalMode) {
+    throw new Error(
+      `dcodeAutoApprovalMode must be one of: ${DCODE_AUTO_APPROVAL_MODES.join(", ")}.`,
+    );
+  }
+  rawToolDisclosure = options.toolDisclosure;
+  const toolDisclosure = normalizeToolDisclosure(rawToolDisclosure);
+  if (rawToolDisclosure !== undefined && !toolDisclosure) {
+    throw new Error(`toolDisclosure must be one of: ${TOOL_DISCLOSURE_VALUES.join(", ")}.`);
+  }
+  return {
+    ...options,
+    ...(dcodeAutoApprovalMode ? { dcodeAutoApprovalMode } : {}),
+    ...(toolDisclosure ? { toolDisclosure } : {}),
+  };
 }
 
 export function normalizeGarbageCollectImagesOptions(

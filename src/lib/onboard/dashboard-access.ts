@@ -7,15 +7,12 @@ import { DASHBOARD_PORT } from "../core/ports";
 import { buildChain, buildControlUiUrls } from "../dashboard/contract";
 
 type RunCapture = (args: string[], options: { ignoreError: true }) => string;
-type OpenshellShellCommand = (args: string[], options?: { openshellBinary?: string }) => string;
 
 export type DashboardAccessOptions = WslDetectionOptions & {
   chatUiUrl?: string;
   token?: string | null;
   wslHostAddress?: string | null;
   runCapture?: RunCapture;
-  openshellBinary?: string;
-  openshellShellCommand?: OpenshellShellCommand;
   fetchGatewayAuthToken?: (sandboxName: string) => string | null;
   env?: NodeJS.ProcessEnv;
 };
@@ -28,7 +25,12 @@ export type DashboardAccessEntry = {
 const CONTROL_UI_PORT = DASHBOARD_PORT;
 
 function defaultChatUiUrl(options: DashboardAccessOptions = {}): string {
-  return options.chatUiUrl || options.env?.CHAT_UI_URL || process.env.CHAT_UI_URL || `http://127.0.0.1:${CONTROL_UI_PORT}`;
+  return (
+    options.chatUiUrl ||
+    options.env?.CHAT_UI_URL ||
+    process.env.CHAT_UI_URL ||
+    `http://127.0.0.1:${CONTROL_UI_PORT}`
+  );
 }
 
 export function getWslHostAddress(options: DashboardAccessOptions = {}): string | null {
@@ -71,12 +73,28 @@ export function buildDashboardChain(
   chatUiUrl = defaultChatUiUrl(),
   options: DashboardAccessOptions = {},
 ) {
-  return buildChain({
-    chatUiUrl,
+  return buildChain({ chatUiUrl, ...resolveDashboardPlatformHints(options) });
+}
+
+/**
+ * Resolve the host-derived half of `buildChain`'s input on its own.
+ *
+ * `buildDashboardChain` derives the port from the URL, which is right for
+ * every caller that only has a URL. A caller that has already resolved the
+ * port needs to pass it explicitly while still getting `isWsl` and
+ * `bindOverride` from the same place, and re-reading those two at the call
+ * site is how a caller silently loses them (#10861).
+ */
+export function resolveDashboardPlatformHints(options: DashboardAccessOptions = {}): {
+  isWsl: boolean;
+  wslHostAddress: string | null;
+  bindOverride: string | undefined;
+} {
+  return {
     isWsl: isWsl(options),
     wslHostAddress: getWslHostAddress(options),
     bindOverride: readBindOverride(options),
-  });
+  };
 }
 
 export function getDashboardForwardPort(
@@ -93,27 +111,18 @@ export function getDashboardForwardTarget(
   return buildDashboardChain(chatUiUrl, options).forwardTarget;
 }
 
-export function getDashboardForwardStartCommand(
-  sandboxName: string,
-  options: DashboardAccessOptions = {},
+export function buildAuthenticatedDashboardUrl(
+  baseUrl: string,
+  token: string | null = null,
 ): string {
-  if (!options.openshellShellCommand) {
-    throw new Error("getDashboardForwardStartCommand requires openshellShellCommand");
-  }
-  const chatUiUrl = defaultChatUiUrl(options);
-  const forwardTarget = getDashboardForwardTarget(chatUiUrl, options);
-  return `${options.openshellShellCommand(
-    ["forward", "start", "--background", forwardTarget, sandboxName],
-    options,
-  )}`;
-}
-
-export function buildAuthenticatedDashboardUrl(baseUrl: string, token: string | null = null): string {
   if (!token) return baseUrl;
   return `${baseUrl}#token=${encodeURIComponent(token)}`;
 }
 
-export function dashboardUrlForDisplay(url: string, redact: (value: string) => string = (value) => value): string {
+export function dashboardUrlForDisplay(
+  url: string,
+  redact: (value: string) => string = (value) => value,
+): string {
   return redact(url.replace(/#token=[^\s'"]*$/i, ""));
 }
 
@@ -123,7 +132,7 @@ export function getDashboardAccessInfo(
 ): DashboardAccessEntry[] {
   const token = Object.prototype.hasOwnProperty.call(options, "token")
     ? options.token
-    : options.fetchGatewayAuthToken?.(sandboxName) ?? null;
+    : (options.fetchGatewayAuthToken?.(sandboxName) ?? null);
   const chatUiUrl = defaultChatUiUrl(options);
   const chain = buildDashboardChain(chatUiUrl, options);
   const dashboardAccess = buildControlUiUrls(token ?? null, chain.port, chain.accessUrl).map(
@@ -133,9 +142,8 @@ export function getDashboardAccessInfo(
     }),
   );
 
-  const wslHostAddress = getWslHostAddress(options);
-  if (wslHostAddress) {
-    const wslUrl = buildAuthenticatedDashboardUrl(`http://${wslHostAddress}:${chain.port}/`, token ?? null);
+  for (const fallback of chain.fallbackUrls) {
+    const wslUrl = buildAuthenticatedDashboardUrl(`${fallback.replace(/\/$/, "")}/`, token ?? null);
     const existing = dashboardAccess.find((access) => access.url === wslUrl);
     if (existing) {
       existing.label = "WSL fallback";

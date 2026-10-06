@@ -13,16 +13,23 @@ import {
   normalizeInstallerProvider,
   type InstallerProvider,
 } from "../../domain/installer/provider";
-import { resolveInstallerVersion, resolveInstallRef, type InstallerRefEnv } from "../../domain/installer/ref";
+import {
+  resolveInstallerVersion,
+  resolveInstallRef,
+  type InstallerRefEnv,
+} from "../../domain/installer/ref";
 import { checkInstallerRuntime, type RuntimeCheckResult } from "../../domain/installer/version";
+import { buildDeferredOnboardingPlan, type DeferredOnboardingPlan } from "./deferred-onboarding";
 
-export interface InstallerPlanEnv extends InstallerRefEnv {
+export interface InstallerPlanEnv extends NodeJS.ProcessEnv, InstallerRefEnv {
   NEMOCLAW_PROVIDER?: string | undefined;
   PATH?: string | undefined;
 }
 
 export interface BuildInstallerPlanOptions {
   defaultVersion?: string;
+  deferredOnboardingRequested?: boolean;
+  deferredOnboardingRuntimeSupported?: boolean;
   env?: InstallerPlanEnv;
   gitDescribeVersion?: string | null;
   nodeVersion?: string | null;
@@ -30,6 +37,7 @@ export interface BuildInstallerPlanOptions {
   npmTargetState?: NpmLinkTargetState;
   npmVersion?: string | null;
   packageJsonVersion?: string | null;
+  registeredSandboxCount?: number;
   stampedVersion?: string | null;
 }
 
@@ -48,6 +56,7 @@ export interface InstallerNpmPlan {
 }
 
 export interface InstallerPlan {
+  deferredOnboarding: DeferredOnboardingPlan;
   installRef: string;
   installerVersion: string;
   npm: InstallerNpmPlan | null;
@@ -68,6 +77,14 @@ export function buildInstallerPlan(options: BuildInstallerPlanOptions = {}): Ins
   const globalBin = options.npmPrefix ? npmGlobalBin(options.npmPrefix) : null;
 
   return {
+    deferredOnboarding: buildDeferredOnboardingPlan(
+      { ...env },
+      {
+        registeredSandboxCount: options.registeredSandboxCount,
+        requested: options.deferredOnboardingRequested,
+        runtimeSupported: options.deferredOnboardingRuntimeSupported,
+      },
+    ),
     installRef,
     installerVersion: resolveInstallerVersion({
       defaultVersion: options.defaultVersion ?? "0.1.0",
@@ -82,7 +99,9 @@ export function buildInstallerPlan(options: BuildInstallerPlanOptions = {}): Ins
           linkTargetsWritable: options.npmTargetState
             ? npmLinkTargetsWritable(options.npmPrefix, options.npmTargetState)
             : null,
-          pathWithGlobalBin: globalBin ? pathWithPrependedEntries(env.PATH ?? "", [globalBin]) : null,
+          pathWithGlobalBin: globalBin
+            ? pathWithPrependedEntries(env.PATH ?? "", [globalBin])
+            : null,
           prefix: options.npmPrefix.trim(),
         }
       : null,
@@ -94,12 +113,17 @@ export function buildInstallerPlan(options: BuildInstallerPlanOptions = {}): Ins
     },
     runtime:
       options.nodeVersion && options.npmVersion
-        ? checkInstallerRuntime({ nodeVersion: options.nodeVersion, npmVersion: options.npmVersion })
+        ? checkInstallerRuntime({
+            nodeVersion: options.nodeVersion,
+            npmVersion: options.npmVersion,
+          })
         : null,
   };
 }
 
-export function normalizeInstallerEnv(env: InstallerPlanEnv): Pick<InstallerPlan, "installRef" | "provider"> {
+export function normalizeInstallerEnv(
+  env: InstallerPlanEnv,
+): Pick<InstallerPlan, "installRef" | "provider"> {
   const plan = buildInstallerPlan({ env });
   return { installRef: plan.installRef, provider: plan.provider };
 }

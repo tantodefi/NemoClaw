@@ -3,6 +3,7 @@
 
 export type NormalizedRootHelpArgv = { kind: "rootHelp" };
 export type NormalizedDumpCommandsArgv = { kind: "dumpCommands" };
+export type NormalizedDumpCommandFlagsArgv = { kind: "dumpCommandFlags" };
 export type NormalizedGlobalArgv = { kind: "global"; command: string; args: string[] };
 export type NormalizedSandboxArgv = {
   kind: "sandbox";
@@ -15,13 +16,31 @@ export type NormalizedSandboxArgv = {
 export type NormalizedArgv =
   | NormalizedRootHelpArgv
   | NormalizedDumpCommandsArgv
+  | NormalizedDumpCommandFlagsArgv
   | NormalizedGlobalArgv
   | NormalizedSandboxArgv;
 
 export type NormalizeArgvOptions = {
   globalCommands: ReadonlySet<string>;
+  isRegisteredSandbox: (name: string) => boolean;
+  isSandboxAction: (arg: string | undefined) => boolean;
   isSandboxConnectFlag: (arg: string | undefined) => boolean;
 };
+
+export function isGlobalCommandInvocation(
+  argv: readonly string[],
+  opts: NormalizeArgvOptions,
+): boolean {
+  const [command, firstArg] = argv;
+  if (!command || !opts.globalCommands.has(command)) return false;
+  if (command !== "doctor") return true;
+  if (!firstArg) return true;
+  if (opts.isSandboxConnectFlag(firstArg)) {
+    const isHelpFlag = firstArg === "--help" || firstArg === "-h";
+    if (!isHelpFlag || opts.isRegisteredSandbox(command)) return false;
+  }
+  return !opts.isSandboxAction(firstArg);
+}
 
 export function normalizeArgv(argv: readonly string[], opts: NormalizeArgvOptions): NormalizedArgv {
   const [cmd, ...args] = argv;
@@ -34,7 +53,11 @@ export function normalizeArgv(argv: readonly string[], opts: NormalizeArgvOption
     return { kind: "dumpCommands" };
   }
 
-  if (opts.globalCommands.has(cmd)) {
+  if (cmd === "--dump-command-flags") {
+    return { kind: "dumpCommandFlags" };
+  }
+
+  if (isGlobalCommandInvocation(argv, opts)) {
     return { kind: "global", command: cmd, args };
   }
 

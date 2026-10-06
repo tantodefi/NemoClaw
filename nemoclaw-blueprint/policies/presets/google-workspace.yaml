@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: google-workspace
+  description: "Google Workspace APIs for the gog CLI (Gmail, Calendar, Drive, Contacts, Sheets, Docs)"
+
+network_policies:
+  # ── Google OAuth + API ─────────────────────────────────────────
+  # gog (steipete/gog) uses OAuth 2.0 for auth and Google REST APIs for
+  # each Workspace service.  access: full (CONNECT tunnel) because the
+  # OAuth token exchange and refresh flows require gog to manage its own
+  # TLS sessions (same pattern as proton_api).
+  google_workspace:
+    name: google_workspace
+    endpoints:
+      # OAuth 2.0 endpoints
+      - host: accounts.google.com
+        port: 443
+        access: full
+      - host: oauth2.googleapis.com
+        port: 443
+        access: full
+      # Service APIs
+      - host: www.googleapis.com
+        port: 443
+        access: full
+      - host: gmail.googleapis.com
+        port: 443
+        access: full
+      - host: calendar-json.googleapis.com
+        port: 443
+        access: full
+      - host: sheets.googleapis.com
+        port: 443
+        access: full
+      - host: docs.googleapis.com
+        port: 443
+        access: full
+      - host: drive.googleapis.com
+        port: 443
+        access: full
+      - host: people.googleapis.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/local/bin/gog }
+      - { path: "/sandbox/gog" }
+      - { path: "/sandbox/.local/bin/gog" }
+      - { path: "/sandbox/.openclaw-data/skills/**/gog" }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }

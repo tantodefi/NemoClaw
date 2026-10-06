@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-auth-context — Resolve and persist a per-flow AuthContext that
+# downstream tools (chad-premium-client, premium subagent profiles) consult
+# before spawning premium Anthropic calls.
+#
+# AuthContext schema (written to $CHAD_AUTH_CONTEXT_PATH):
+#   {
+#     "source":           "dashboard" | "terminal" | "email" | "github" | "cron",
+#     "verifiedIdentity": "<email or gh-actor or 'tantodefi-dashboard'>" | null,
+#     "allowsPremium":    true | false,
+#     "createdAt":        "<ISO8601 UTC>",
+#     "createdBy":        "chad-auth-context",
+#     "scope":            "<short, free-form trigger description>"
+#   }
+#
+# Default ($CHAD_AUTH_CONTEXT_PATH unset): /tmp/chad-auth-context-$$.json
+#
+# Authorized sources today:
+#   tantodefi@proton.me  — inbound email From: header
+#   tantodefi, supachad  — github @mention actors / mentioners
+#   <NEMOCLAW_INVOKER_TOKEN match> — terminal session presenting host token
+#   dashboard            — openclaw plugin verified senderId
+#
+# Subcommands:
+#   detect --email-from <addr>            create context for an email
+#   detect --gh-mention-actor <user>      create context for a gh @mention
+#   detect --terminal-token <hex>         create context for a terminal session
+#   detect --dashboard <senderId>         create context for /premium dashboard call
+#   show                                  cat current context (or 'none')
+#   require-premium                       exit 0 if allowsPremium, else 1 + reason
+#   path                                  print $CHAD_AUTH_CONTEXT_PATH
+#   clear                                 remove the context file
+
+set -uo pipefail
+
+CTX_PATH="${CHAD_AUTH_CONTEXT_PATH:-/tmp/chad-auth-context-$$.json}"
+CREDS_FILE="${CHAD_CREDS_FILE:-/sandbox/.nemoclaw/credentials.json}"
+ALLOWED_EMAIL_SENDERS="${CHAD_PREMIUM_EMAIL_ALLOW:-tantodefi@proton.me}"
+ALLOWED_GH_ACTORS="${CHAD_PREMIUM_GH_ALLOW:-tantodefi,supachad}"
+
+usage() {
+  sed -n '4,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-2}"
+}
+
+write_ctx() {
+  local source="$1" identity="$2" allows="$3" scope="$4"
+  python3 - "$CTX_PATH" "$source" "$identity" "$allows" "$scope" <<'PY'
+import json, os, sys, datetime
+path, source, identity, allows, scope = sys.argv[1:6]
+payload = {
+  "source": source,
+  "verifiedIdentity": None if identity in ("", "null") else identity,
+  "allowsPremium": allows == "true",
+  "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+  "createdBy": "chad-auth-context",
+  "scope": scope,
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as f:
+  json.dump(payload, f, indent=2)
+os.chmod(path, 0o600)
+print(path)
+PY
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  detect)
+    shift
+    flag="${1:-}"; val="${2:-}"
+    case "$flag" in
+      --email-from)
+        # Strip angle brackets / display name if present
+        addr="$(printf '%s' "$val" | sed -E 's/.*<([^>]+)>.*/\1/' | tr -d ' \t')"
+        if printf '%s\n' "$ALLOWED_EMAIL_SENDERS" | tr ',' '\n' | grep -Fxq "$addr"; then
+          write_ctx "email" "$addr" "true" "email-from:$addr"
+        else
+          write_ctx "email" "$addr" "false" "email-from:$addr (not authorized)"
+        fi
+        ;;
+      --gh-mention-actor)
+        actor="$(printf '%s' "$val" | tr -d '@ \t')"
+        if printf '%s\n' "$ALLOWED_GH_ACTORS" | tr ',' '\n' | grep -Fxq "$actor"; then
+          write_ctx "github" "$actor" "true" "gh-mention:@$actor"
+        else
+          write_ctx "github" "$actor" "false" "gh-mention:@$actor (not authorized)"
+        fi
+        ;;
+      --terminal-token)
+        # Compare against deployed token in credentials.json
+        deployed=""
+        if [ -r "$CREDS_FILE" ]; then
+          deployed="$(python3 -c "import json,sys; print(json.load(open('$CREDS_FILE')).get('NEMOCLAW_INVOKER_TOKEN',''))" 2>/dev/null)"
+        fi
+        if [ -n "$deployed" ] && [ -n "$val" ] && [ "$val" = "$deployed" ]; then
+          write_ctx "terminal" "tantodefi-terminal" "true" "terminal-token-match"
+        else
+          write_ctx "terminal" "null" "false" "terminal-token-mismatch"
+        fi
+        ;;
+      --dashboard)
+        sender="$(printf '%s' "$val" | tr -d ' \t')"
+        # Dashboard-presented senderId is trusted: openclaw plugin sets
+        # isAuthorizedSender=true upstream. We just record who.
+        if [ -n "$sender" ]; then
+          write_ctx "dashboard" "$sender" "true" "dashboard-senderId:$sender"
+        else
+          write_ctx "dashboard" "null" "false" "dashboard-no-sender"
+        fi
+        ;;
+      *)
+        echo "chad-auth-context detect: unknown flag '$flag'" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  show)
+    if [ -r "$CTX_PATH" ]; then
+      cat "$CTX_PATH"
+    else
+      echo "none"
+    fi
+    ;;
+  require-premium)
+    if [ ! -r "$CTX_PATH" ]; then
+      echo "PremiumAccessDenied: no auth context, source=cron, allowsPremium=false" >&2
+      exit 1
+    fi
+    allows="$(python3 -c "import json,sys; print(json.load(open('$CTX_PATH')).get('allowsPremium',False))" 2>/dev/null || echo "False")"
+    if [ "$allows" = "True" ]; then
+      exit 0
+    fi
+    src="$(python3 -c "import json,sys; print(json.load(open('$CTX_PATH')).get('source','?'))" 2>/dev/null || echo "?")"
+    echo "PremiumAccessDenied: source=$src, allowsPremium=false" >&2
+    exit 1
+    ;;
+  path)
+    printf '%s\n' "$CTX_PATH"
+    ;;
+  clear)
+    rm -f "$CTX_PATH"
+    ;;
+  ""|-h|--help|help)
+    usage 0
+    ;;
+  *)
+    echo "chad-auth-context: unknown subcommand '$cmd'" >&2
+    usage 2
+    ;;
+esac

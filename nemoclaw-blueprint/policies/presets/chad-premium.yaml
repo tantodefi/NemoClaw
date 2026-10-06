@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-premium preset — opt-in Anthropic Messages egress.
+#
+# The `chad-premium-client` Python helper is the only binary allowed to
+# POST to api.anthropic.com. It reads ANTHROPIC_API_KEY from
+# /sandbox/.nemoclaw/credentials.json (deployed by chad-setup.sh) and
+# refuses to send unless $CHAD_AUTH_CONTEXT_PATH resolves to a blob
+# with allowsPremium=true (see scripts/chad-cron-wrappers/chad-auth-context).
+#
+# Authorized invocation paths (all carry an AuthContext):
+#   - dashboard `/premium <prompt>` prefix → chad-route-prompt → chad-premium
+#   - terminal `chad-premium` (auto-detects NEMOCLAW_INVOKER_TOKEN)
+#   - mail-check cron when From: matches tantodefi@proton.me / supachad@proton.me
+#   - issue-triage cron when an open issue mentions @supachad / @tantodefi
+#
+# Cron ticks with no inbound trigger have no AuthContext, so calls fail
+# closed at the application layer. This preset is the second layer:
+# even if a future bug allowed an unauthorized python script to
+# fabricate an AuthContext, the L7 proxy would still block it because
+# only /usr/local/bin/chad-premium-client is in the binaries allowlist.
+#
+# Scope is deliberately narrow:
+#   - api.anthropic.com   (POST /v1/messages — sole API surface used)
+#
+# We do NOT grant access to:
+#   - api.anthropic.com   /v1/messages/batches  (no batched calls today)
+#   - api.anthropic.com   /v1/complete          (legacy endpoint, unused)
+#   - statsig.anthropic.com / sentry.io         (telemetry; would just leak)
+#
+# When a new authorized invocation surface is added, prefer routing it
+# through chad-premium-client rather than expanding the binaries list —
+# the application-layer AuthContext is the source of truth for who is
+# allowed to escalate to a premium model, and this preset should stay
+# the second layer of defense, not the first.
+
+preset:
+  name: chad-premium
+  description: "Anthropic Messages API egress for chad-premium-client (gated upstream by chad-auth-context)."
+
+network_policies:
+  chad_premium:
+    name: chad_premium
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/v1/messages" }
+    binaries:
+      # The python wrapper that orchestrates auth + audit. The actual HTTP
+      # call is shelled out to curl so OPA can pin a real binary identity
+      # rather than /usr/bin/python3 (too broad). Both must be allowed.
+      - { path: /usr/local/bin/chad-premium-client }
+      - { path: /usr/bin/curl }

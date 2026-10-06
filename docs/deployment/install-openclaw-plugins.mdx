@@ -3,100 +3,110 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Install OpenClaw Plugins"
 sidebar-title: "Install OpenClaw Plugins"
-description: "How to install OpenClaw plugins in a NemoClaw-managed sandbox today."
-description-agent: "Explains the difference between OpenClaw plugins and agent skills, and shows the current Dockerfile-based workflow for baking a plugin into a NemoClaw sandbox. Use when users ask how to install, build, or configure OpenClaw plugins under NemoClaw."
-keywords: ["nemoclaw plugins", "openclaw plugins", "install openclaw plugin", "nemoclaw onboard from dockerfile"]
+description: "Install and manage OpenClaw plugins with OpenClaw inside a NemoClaw sandbox."
+description-agent: "Explains the native OpenClaw plugin lifecycle inside a NemoClaw sandbox, including installation, discovery, updates, removal, restart, rebuild persistence, policy, and credential boundaries."
+keywords: ["nemoclaw plugins", "openclaw plugins", "install openclaw plugin", "update openclaw plugin", "remove openclaw plugin"]
 content:
   type: "how_to"
 skill:
   priority: 20
+agent-variants: ["openclaw"]
 ---
-OpenClaw plugins extend the OpenClaw runtime with hooks, services, tools, or
-provider integrations. They are different from NemoClaw-managed agent skills:
+
+OpenClaw owns its plugin lifecycle after NemoClaw onboarding. Use the OpenClaw
+CLI inside the sandbox to install, discover, enable, update, disable, or remove
+plugins. NemoClaw does not keep a separate plugin allowlist or ownership index.
+
+Plugins are different from skills and policy presets:
 
 - **Plugins** are code packages loaded by OpenClaw.
-- **Skills** are `SKILL.md` directories that teach an agent how to perform a task.
-- **Policy presets** are network-egress rules that control what sandboxed code can reach.
+- **Skills** are `SKILL.md` directories that teach the agent how to perform a task.
+- **Policy presets** control which network destinations sandboxed code can reach.
 
-Today, the supported NemoClaw path for OpenClaw plugins is to bake the plugin
-into a custom sandbox image and onboard from that Dockerfile.
+## Install a Plugin
 
-## Prepare a Build Directory
+Add the `npm_registry` policy before an npm-backed install. A local path install
+does not need registry access unless its own installation process downloads
+packages.
 
-Put the Dockerfile and everything it needs to `COPY` in one directory.
-`nemoclaw onboard --from <Dockerfile>` uses the Dockerfile's parent directory as
-the Docker build context.
-
-```text
-my-plugin-sandbox/
-├── Dockerfile
-└── my-plugin/
-    ├── package.json
-    └── src/
+```bash
+nemoclaw <name> policy add npm_registry --yes
+nemoclaw <name> exec -- openclaw plugins install <package-or-path>
+nemoclaw <name> exec -- openclaw plugins inspect <plugin-id> --json
 ```
 
-## Example Dockerfile
+OpenClaw records installed plugins and their package locations under its native
+state directory, `/sandbox/.openclaw`. Do not edit the install index or
+`openclaw.json` to create a second ownership record.
 
-Use the custom image to copy the plugin into the OpenClaw extensions directory
-and let OpenClaw refresh its config before NemoClaw starts the sandbox.
+For local development, stage the plugin outside
+`/sandbox/.openclaw/extensions/<plugin-id>` and pass that source path to
+`openclaw plugins install`. Use `--force` when intentionally replacing an
+existing path install.
 
-```dockerfile
-ARG SANDBOX_BASE=ghcr.io/nvidia/nemoclaw/sandbox-base:latest
-FROM ${SANDBOX_BASE}
+## Enable, Update, and Remove Plugins
 
-COPY my-plugin/ /opt/my-plugin/
-WORKDIR /opt/my-plugin
-RUN npm ci --no-audit --no-fund && npm run build
+Use OpenClaw for the complete lifecycle:
 
-RUN mkdir -p /sandbox/.openclaw/extensions \
- && cp -a /opt/my-plugin /sandbox/.openclaw/extensions/my-plugin \
- && openclaw doctor --fix
-
-WORKDIR /opt/nemoclaw
+```bash
+nemoclaw <name> exec -- openclaw plugins list
+nemoclaw <name> exec -- openclaw plugins enable <plugin-id>
+nemoclaw <name> exec -- openclaw plugins update <plugin-id> --dry-run
+nemoclaw <name> exec -- openclaw plugins update <plugin-id>
+nemoclaw <name> exec -- openclaw plugins disable <plugin-id>
+nemoclaw <name> exec -- openclaw plugins uninstall <plugin-id> --force
 ```
 
-If the plugin needs configuration in `openclaw.json`, apply it after
-`openclaw doctor --fix` so the base config exists first.
+OpenClaw updates registry-installed plugins through `plugins update`. A local
+path install remains tied to its source and is not registry-updated; replace it
+with `plugins install <path> --force` instead.
 
-## Create the Sandbox
+OpenClaw also owns supported self-updates. Inspect the proposed operation before
+applying it:
 
-Point `nemoclaw onboard --from` at the Dockerfile in the build directory.
-
-```console
-$ nemoclaw onboard --from ./my-plugin-sandbox/Dockerfile
+```bash
+nemoclaw <name> exec -- openclaw update --dry-run --yes --no-restart
 ```
 
-If you need a second sandbox alongside an existing one, use a dedicated build
-directory and rerun onboarding with the sandbox name and ports you intend to
-use.
+Follow the version and compatibility guidance printed by OpenClaw. NemoClaw
+does not intercept or reset these operations.
 
-## Network Access
+## Apply Runtime Changes
 
-Plugins still run inside the sandbox policy boundary. If a plugin needs network
-egress, add or update a policy preset for the required hostnames and binaries
-before rebuilding the sandbox.
+Plugin configuration changes may require a supervised gateway restart:
 
-For example, see [Network Policies](/reference/network-policies) for
-policy concepts and [Customize Network Policy](/network-policy/customize-network-policy)
-for custom preset workflows.
+```bash
+nemoclaw <name> gateway restart
+nemoclaw <name> exec -- openclaw plugins inspect <plugin-id> --runtime --json
+```
+
+For an updated native plugin, the restart loads a fresh module graph.
+Replacement code at the same plugin path takes effect.
+NemoClaw preserves OpenClaw's native state during restart and state-preserving
+rebuild or restore. User-installed extensions and packages therefore survive
+without NemoClaw plugin ownership metadata. A fresh onboarding with `--fresh`
+is intentionally a new state boundary.
+
+## Keep Credentials in OpenShell
+
+Never place plugin credentials in the plugin directory, package environment,
+or `openclaw.json`. Store secrets through the supported NemoClaw/OpenShell
+credential flow and refer only to the projected placeholder expected by the
+runtime.
+
+OpenShell-held credential values must not be copied into plugin-visible files
+or ordinary process environments. Plugin code still runs inside the sandbox
+and must comply with its network policy.
 
 ## Common Mistakes
 
-These are the most common places where plugin installation gets mixed up with
-other NemoClaw extension paths.
-
-- Do not use `nemoclaw <sandbox> skill install` for OpenClaw plugins. That
-  command only installs `SKILL.md` agent skills.
-- Do not put a Dockerfile in a broad directory such as `/tmp` unless you intend
-  to send that whole directory as the Docker build context.
-- Keep plugin dependencies in the build stage or plugin directory; avoid copying
-  unrelated host files into the sandbox image.
+- Do not bake a plugin into a custom image merely to make it survive restart or rebuild.
+- Do not add a NemoClaw-side allowlist or registry for native OpenClaw plugins.
+- Do not hand-edit OpenClaw's install index or copy OpenShell-held credentials into plugin state.
+- Do not expect a local path install to update from the npm registry.
+- Do not confuse `skill install` with OpenClaw plugin installation.
 
 ## Next Steps
 
-- Review [Sandbox Hardening](/deployment/sandbox-hardening) before adding plugin code to a
-  shared or long-lived sandbox.
-- Review [Network Policies](/reference/network-policies) to plan plugin
-  egress rules.
-- Follow [Customize Network Policy](/network-policy/customize-network-policy)
-  if the plugin needs a custom preset.
+- Review [Network Policies](../reference/network-policies) before a plugin downloads packages or calls an external service.
+- Review [Understand Runtime Changes](../manage-sandboxes/configure-sandboxes/understand-runtime-changes) before changing runtime configuration.

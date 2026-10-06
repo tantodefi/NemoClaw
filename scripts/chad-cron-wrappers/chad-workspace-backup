@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-workspace-backup — Wraps chad-backup-to-github for the cron job.
+#
+# Returns immediately so the cron agent's exec call doesn't time out.
+# The actual backup runs detached via nohup; its result lands in today's
+# memory file when it finishes (the next dream cycle / cron run can read it).
+
+set -uo pipefail
+
+MEMORY_FILE="$(/usr/local/bin/chad-ensure-today-memory)"
+TS="$(date -u +%FT%TZ)"
+TS_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG="/tmp/chad-workspace-backup-${TS_TAG}.log"
+
+{
+  echo ""
+  echo "## Workspace Backup — ${TS}"
+  echo "Status: detached"
+  echo "Log: ${LOG}"
+} >> "$MEMORY_FILE"
+
+nohup bash -c "
+  if /usr/local/bin/chad-backup-to-github > '${LOG}' 2>&1; then
+    {
+      echo ''
+      echo '### Workspace Backup result — $(date -u +%FT%TZ) (started ${TS})'
+      echo 'Status: ok'
+      grep -E '^(Backed up|Files:|Pushed|Total)' '${LOG}' | head -10
+    } >> '${MEMORY_FILE}'
+  else
+    rc=\$?
+    {
+      echo ''
+      echo '### Workspace Backup result — $(date -u +%FT%TZ) (started ${TS})'
+      echo \"Status: FAILED (exit \${rc})\"
+      echo ''
+      echo '\`\`\`'
+      tail -40 '${LOG}'
+      echo '\`\`\`'
+    } >> '${MEMORY_FILE}'
+  fi
+" >/dev/null 2>&1 < /dev/null &
+disown 2>/dev/null || true
+
+echo "workspace-backup detached → ${LOG} (result will append to ${MEMORY_FILE})"
+exit 0

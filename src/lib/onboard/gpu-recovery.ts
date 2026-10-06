@@ -15,6 +15,10 @@
 
 import * as registry from "../state/registry";
 
+export type GpuPassthroughRecoveryOptions = {
+  missingRuntimePlatform?: "jetson" | null;
+};
+
 /**
  * Returns the multi-line recovery hint for the GPU-passthrough mismatch
  * branch in onboard. Caller is expected to emit each line on its own line
@@ -29,7 +33,19 @@ import * as registry from "../state/registry";
  * line each; only the last carries `--cleanup-gateway` so the gateway lives
  * until every sandbox is gone.
  */
-export function gpuPassthroughRecoveryLines(names: readonly string[] | null): string[] {
+export function gpuPassthroughRecoveryLines(
+  names: readonly string[] | null,
+  options: GpuPassthroughRecoveryOptions = {},
+): string[] {
+  if (options.missingRuntimePlatform === "jetson") {
+    return [
+      "  Jetson/Tegra sandbox GPU requires Docker NVIDIA runtime support.",
+      "  Destroying/recreating the sandbox or gateway will not repair a missing NVIDIA runtime.",
+      "  Use CPU sandbox mode instead:",
+      "    nemoclaw onboard --no-gpu",
+    ];
+  }
+
   const cleanNames = (names ?? []).map((n) => n.trim()).filter((n) => n.length > 0);
 
   if (cleanNames.length === 0) {
@@ -38,8 +54,8 @@ export function gpuPassthroughRecoveryLines(names: readonly string[] | null): st
       "  No sandboxes are registered, so onboard attempted safe gateway replacement automatically.",
       "  If the retry still fails, clear the stale gateway state and re-onboard with GPU enabled:",
       "    openshell gateway remove nemoclaw",
-      "    # For OpenShell releases that still expose lifecycle commands:",
-      "    openshell gateway destroy -g nemoclaw",
+      "  If a privileged process remains, do not use a host-wide process match.",
+      "  Verify its live owner, exact gateway name and port, command line, PID file, runtime marker, and loaded sandbox namespace before stopping it.",
       "    nemoclaw onboard --gpu",
     ];
   }
@@ -90,6 +106,8 @@ export function getRegisteredSandboxNamesForGpuRecovery(): string[] {
 export function reportGpuPassthroughRecovery(
   emit: (line: string) => void,
   loadNames: () => string[] = getRegisteredSandboxNamesForGpuRecovery,
+  options: GpuPassthroughRecoveryOptions = {},
 ): void {
-  for (const line of gpuPassthroughRecoveryLines(loadNames())) emit(line);
+  const names = options.missingRuntimePlatform === "jetson" ? [] : loadNames();
+  for (const line of gpuPassthroughRecoveryLines(names, options)) emit(line);
 }

@@ -3,6 +3,7 @@
 
 export const INSTALLER_PROVIDER_VALUES = [
   "build",
+  "openrouter",
   "openai",
   "anthropic",
   "anthropicCompatible",
@@ -20,13 +21,17 @@ export const INSTALLER_PROVIDER_ALIASES: Readonly<Record<string, InstallerProvid
   anthropiccompatible: "anthropicCompatible",
   cloud: "build",
   nim: "nim-local",
+  "open-router": "openrouter",
+  openrouterai: "openrouter",
 };
 
 const PROVIDERS_BY_LOWERCASE = new Map<string, InstallerProvider>(
   INSTALLER_PROVIDER_VALUES.map((provider) => [provider.toLowerCase(), provider]),
 );
 
-export function normalizeInstallerProvider(value: string | null | undefined): InstallerProvider | null {
+export function normalizeInstallerProvider(
+  value: string | null | undefined,
+): InstallerProvider | null {
   const provider = (value ?? "").trim();
   if (!provider) return null;
   const key = provider.toLowerCase();

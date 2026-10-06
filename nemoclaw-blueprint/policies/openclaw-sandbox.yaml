@@ -16,9 +16,8 @@
 version: 1
 
 filesystem_policy:
-  # Home directory writable (matches Hermes). Agents can create dotfiles,
-  # caches, etc. natively. Immutability is opt-in via `shields up` (DAC +
-  # chattr only — Landlock can't be toggled at runtime).
+  # Home directory writable (matches Hermes). Agents can create dotfiles and
+  # caches natively.
   include_workdir: true
   read_only:
     - /usr
@@ -28,10 +27,33 @@ filesystem_policy:
     - /app
     - /etc
     - /var/log
+    - /sandbox                      # Home directory — read-only to prevent agents
+                                    # from creating arbitrary files or modifying
+                                    # their own runtime environment. Writable state
+                                    # is restricted to /sandbox/.openclaw-data.
+                                    # Ref: https://github.com/NVIDIA/NemoClaw/issues/804
+    - /sandbox/.openclaw            # Immutable gateway config — prevents agent
+                                    # from tampering with auth tokens or CORS.
+                                    # Writable state (agents, plugins) lives in
+                                    # /sandbox/.openclaw-data via symlinks.
+                                    # Ref: https://github.com/NVIDIA/NemoClaw/issues/514
+    - /opt/gbrain                   # gbrain package install dir (read+execute for bun)
+    - /var/lib/dpkg                  # Allow package-version inspection without package mutation.
   read_write:
     - /tmp
     - /dev/null
-    - /sandbox/.openclaw            # Agent config (lockable via shields up)
+    - /dev/pts                      # PTY multiplexer + slave devices (devpts).
+                                    # OpenClaw's bundled tmux-session flow — and
+                                    # any PTY allocation (tmux, script, expect,
+                                    # interactive shells) — opens /dev/ptmx
+                                    # (-> /dev/pts/ptmx) and a /dev/pts/<n> slave
+                                    # via forkpty(). Without this grant landlock
+                                    # denies the open with EACCES, which tmux
+                                    # surfaces as `create window failed: fork
+                                    # failed: Permission denied` (#4513). Grant
+                                    # the directory, not /dev/ptmx itself — the
+                                    # supervisor refuses to chown that symlink.
+    - /sandbox/.openclaw            # Mutable agent config and state.
     - /sandbox/.nemoclaw            # Plugin state and config (state.ts, config.ts).
                                     # Blueprints are root-owned; sticky bit (1755)
                                     # on parent prevents rename/delete (#1607).
@@ -46,13 +68,6 @@ filesystem_policy:
 # across different kernel versions before we flip this. (ref #516 item 3)
 landlock:
   compatibility: best_effort
-
-# Note: tool-level write/edit restrictions for openclaw.json are intentionally
-# NOT declared here. OpenShell's PolicyFile schema does not support a
-# `tool_policy` section (serde deny_unknown_fields — only version, filesystem_policy,
-# landlock, process, network_policies are accepted). Config protection when
-# shields are up is achieved via DAC (444 root:root) and chattr +i.
-# Ref: https://github.com/NVIDIA/NemoClaw/pull/654#pullrequestreview-…
 
 process:
   run_as_user: sandbox
@@ -72,18 +87,9 @@ network_policies:
           - allow: { method: POST, path: "/v1/embeddings" }
           - allow: { method: GET, path: "/v1/models" }
           - allow: { method: GET, path: "/v1/models/**" }
-      - host: inference-api.nvidia.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        rules:
-          - allow: { method: POST, path: "/v1/chat/completions" }
-          - allow: { method: POST, path: "/v1/completions" }
-          - allow: { method: POST, path: "/v1/embeddings" }
-          - allow: { method: GET, path: "/v1/models" }
-          - allow: { method: GET, path: "/v1/models/**" }
     binaries:
       - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/bun }      # gbrain embed calls inference for embeddings
 
   # ── Managed inference route ──────────────────────────────────────────
   # inference.local is the OpenShell gateway's internal virtual hostname;
@@ -128,6 +134,11 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
+        # ClawHub addresses scoped packages as @scope%2Fname. Keep strict
+        # canonicalization everywhere else while allowing that registry form.
+        # TODO(#4104): Remove if ClawHub stops encoding scope separators or
+        # OpenShell can preserve this route without an endpoint-level opt-in.
+        allow_encoded_slash: true
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
@@ -145,6 +156,13 @@ network_policies:
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
+      # OpenClaw reads model metadata from this catalog during agent turns.
+      - host: catalog.openclaw.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
     binaries:
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/node }

@@ -10,13 +10,13 @@ import { buildVersionedUninstallUrl, runUninstallCommand } from "../lib/uninstal
 
 export default class UninstallCliCommand extends NemoClawCommand {
   static id = "uninstall";
+  static customHelp = true;
   static strict = false;
   static summary = "Run uninstall.sh";
   static description = "Run the local uninstall.sh script; remote fallback is disabled.";
   static usage = ["uninstall [flags]"];
   static examples = ["<%= config.bin %> uninstall --yes"];
-  static flags = {
-  };
+  static flags = {};
 
   public async run(): Promise<void> {
     this.parsed = true;

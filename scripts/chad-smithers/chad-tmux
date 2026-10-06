@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# chad-tmux — host-side named tmux sessions for Chad's long-running work,
+# attachable from the Moshi iPhone app. Follows the Moshi skill conventions:
+# a PRIVATE socket (no collision with the operator's own tmux), stable session
+# names, and detach-safe / capture-pane-friendly usage.
+#
+# Why: host-side long jobs (webui-ingest, gbrain backfills, deploys, the
+# Smithers experiment runs) otherwise run under nohup and are invisible. In a
+# named tmux session you can attach from your phone over Moshi/mosh mid-run,
+# watch, or intervene — the S141 "on vacation" case.
+#
+# Usage:
+#   chad-tmux <name> [command...]   new-or-attach session <name>; run command if new
+#   chad-tmux ls                    list chad sessions on the private socket
+#   chad-tmux attach <name>         attach (use from a Moshi terminal)
+#   chad-tmux capture <name>        print the session's pane content (no attach)
+#   chad-tmux kill <name>           kill a session
+#
+# The private socket keeps these sessions separate from `tmux` with no args.
+# Moshi attaches via: tmux -S "$CHAD_TMUX_SOCKET" attach -t chad-<name>
+
+set -uo pipefail
+
+SOCKET="${CHAD_TMUX_SOCKET:-$HOME/.chad-tmux.sock}"
+PREFIX="chad-"
+TM() { tmux -S "$SOCKET" "$@"; }
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  ""|-h|--help)
+    sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  ls)
+    TM list-sessions 2>/dev/null || echo "no chad sessions"
+    ;;
+  attach)
+    name="$PREFIX${1:?usage: chad-tmux attach <name>}"
+    exec tmux -S "$SOCKET" attach -t "$name"
+    ;;
+  capture)
+    name="$PREFIX${1:?usage: chad-tmux capture <name>}"
+    TM capture-pane -pt "$name"
+    ;;
+  kill)
+    name="$PREFIX${1:?usage: chad-tmux kill <name>}"
+    TM kill-session -t "$name" && echo "killed $name"
+    ;;
+  *)
+    # new-or-attach: `chad-tmux <name> [command...]`
+    name="$PREFIX$cmd"
+    if TM has-session -t "$name" 2>/dev/null; then
+      echo "chad-tmux: session $name exists — attach with: chad-tmux attach $cmd"
+    elif [ "$#" -gt 0 ]; then
+      TM new-session -d -s "$name" "$@"
+      echo "chad-tmux: started $name (attach: chad-tmux attach $cmd)"
+    else
+      TM new-session -d -s "$name"
+      echo "chad-tmux: created empty $name (attach: chad-tmux attach $cmd)"
+    fi
+    ;;
+esac

@@ -1,28 +1,49 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn, type SpawnOptions } from "node:child_process";
+import { type SpawnOptions, spawn } from "node:child_process";
 
+import { redact } from "../security/redact";
 import { ROOT } from "../state/paths";
+import {
+  BUILD_PROGRESS_PATTERNS,
+  type CreatePhase,
+  matchesAny,
+  PULL_PROGRESS_PATTERNS,
+  UPLOAD_PROGRESS_PATTERNS,
+  VISIBLE_PROGRESS_PATTERNS,
+} from "./create-stream-progress";
+import { getReadyCheckOutputPatterns } from "./create-stream-ready-gate";
 
 export interface StreamSandboxCreateResult {
   status: number;
   output: string;
   sawProgress: boolean;
   forcedReady?: boolean;
+  readyTerminationTimedOut?: boolean;
 }
 
 export interface StreamSandboxCreateOptions {
+  /** Schema-owned build context. Ordinary create paths keep the repository root. */
+  cwd?: string;
   readyCheck?: (() => boolean) | null;
+  // Optional poll side effect. Must be paired with failureCheck so any
+  // observed side-effect error has an authoritative terminal-state classifier.
+  onPoll?: (() => void | Promise<void>) | null;
   failureCheck?: (() => string | null | undefined) | null;
   pollIntervalMs?: number;
   heartbeatIntervalMs?: number;
   silentPhaseMs?: number;
   logLine?: (line: string) => void;
+  traceEvent?: (name: string, attributes?: Record<string, unknown>) => void;
   // Optional guard for the early-ready escape hatch. When set, readyCheck()
   // alone cannot detach the create stream until at least one streamed output
   // line matches a configured pattern.
   readyCheckOutputPatterns?: readonly RegExp[];
+  // When Ready is used to cancel a long-lived create client, wait for that
+  // client to exit before returning so a following ownership cutover cannot
+  // overlap the still-active OpenShell create operation.
+  waitForReadyTermination?: boolean;
   // Initial progress phase:
   //   build  — docker-building the sandbox image
   //   upload — pushing the built image into the gateway registry
@@ -46,6 +67,7 @@ export interface StreamableReadable {
 export interface StreamableChildProcess {
   stdout: StreamableReadable | null;
   stderr: StreamableReadable | null;
+  pid?: number;
   kill?(signal?: NodeJS.Signals | number): boolean;
   removeAllListeners?(event?: string | symbol): void;
   unref?(): void;
@@ -53,87 +75,58 @@ export interface StreamableChildProcess {
   on(event: "close", listener: (code: number | null) => void): this;
 }
 
-export const BUILD_PROGRESS_PATTERNS: readonly RegExp[] = [
-  /^ {2}Building image /,
-  /^ {2}Step \d+\/\d+ : /,
-  /^#\d+ \[/,
-  /^#\d+ (DONE|CACHED)\b/,
-];
+const CLASSIC_DOCKER_STEP_RE = /^\s*Step (\d+)\/(\d+) : (.+)$/;
+const BUILDKIT_STEP_RE = /^#(\d+)\s+(.+)$/;
+const READY_TERMINATION_TIMEOUT_MS = 5_000;
 
-const UPLOAD_PROGRESS_PATTERNS: readonly RegExp[] = [
-  /^ {2}Pushing image /,
-  /^\s*\[progress\]/,
-  /^\s*(?:✓\s*)?Image .*available in the gateway/,
-];
-
-// Pull-phase indicators. Detect classic Docker pull output (`<tag>: Pulling
-// from <ref>`, `<id>: Pulling fs layer / Downloading / Extracting / Pull
-// complete`, `Status: Downloaded`, `Digest:`) plus BuildKit pull progress
-// (`#N resolve <ref>`, `#N sha256:<id> <size> / <total>`). The tag prefix
-// regex uses [^:\s]+ so non-lowercase tags (`v1.2.3`, `cuda-12.5`, `12.4`)
-// also match. See #1829.
-const PULL_PROGRESS_PATTERNS: readonly RegExp[] = [
-  /^\s*(?:[^:\s]+:\s+)?Pulling from \S+/,
-  /^\s*[a-f0-9]{6,}: (?:Pulling fs layer|Waiting|Downloading|Extracting|Pull complete|Verifying Checksum|Download complete)\b/,
-  /^\s*Status: (?:Downloaded|Image is up to date)/,
-  /^\s*Digest: sha256:[a-f0-9]{8,}/,
-  /^\s*#\d+\s+(?:resolve\s+\S+|sha256:[a-f0-9]+\s+[\d.]+\s*(?:B|KB|MB|GB)\s*\/)/,
-];
-
-const VISIBLE_PROGRESS_PATTERNS: readonly RegExp[] = [
-  ...BUILD_PROGRESS_PATTERNS,
-  /^ {2}Context: /,
-  /^ {2}Gateway: /,
-  /^Successfully built /,
-  /^Successfully tagged /,
-  /^ {2}Built image /,
-  ...UPLOAD_PROGRESS_PATTERNS,
-  ...PULL_PROGRESS_PATTERNS,
-  /^Created sandbox: /,
-  /^Creating sandbox/i,
-  /^Starting sandbox/i,
-  /^✓ /,
-];
-
-const VM_READY_DETACH_OUTPUT_PATTERNS: readonly RegExp[] = [/Setting up NemoClaw/];
-
-function matchesAny(line: string, patterns: readonly RegExp[]) {
-  return patterns.some((pattern) => pattern.test(line));
-}
-
-function selectedDrivers(env: NodeJS.ProcessEnv): string[] {
-  const raw =
-    env.OPENSHELL_DRIVERS ??
-    process.env.OPENSHELL_DRIVERS ??
-    (process.platform === "darwin" ? "vm" : "docker");
-  return raw
-    .split(",")
-    .map((driver) => driver.trim())
-    .filter(Boolean);
-}
-
-function getReadyCheckOutputPatterns(
-  env: NodeJS.ProcessEnv,
-  patterns: readonly RegExp[] | undefined,
-): readonly RegExp[] {
-  if (patterns) return patterns;
-  return selectedDrivers(env).includes("vm") ? VM_READY_DETACH_OUTPUT_PATTERNS : [];
-}
-
+/**
+ * @deprecated Prefer the argv overload `streamSandboxCreate(command, args, env, options)` for
+ * trusted create paths. This legacy overload preserves shell-compatible callers by executing
+ * `bash -lc <command>`, so callers must not include unquoted user-controlled input. Remove
+ * this transitional overload in the #6258 follow-up once external callers have migrated.
+ */
 export function streamSandboxCreate(
   command: string,
-  env: NodeJS.ProcessEnv = process.env,
-  options: StreamSandboxCreateOptions = {},
+  env?: NodeJS.ProcessEnv,
+  options?: StreamSandboxCreateOptions,
+): Promise<StreamSandboxCreateResult>;
+export function streamSandboxCreate(
+  command: string,
+  args: readonly string[],
+  env?: NodeJS.ProcessEnv,
+  options?: StreamSandboxCreateOptions,
+): Promise<StreamSandboxCreateResult>;
+export function streamSandboxCreate(
+  command: string,
+  argsOrEnv: readonly string[] | NodeJS.ProcessEnv = process.env,
+  envOrOptions: NodeJS.ProcessEnv | StreamSandboxCreateOptions | undefined = undefined,
+  maybeOptions: StreamSandboxCreateOptions = {},
 ): Promise<StreamSandboxCreateResult> {
-  const child: StreamableChildProcess = (options.spawnImpl ?? spawn)("bash", ["-lc", command], {
-    cwd: ROOT,
+  const hasArgs = Array.isArray(argsOrEnv);
+  const commandArgs = hasArgs ? argsOrEnv : ["-lc", command];
+  const spawnCommand = hasArgs ? command : "bash";
+  const env = hasArgs
+    ? ((envOrOptions ?? process.env) as NodeJS.ProcessEnv)
+    : (argsOrEnv as NodeJS.ProcessEnv);
+  const options = hasArgs ? maybeOptions : ((envOrOptions ?? {}) as StreamSandboxCreateOptions);
+  if (options.onPoll && !options.failureCheck) {
+    throw new Error(
+      "streamSandboxCreate onPoll requires failureCheck (e.g., dockerGpuCreatePatch.createFailureMessage)",
+    );
+  }
+  const spawnChild = options.spawnImpl ?? spawn;
+  const ownProcessGroup = spawnChild === spawn && process.platform !== "win32";
+  const child: StreamableChildProcess = spawnChild(spawnCommand, commandArgs, {
+    cwd: options.cwd ?? ROOT,
     env,
+    detached: ownProcessGroup,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
   const logLine = options.logLine ?? console.log;
+  const traceEvent = options.traceEvent ?? (() => {});
   const lines: string[] = [];
-  let pending = "";
+  const pending = { stdout: "", stderr: "" };
   let lastPrintedLine = "";
   let sawProgress = false;
   const readyCheckOutputPatterns = getReadyCheckOutputPatterns(
@@ -144,17 +137,25 @@ export function streamSandboxCreate(
   let printedReadyCheckOutputWait = false;
   let settled = false;
   let polling = false;
+  let waitingForReadyTermination = false;
+  let readyTerminationTimer: ReturnType<typeof setTimeout> | null = null;
   const pollIntervalMs = options.pollIntervalMs || 2000;
   const heartbeatIntervalMs = options.heartbeatIntervalMs || 5000;
   const silentPhaseMs = options.silentPhaseMs || 15000;
   const startedAt = Date.now();
   let lastOutputAt = startedAt;
-  type CreatePhase = "pull" | "build" | "upload" | "create" | "ready";
 
   let currentPhase: CreatePhase | null = null;
   let lastHeartbeatPhase: CreatePhase | null = null;
   let lastHeartbeatBucket = -1;
   let resolvePromise: (result: StreamSandboxCreateResult) => void;
+  let buildStartedAtMs: number | null = null;
+  let buildTimingFinished = false;
+  let activeBuildStep: {
+    label: string;
+    instruction: string;
+    startedAtMs: number;
+  } | null = null;
 
   function getDisplayWidth() {
     return Math.max(60, Number(process.stdout.columns || 100));
@@ -173,6 +174,92 @@ export function streamSandboxCreate(
       logLine(display);
       lastPrintedLine = display;
     }
+  }
+
+  function formatDuration(ms: number) {
+    return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+  }
+
+  function timingNow() {
+    return Date.now();
+  }
+
+  function appendTimingLine(line: string) {
+    lines.push(line);
+    printProgressLine(line);
+  }
+
+  function emitTraceEvent(name: string, attributes: Record<string, unknown> = {}) {
+    traceEvent(name, attributes);
+  }
+
+  function markBuildStarted(nowMs: number = timingNow()) {
+    if (buildStartedAtMs === null) {
+      buildStartedAtMs = nowMs;
+    }
+  }
+
+  function finishActiveBuildStep(status: "completed" | "stopped", nowMs: number = timingNow()) {
+    if (!activeBuildStep) return;
+    const elapsedMs = nowMs - activeBuildStep.startedAtMs;
+    const phrase = status === "completed" ? "completed in" : "stopped after";
+    const elapsed = formatDuration(elapsedMs);
+    appendTimingLine(
+      `  ${activeBuildStep.label} ${phrase} ${elapsed} (${activeBuildStep.instruction})`,
+    );
+    emitTraceEvent("docker_build_step_end", {
+      status,
+      step: activeBuildStep.label,
+      instruction: activeBuildStep.instruction,
+      duration_ms: elapsedMs,
+    });
+    activeBuildStep = null;
+  }
+
+  function finishBuildTiming(status: "completed" | "stopped", nowMs: number = timingNow()) {
+    if (buildTimingFinished) return;
+    finishActiveBuildStep(status, nowMs);
+    if (buildStartedAtMs !== null) {
+      const elapsedMs = nowMs - buildStartedAtMs;
+      const phrase = status === "completed" ? "completed in" : "stopped after";
+      appendTimingLine(`  Sandbox image build ${phrase} ${formatDuration(elapsedMs)}`);
+      emitTraceEvent("docker_build_end", {
+        status,
+        duration_ms: elapsedMs,
+      });
+    }
+    buildTimingFinished = true;
+  }
+
+  function maybeStartClassicBuildStep(line: string) {
+    const match = line.match(CLASSIC_DOCKER_STEP_RE);
+    if (!match) return;
+    const nowMs = timingNow();
+    finishActiveBuildStep("completed", nowMs);
+    markBuildStarted(nowMs);
+    activeBuildStep = {
+      label: `Step ${match[1]}/${match[2]}`,
+      instruction: match[3].trim().replace(/\s+/g, " "),
+      startedAtMs: nowMs,
+    };
+    emitTraceEvent("docker_build_step_start", {
+      step: activeBuildStep.label,
+      index: Number(match[1]),
+      total: Number(match[2]),
+      instruction: activeBuildStep.instruction,
+    });
+  }
+
+  function maybeRecordBuildKitStep(line: string) {
+    const match = line.match(BUILDKIT_STEP_RE);
+    if (!match) return;
+    if (!matchesAny(line, BUILD_PROGRESS_PATTERNS) && !matchesAny(line, PULL_PROGRESS_PATTERNS)) {
+      return;
+    }
+    emitTraceEvent("docker_buildkit_progress", {
+      step: Number(match[1]),
+      detail: match[2].trim().replace(/\s+/g, " "),
+    });
   }
 
   function elapsedSeconds() {
@@ -196,6 +283,10 @@ export function streamSandboxCreate(
               : nextPhase === "ready"
                 ? "  Waiting for sandbox to become ready..."
                 : null;
+    emitTraceEvent("sandbox_create_phase", {
+      phase: nextPhase,
+      elapsed_seconds: elapsedSeconds(),
+    });
     if (phaseLine) printProgressLine(phaseLine);
   }
 
@@ -206,6 +297,14 @@ export function streamSandboxCreate(
     lastOutputAt = Date.now();
     if (!readyCheckOutputMatched && matchesAny(line, readyCheckOutputPatterns)) {
       readyCheckOutputMatched = true;
+    }
+    if (matchesAny(line, BUILD_PROGRESS_PATTERNS)) {
+      markBuildStarted();
+    }
+    maybeStartClassicBuildStep(line);
+    maybeRecordBuildKitStep(line);
+    if (/^(?:Successfully built | {2}Built image )/.test(line)) {
+      finishBuildTiming("completed");
     }
     if (/^ {2}Built image /.test(line)) {
       setPhase("create");
@@ -228,25 +327,67 @@ export function streamSandboxCreate(
     return matchesAny(line, VISIBLE_PROGRESS_PATTERNS);
   }
 
-  function onChunk(chunk: Buffer | string) {
-    pending += chunk.toString();
-    const parts = pending.split("\n");
-    pending = parts.pop() ?? "";
+  function onChunk(stream: keyof typeof pending, chunk: Buffer | string) {
+    pending[stream] += chunk.toString();
+    const parts = pending[stream].split("\n");
+    pending[stream] = parts.pop() ?? "";
     parts.forEach(flushLine);
   }
 
-  function flushPendingLine() {
-    if (!pending) return;
-    const trailing = pending;
-    pending = "";
-    flushLine(trailing);
+  function flushPendingLines() {
+    for (const stream of ["stdout", "stderr"] as const) {
+      if (!pending[stream]) continue;
+      const trailing = pending[stream];
+      pending[stream] = "";
+      flushLine(trailing);
+    }
   }
+
+  function terminateChild(signal: NodeJS.Signals) {
+    try {
+      if (ownProcessGroup && typeof child.pid === "number" && child.pid > 0) {
+        process.kill(-child.pid, signal);
+      } else {
+        child.kill?.(signal);
+      }
+    } catch {
+      // Best effort only — the child may have already exited.
+    }
+  }
+
+  function terminateChildOnHostExit() {
+    if (!settled) terminateChild("SIGKILL");
+  }
+
+  function removeHostExitListeners() {
+    process.removeListener("exit", terminateChildOnHostExit);
+    process.removeListener("SIGINT", onHostSigint);
+    process.removeListener("SIGTERM", onHostSigterm);
+  }
+
+  function handleHostSignal(signal: NodeJS.Signals) {
+    terminateChildOnHostExit();
+    removeHostExitListeners();
+    process.kill(process.pid, signal);
+  }
+
+  const onHostSigint = () => handleHostSignal("SIGINT");
+  const onHostSigterm = () => handleHostSignal("SIGTERM");
+
+  process.once("exit", terminateChildOnHostExit);
+  process.on("SIGINT", onHostSigint);
+  process.on("SIGTERM", onHostSigterm);
 
   function finish(status: number, overrides: Partial<StreamSandboxCreateResult> = {}) {
     if (settled) return;
     settled = true;
-    flushPendingLine();
+    removeHostExitListeners();
+    flushPendingLines();
+    if (!buildTimingFinished && buildStartedAtMs !== null) {
+      finishBuildTiming(status === 0 ? "completed" : "stopped");
+    }
     if (readyTimer) clearInterval(readyTimer);
+    if (readyTerminationTimer) clearTimeout(readyTerminationTimer);
     clearInterval(heartbeatTimer);
     resolvePromise({
       status,
@@ -266,18 +407,21 @@ export function streamSandboxCreate(
     child.unref?.();
   }
 
-  child.stdout?.on("data", onChunk);
-  child.stderr?.on("data", onChunk);
+  child.stdout?.on("data", (chunk) => onChunk("stdout", chunk));
+  child.stderr?.on("data", (chunk) => onChunk("stderr", chunk));
 
   const readyTimer = options.readyCheck
-    ? setInterval(() => {
-        if (settled || polling) return;
+    ? setInterval(async () => {
+        if (settled || polling || waitingForReadyTermination) return;
         polling = true;
         try {
           let ready = false;
           try {
             ready = !!options.readyCheck?.();
-          } catch {
+          } catch (error) {
+            emitTraceEvent("sandbox_create_ready_check_error", {
+              message: redact(error instanceof Error ? error.message : String(error)),
+            });
             return;
           }
           if (ready) {
@@ -292,13 +436,22 @@ export function streamSandboxCreate(
               }
               return;
             }
-            const detail = "Sandbox reported Ready before create stream exited; continuing.";
+            const detail = options.waitForReadyTermination
+              ? "Sandbox reported Ready; waiting for the create ownership handoff to finish."
+              : "Sandbox reported Ready before create stream exited; continuing.";
             lines.push(detail);
             printProgressLine(`  ${detail}`);
-            try {
-              child.kill?.("SIGTERM");
-            } catch {
-              // Best effort only — the child may have already exited.
+            terminateChild("SIGTERM");
+            if (options.waitForReadyTermination) {
+              waitingForReadyTermination = true;
+              readyTerminationTimer = setTimeout(() => {
+                lines.push("OpenShell create client did not exit after Ready; aborting cutover.");
+                terminateChild("SIGKILL");
+                finish(1, { readyTerminationTimedOut: true });
+              }, READY_TERMINATION_TIMEOUT_MS);
+              readyTerminationTimer.unref?.();
+              sawProgress = true;
+              return;
             }
             detachChild();
             sawProgress = true;
@@ -306,16 +459,23 @@ export function streamSandboxCreate(
             return;
           }
 
-          const failure = options.failureCheck?.();
+          let pollFailure: string | null | undefined;
+          try {
+            await options.onPoll?.();
+          } catch (error) {
+            emitTraceEvent("sandbox_create_poll_error", {
+              message: redact(error instanceof Error ? error.message : String(error)),
+            });
+            pollFailure = options.failureCheck?.() ?? "Sandbox create poll side effect failed.";
+          }
+          if (settled || waitingForReadyTermination) return;
+
+          const failure = pollFailure ?? options.failureCheck?.();
           if (!failure) return;
           const detail = String(failure);
           lines.push(detail);
           printProgressLine(`  ${detail}`);
-          try {
-            child.kill?.("SIGTERM");
-          } catch {
-            // Best effort only — the child may have already exited.
-          }
+          terminateChild("SIGTERM");
           detachChild();
           sawProgress = true;
           finish(1);
@@ -368,7 +528,11 @@ export function streamSandboxCreate(
     child.on("close", (code) => {
       // One last ready-check: the sandbox may have become Ready between the
       // last poll tick and the stream exit (e.g. SSH 255 after "Created sandbox:").
-      flushPendingLine();
+      flushPendingLines();
+      if (waitingForReadyTermination) {
+        finish(0, { forcedReady: true });
+        return;
+      }
       if (code && code !== 0 && options.readyCheck) {
         try {
           if (options.readyCheck() && readyCheckOutputMatched) {

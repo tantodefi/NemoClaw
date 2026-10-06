@@ -1,11 +1,14 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Repo Policy
 
-Configurable defaults that adapt the skill to a specific repository. Edit this file when adopting the skill in a new repo. The skill reads these values to know what to gate on.
+Repository settings for this skill. Edit this file when you use the skill in another repository.
 
 ## Contents
 
 - Required reviewer teams (CODEOWNERS)
-- Sign-off policy (DCO)
+- PR compliance policy (DCO declaration and GitHub verified signatures)
 - Automated reviewer (CodeRabbit, Copilot, etc.)
 - Documentation directory
 - Coverage threshold files
@@ -19,15 +22,20 @@ CODEOWNERS approval is enforced via branch protection. The skill checks `reviewD
 codeowners_enforced_via_branch_protection: true
 ```
 
-If your repo does NOT enforce CODEOWNERS via branch protection, set this to `false` and add an explicit list of required teams to check.
+If branch protection does not enforce CODEOWNERS, set this value to `false` and add the required teams.
 
-## Sign-off policy
+## Commit compliance policy
 
-NemoClaw default: DCO sign-off required, enforced by `dco-check` workflow.
+NemoClaw requires a `Signed-off-by:` line in the PR description.
+GitHub must show each PR commit as `Verified`.
+The `dco-check` workflow, comparator, and merge gate check DCO.
+The comparator and merge gate check commit verification. Branch protection is a separate gate.
 
 ```yaml
 dco_required: true
+dco_location: pr_description
 dco_check_name: dco-check
+github_verified_signatures_required: true
 ```
 
 ## Automated reviewers
@@ -61,7 +69,7 @@ The skill defers to ratchet enforcement in CI. NemoClaw uses `ci/coverage-thresh
 coverage_ratchet_enforced_via_ci: true
 ```
 
-If your repo does NOT ratchet coverage in CI, the skill needs to compute coverage delta itself — flag this as a v2 gap.
+If CI does not enforce coverage, report that this skill does not compute the coverage change.
 
 ## Discovery search
 

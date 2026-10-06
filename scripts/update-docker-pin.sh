@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Updates the pinned sha256 digest for node:22-trixie-slim in the Dockerfile.
+# Updates the pinned sha256 digest for node:24.18.1-trixie-slim in the Dockerfile.
 # Queries Docker Hub for the current multi-arch image-index digest and
-# rewrites every FROM line that references node:22-trixie-slim.
+# rewrites every FROM line that references node:24.18.1-trixie-slim.
 #
 # Usage:
 #   scripts/update-docker-pin.sh            # update Dockerfile in repo root
@@ -21,7 +21,7 @@ case "${1:-}" in
 esac
 
 IMAGE="node"
-TAG="22-trixie-slim"
+TAG="24.18.1-trixie-slim"
 DOCKERFILE="${DOCKERFILE:-Dockerfile}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKERFILE_PATH="${REPO_ROOT}/${DOCKERFILE}"
@@ -33,7 +33,7 @@ resolve_latest_digest() {
   local token digest
 
   # Step 1: get an auth token for the Docker Hub library repo
-  token=$(curl -fsSL --retry 3 --retry-delay 1 --retry-all-errors \
+  token=$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 1 --retry-all-errors \
     --connect-timeout 10 --max-time 30 \
     "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/${IMAGE}:pull" \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -44,7 +44,7 @@ resolve_latest_digest() {
   fi
 
   # Step 2: fetch the tag headers and use Docker-Content-Digest for the index.
-  digest=$(curl -fsSIL --retry 3 --retry-delay 1 --retry-all-errors \
+  digest=$(curl -fsSIL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 1 --retry-all-errors \
     --connect-timeout 10 --max-time 30 \
     -H "Authorization: Bearer ${token}" \
     -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json" \

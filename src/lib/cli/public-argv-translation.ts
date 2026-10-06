@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { getRegisteredOclifCommandMetadata, getRegisteredOclifCommandsMetadata } from "./oclif-metadata";
-import { globalRouteTokenVariants, sandboxRouteTokens } from "./public-route-metadata";
+import {
+  getRegisteredOclifCommandMetadata,
+  getRegisteredOclifCommandsMetadata,
+} from "./oclif-metadata";
+import { globalRouteTokenVariants, sandboxRouteTokenVariants } from "./public-route-metadata";
 
 export type NativeArgvTranslation = {
   kind: "nativeArgv";
@@ -49,10 +52,9 @@ function sandboxRoutes(): SandboxRoute[] {
   return [...commandIds]
     .filter((commandId) => commandId.startsWith("sandbox:"))
     .filter((commandId) => !hasChildCommand(commandId, commandIds))
-    .map((commandId) => ({
-      commandId,
-      publicTokens: sandboxRouteTokens(commandId) ?? [],
-    }))
+    .flatMap((commandId) =>
+      sandboxRouteTokenVariants(commandId).map((publicTokens) => ({ commandId, publicTokens })),
+    )
     .filter((route) => route.publicTokens.length > 0)
     .sort((a, b) => b.publicTokens.length - a.publicTokens.length);
 }
@@ -77,6 +79,20 @@ function startsWithTokens(tokens: readonly string[], prefix: readonly string[]):
   return prefix.every((token, index) => tokens[index] === token);
 }
 
+function matchRegisteredSandboxRoute(tokens: readonly string[]): SandboxRoute | null {
+  return sandboxRoutes().find((route) => startsWithTokens(tokens, route.publicTokens)) ?? null;
+}
+
+/**
+ * Return the longest registered sandbox route that prefixes the public input.
+ *
+ * Diagnostics use these registered tokens so untrusted action arguments never
+ * reach terminal or log output (#10212).
+ */
+export function matchSandboxRoute(tokens: readonly string[]): string[] | null {
+  return matchRegisteredSandboxRoute(tokens)?.publicTokens ?? null;
+}
+
 function nativeArgv(commandId: string, args: string[], argv?: string[]): NativeArgvTranslation {
   return { kind: "nativeArgv", commandId, args, argv: argv ?? [...commandId.split(":"), ...args] };
 }
@@ -92,6 +108,10 @@ function parentSubcommands(action: string): Set<string> {
 
 function hasRegisteredOclifParentCommand(action: string): boolean {
   return getRegisteredOclifCommandMetadata(`sandbox:${action}`) !== null;
+}
+
+function isNonStrictRegisteredParent(action: string): boolean {
+  return getRegisteredOclifCommandMetadata(`sandbox:${action}`)?.strict === false;
 }
 
 function isHelpToken(token: string | undefined): boolean {
@@ -115,13 +135,17 @@ function nativeSandboxParentArgv(
   if (!subcommand || isHelpToken(subcommand)) {
     return nativeArgv(`sandbox:${action}`, ["--help"], ["sandbox", action, "--help"]);
   }
-  return nativeArgv(`sandbox:${action}:${subcommand}`, [sandboxName, ...actionArgs.slice(1)], [
-    "sandbox",
-    action,
-    subcommand,
-    sandboxName,
-    ...actionArgs.slice(1),
-  ]);
+  if (subcommand.startsWith("-")) {
+    if (isNonStrictRegisteredParent(action)) {
+      return nativeArgv(`sandbox:${action}`, [sandboxName, ...actionArgs]);
+    }
+    return nativeArgv(`sandbox:${action}`, ["--help"], ["sandbox", action, "--help"]);
+  }
+  return nativeArgv(
+    `sandbox:${action}:${subcommand}`,
+    [sandboxName, ...actionArgs.slice(1)],
+    ["sandbox", action, subcommand, sandboxName, ...actionArgs.slice(1)],
+  );
 }
 
 export function translatePublicGlobalArgv(cmd: string, args: string[]): PublicTranslationResult {
@@ -131,7 +155,7 @@ export function translatePublicGlobalArgv(cmd: string, args: string[]): PublicTr
     return nativeArgv(route.commandId, inputTokens.slice(route.tokens.length));
   }
 
-  if (cmd === "tunnel" || cmd === "inference" || cmd === "credentials") {
+  if (cmd === "agents" || cmd === "tunnel" || cmd === "inference" || cmd === "credentials") {
     return nativeGlobalParentArgv(cmd, args);
   }
 
@@ -152,13 +176,19 @@ export function translatePublicSandboxArgv(
   }
 
   const inputTokens = [action, ...actionArgs];
-  for (const route of sandboxRoutes()) {
-    if (!startsWithTokens(inputTokens, route.publicTokens)) continue;
+  const route = matchRegisteredSandboxRoute(inputTokens);
+  if (route) {
     const remainingArgs = inputTokens.slice(route.publicTokens.length);
     return nativeArgv(route.commandId, [sandboxName, ...remainingArgs]);
   }
 
-  if (parentSubcommands(action).size > 0 && (actionArgs.length === 0 || !parentSubcommands(action).has(actionArgs[0]))) {
+  if (
+    parentSubcommands(action).size > 0 &&
+    (actionArgs.length === 0 || !parentSubcommands(action).has(actionArgs[0]))
+  ) {
+    if (actionArgs.length === 0 && isNonStrictRegisteredParent(action)) {
+      return nativeArgv(`sandbox:${action}`, [sandboxName]);
+    }
     return nativeSandboxParentArgv(sandboxName, action, actionArgs);
   }
 

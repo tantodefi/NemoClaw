@@ -2,12 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-
-import {
-  ONBOARD_MACHINE_EVENT_TYPES,
-  ONBOARD_MACHINE_STATES,
-  ONBOARD_NON_TERMINAL_MACHINE_STATES,
-} from "./types";
 import {
   assertValidOnboardMachineTransition,
   canTransitionOnboardMachineState,
@@ -20,6 +14,11 @@ import {
   ONBOARD_MACHINE_NEXT_STATES,
   ONBOARD_MACHINE_TRANSITIONS,
 } from "./transitions";
+import {
+  ONBOARD_MACHINE_EVENT_TYPES,
+  ONBOARD_MACHINE_STATES,
+  ONBOARD_NON_TERMINAL_MACHINE_STATES,
+} from "./types";
 
 const canonicalDirectTransitions = [
   ["init", "preflight", "advance"],
@@ -38,7 +37,7 @@ const canonicalDirectTransitions = [
 ] as const;
 
 describe("onboard machine vocabulary", () => {
-  it("defines the initial coarse state vocabulary from issue #3802", () => {
+  it("defines the initial coarse state vocabulary (#3802)", () => {
     expect(ONBOARD_MACHINE_STATES).toEqual([
       "init",
       "preflight",
@@ -56,7 +55,7 @@ describe("onboard machine vocabulary", () => {
     ]);
   });
 
-  it("defines the initial observe-only event vocabulary from issue #3802", () => {
+  it("defines the initial observe-only event vocabulary (#3802)", () => {
     expect(ONBOARD_MACHINE_EVENT_TYPES).toEqual([
       "onboard.started",
       "onboard.resumed",
@@ -70,6 +69,8 @@ describe("onboard machine vocabulary", () => {
       "state.repair.started",
       "state.repair.completed",
       "state.repair.failed",
+      "state.result.invalidated",
+      "state.result.skipped",
       "context.updated",
       "resume.conflict",
       "hook.started",
@@ -92,11 +93,9 @@ describe("onboard machine transitions", () => {
     );
   });
 
-  it("allows every non-terminal state to fail", () => {
-    for (const state of ONBOARD_NON_TERMINAL_MACHINE_STATES) {
-      expect(canTransitionOnboardMachineState(state, "failed")).toBe(true);
-      expect(getOnboardMachineTransition(state, "failed")?.kind).toBe("failure");
-    }
+  it.each(ONBOARD_NON_TERMINAL_MACHINE_STATES)("allows the %s state to fail", (state) => {
+    expect(canTransitionOnboardMachineState(state, "failed")).toBe(true);
+    expect(getOnboardMachineTransition(state, "failed")?.kind).toBe("failure");
   });
 
   it("keeps terminal states terminal", () => {
@@ -147,14 +146,29 @@ describe("onboard machine transitions", () => {
     );
   });
 
-  it("keeps the next-state map aligned with the transition list", () => {
-    for (const state of ONBOARD_MACHINE_STATES) {
-      expect(
-        ONBOARD_MACHINE_TRANSITIONS.filter((transition) => transition.from === state).map(
-          (transition) => transition.to,
-        ),
-      ).toEqual(getNextOnboardMachineStates(state));
-    }
+  it.each(["agent_setup", "openclaw", "sandbox", "policies", "init"] as const)(
+    "does not allow failed to re-enter %s (#6179)",
+    (to) => {
+      expect(canTransitionOnboardMachineState("failed", to)).toBe(false);
+      expect(getOnboardMachineTransition("failed", to)).toBeNull();
+      expect(() => assertValidOnboardMachineTransition("failed", to)).toThrow(`failed -> ${to}`);
+    },
+  );
+
+  it.each(ONBOARD_MACHINE_TRANSITIONS)(
+    "keeps the $from to $to edge outside terminal source states (#6179)",
+    (transition) => {
+      expect(transition.from).not.toBe("failed");
+      expect(transition.from).not.toBe("complete");
+    },
+  );
+
+  it.each(ONBOARD_MACHINE_STATES)("keeps the %s next-state map aligned", (state) => {
+    expect(
+      ONBOARD_MACHINE_TRANSITIONS.filter((transition) => transition.from === state).map(
+        (transition) => transition.to,
+      ),
+    ).toEqual(getNextOnboardMachineStates(state));
   });
 
   it("does not contain duplicate transition edges", () => {

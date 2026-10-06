@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import {
-  InferenceGetError,
-  runInferenceGet,
-} from "../../lib/actions/inference-get";
+import { InferenceGetError, runInferenceGet } from "../../lib/actions/inference-get";
 import { NemoClawCommand } from "../../lib/cli/nemoclaw-oclif-command";
 
 export default class InferenceGetCommand extends NemoClawCommand {
@@ -20,7 +17,10 @@ export default class InferenceGetCommand extends NemoClawCommand {
   public async run(): Promise<unknown> {
     await this.parse(InferenceGetCommand);
     try {
-      const result = await runInferenceGet({ quiet: this.jsonEnabled() });
+      const result = await runInferenceGet({
+        cliName: this.config.bin,
+        quiet: this.jsonEnabled(),
+      });
       if (this.jsonEnabled()) return result;
     } catch (error) {
       if (error instanceof InferenceGetError) {

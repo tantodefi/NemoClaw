@@ -6,12 +6,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   addSandboxPolicy: vi.fn().mockResolvedValue(undefined),
   removeSandboxPolicy: vi.fn().mockResolvedValue(undefined),
+  excludeSandboxBaseline: vi.fn().mockResolvedValue(undefined),
+  restoreSandboxBaseline: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../../../lib/actions/sandbox/policy-channel", () => mocks);
 
 import PolicyAddCommand from "./add";
+import PolicyExcludeCommand from "./exclude";
 import PolicyRemoveCommand from "./remove";
+import PolicyRestoreCommand from "./restore";
 
 const rootDir = process.cwd();
 
@@ -33,6 +37,32 @@ describe("policy mutation oclif commands", () => {
       dryRun: true,
       fromFile: "/tmp/preset.yaml",
       fromDir: undefined,
+      trustedPrivateHosts: undefined,
+    });
+  });
+
+  it("maps repeatable trusted private hosts for custom policy input (#8176)", async () => {
+    await PolicyAddCommand.run(
+      [
+        "alpha",
+        "--from-file",
+        "/tmp/preset.yaml",
+        "--trusted-private-host",
+        "api.corp.example",
+        "--trusted-private-host",
+        "10.20.30.40",
+      ],
+      rootDir,
+    );
+
+    expect(mocks.addSandboxPolicy).toHaveBeenCalledWith("alpha", {
+      preset: undefined,
+      yes: false,
+      force: false,
+      dryRun: false,
+      fromFile: "/tmp/preset.yaml",
+      fromDir: undefined,
+      trustedPrivateHosts: ["api.corp.example", "10.20.30.40"],
     });
   });
 
@@ -57,9 +87,69 @@ describe("policy mutation oclif commands", () => {
 
   it("rejects mutually exclusive custom policy sources before dispatch", async () => {
     await expect(
-      PolicyAddCommand.run(["alpha", "--from-file", "preset.yaml", "--from-dir", "presets"], rootDir),
+      PolicyAddCommand.run(
+        ["alpha", "--from-file", "preset.yaml", "--from-dir", "presets"],
+        rootDir,
+      ),
     ).rejects.toThrow(/from-file|from-dir/);
 
     expect(mocks.addSandboxPolicy).not.toHaveBeenCalled();
+  });
+
+  it("maps policy-exclude args to typed baseline options", async () => {
+    await PolicyExcludeCommand.run(["alpha", "nous_research", "--force"], rootDir);
+
+    expect(mocks.excludeSandboxBaseline).toHaveBeenCalledWith("alpha", {
+      key: "nous_research",
+      yes: false,
+      force: true,
+      dryRun: false,
+    });
+  });
+
+  it("maps policy-restore args to typed baseline options", async () => {
+    await PolicyRestoreCommand.run(["alpha", "nous_research", "--dry-run"], rootDir);
+
+    expect(mocks.restoreSandboxBaseline).toHaveBeenCalledWith("alpha", {
+      key: "nous_research",
+      yes: false,
+      force: false,
+      dryRun: true,
+    });
+  });
+
+  it("accepts the same acknowledgement flags on restore as on exclude (#8114)", async () => {
+    await PolicyRestoreCommand.run(["alpha", "nous_research", "-y"], rootDir);
+
+    expect(mocks.restoreSandboxBaseline).toHaveBeenCalledWith("alpha", {
+      key: "nous_research",
+      yes: true,
+      force: false,
+      dryRun: false,
+    });
+
+    await PolicyRestoreCommand.run(["alpha", "nous_research", "--yes"], rootDir);
+
+    expect(mocks.restoreSandboxBaseline).toHaveBeenLastCalledWith("alpha", {
+      key: "nous_research",
+      yes: true,
+      force: false,
+      dryRun: false,
+    });
+
+    await PolicyRestoreCommand.run(["alpha", "nous_research", "--force"], rootDir);
+
+    expect(mocks.restoreSandboxBaseline).toHaveBeenLastCalledWith("alpha", {
+      key: "nous_research",
+      yes: false,
+      force: true,
+      dryRun: false,
+    });
+  });
+
+  it("requires an explicit baseline key before dispatch", async () => {
+    await expect(PolicyExcludeCommand.run(["alpha"], rootDir)).rejects.toThrow();
+
+    expect(mocks.excludeSandboxBaseline).not.toHaveBeenCalled();
   });
 });

@@ -17,7 +17,11 @@ describe("uninstall paths", () => {
   });
 
   it("builds host state, shim, OpenShell, and temp cleanup paths", () => {
-    const paths = defaultUninstallPaths({ home: "/home/test", tmpDir: "/tmp/nemo", xdgBinHome: "/xdg/bin" });
+    const paths = defaultUninstallPaths({
+      home: "/home/test",
+      tmpDir: "/tmp/nemo",
+      xdgBinHome: "/xdg/bin",
+    });
 
     expect(paths.nemoclawStateDir).toBe(path.join("/home/test", ".nemoclaw"));
     expect(paths.openshellConfigDir).toBe(path.join("/home/test", ".config", "openshell"));
@@ -28,6 +32,7 @@ describe("uninstall paths", () => {
       ...OPENSHELL_MANAGED_BINARIES.map((binary) => path.join("/xdg/bin", binary)),
     ]);
     expect(paths.helperServiceGlob).toBe(path.join("/tmp/nemo", "nemoclaw-services-*"));
+    expect(paths.huggingFaceModelCacheDir).toBe(path.join("/home/test", ".cache", "huggingface"));
     expect(paths.runtimeTempGlobs).toEqual([
       path.join("/tmp/nemo", "nemoclaw-create-*.log"),
       path.join("/tmp/nemo", "nemoclaw-tg-ssh-*.conf"),
@@ -49,13 +54,30 @@ describe("uninstall paths", () => {
       path.join("/home/test", ".config", "nemoclaw"),
     ]);
   });
-  it("#3456: exposes the Linux Docker-driver gateway state dir so uninstall can clean it", () => {
+
+  it("includes a configured gateway state directory in cleanup paths", () => {
+    const gatewayStateDir = "/srv/nemoclaw/gateway";
+    const paths = defaultUninstallPaths({ gatewayStateDir, home: "/home/test" });
+
+    expect(paths.selectedGatewayLocalStateDir).toBe(gatewayStateDir);
+    expect(uninstallStatePaths(paths)).toEqual([
+      path.join("/home/test", ".nemoclaw"),
+      path.join("/home/test", ".local", "state", "nemoclaw"),
+      gatewayStateDir,
+      path.join("/home/test", ".config", "openshell"),
+      path.join("/home/test", ".config", "nemoclaw"),
+    ]);
+  });
+
+  it("exposes the Linux Docker-driver gateway state dir so uninstall can clean it (#3456)", () => {
     // ~/.local/state/nemoclaw/ holds the openshell-gateway PID file, SQLite
     // database, audit log, and vm-driver/ state. Documented as
     // NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR in docs/reference/commands.mdx.
     // Before this fix, uninstall left it behind (#3456 hulynn comment).
     const paths = defaultUninstallPaths({ home: "/home/test" });
     expect(paths.gatewayLocalStateDir).toBe(path.join("/home/test", ".local", "state", "nemoclaw"));
-    expect(uninstallStatePaths(paths)).toContain(path.join("/home/test", ".local", "state", "nemoclaw"));
+    expect(uninstallStatePaths(paths)).toContain(
+      path.join("/home/test", ".local", "state", "nemoclaw"),
+    );
   });
 });

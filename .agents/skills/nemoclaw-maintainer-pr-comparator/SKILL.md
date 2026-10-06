@@ -1,48 +1,45 @@
 ---
 name: nemoclaw-maintainer-pr-comparator
-description: Compares competing PRs that target the same issue and recommends which one to merge. Runs gate, correctness, and quality checks; outputs a deterministic scorecard with reasoning trace. Use when an issue has two or more open PRs and a maintainer needs to decide which to merge.
+description: "Compare competing NemoClaw PRs for one issue and recommend a merge or salvage candidate from review evidence."
 user_invocable: true
 ---
 
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # PR Comparator
 
-Picks the merge winner among competing PRs for a single issue. Tier 0 gates eliminate plumbing failures; Tiers 1-2 score correctness and quality; Tier 3 applies deterministic tiebreakers. Degraded mode handles the case where no PR passes gates.
+Compare PRs for one issue. Tier 0 determines eligibility. Tiers 1 and 2 score correctness and quality.
+Tier 3 resolves ties. If no PR passes Tier 0, rank eligible PRs for salvage.
 
 ## Prerequisites
 
 - `gh` CLI installed and authenticated
-- A target repository with an issue that has 2+ open PRs
+- A target repository with an issue that has two or more open PRs
 
 ## Repo policy
 
-Defaults assume NemoClaw conventions (security CODEOWNERS, DCO, CodeRabbit, `docs/` directory). For other repos, edit `repo-policy.md` to override.
+The defaults use NemoClaw conventions for CODEOWNERS, DCO, CodeRabbit, and `docs/`.
+Read the canonical superseded-PR attribution policy in
+`../nemoclaw-maintainer-policies/references/workflow-policy.md`.
+Edit `repo-policy.md` for another repository.
+
+Execute comparator helpers from a fetched canonical NVIDIA/NemoClaw `main` checkout, or verify
+their executable code and dependencies against that revision before use. Candidate-modified helpers
+must not receive GitHub credentials. Inspect helper source when needed; a section heading does not
+establish trust.
 
 ## Workflow
 
-Copy this checklist into your response and check off each step:
-
-```text
-PR Comparison Progress:
-- [ ] Step 1: Parse issue (body + comments) for acceptance criteria
-- [ ] Step 2: Discover candidate PRs (default-order search with stop conditions)
-- [ ] Step 3: Detect supersession (parse PR bodies)
-- [ ] Step 4: Run Tier 0 gates per PR
-- [ ] Step 5: Run Tier 1 correctness checks per PR
-- [ ] Step 6: Run Tier 2 quality checks per PR
-- [ ] Step 7: Compute weighted scores
-- [ ] Step 8: Apply Tier 3 ranking (happy path or degraded mode)
-- [ ] Step 9: Emit verdict using templates/verdict.md
-```
-
 ### Step 1: Parse issue
 
-Extract acceptance criteria from issue body **and all comments**:
+Read the issue body and all comments. Extract each acceptance criterion:
 
 ```bash
 gh issue view <issue-number> --json title,body,comments
 ```
 
-Read every comment — commenters often add asks the body doesn't capture.
+Comments can add requirements that are absent from the issue body.
 
 ### Step 2: Discover candidate PRs
 
@@ -52,33 +49,63 @@ scripts/find-candidates.sh <issue-number>
 
 Applies a single default order with stop conditions.
 
-### Step 3: Detect supersession
+### Step 3: Detect supersession and transferred work
 
 ```bash
 scripts/parse-supersession.sh <pr-number-1> <pr-number-2> ...
 ```
 
-Parses each PR body for `supersedes #N`, `replaces #N`, `closes in favor of #N`, `folds in #N`. A PR that supersedes another wins ties immediately.
+Parse the case-insensitive statement families implemented by `scripts/parse-supersession.sh`:
+
+- `supersed[a-z]*` before `#N`: `supersedes #N` points from the current PR to `#N`; `superseded by #N` points from `#N` to the current PR.
+- `replac[a-z]*` before `#N`: `replaces #N` points from the current PR to `#N`; `replaced by #N` points from `#N` to the current PR.
+- `clos[a-z]* in favor of` before `#N`: `closes in favor of #N` and `closed in favor of #N` point from `#N` to the current PR.
+- `fold[a-z]* in` before `#N`: `folds in #N` points from the current PR to `#N`; `folded into #N` points from `#N` to the current PR.
+
+The bracket expressions describe the parser grammar; they are not literal PR body text.
+A `follow-up to #N` statement is a related-PR signal, not a supersession declaration, unless one of these phrases also appears.
+These statements record a relationship.
+They do not rank a candidate or prove that its diff contains another contributor's work.
+
+For each declared or suspected replacement, compare the commits and diffs and classify the relationship:
+
+- `independent`: The PR implements the issue without carrying material code, tests, or documentation from another contributor.
+- `transferred`: The PR carries material work from another contributor.
+- `unclear`: The available evidence does not establish whether another contributor's work remains.
+
+For `transferred`, apply the canonical superseded-PR attribution policy before setting a winner or recommending that the source PR be closed.
+For `unclear`, leave `winner` null and request maintainer judgment.
 
 ### Step 4: Tier 0 gates
 
 ```bash
 scripts/collect-gates.sh <pr-number>
 scripts/check-coderabbit-threads.sh <pr-number>
+git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+bash <(git show origin/main:.agents/skills/nemoclaw-maintainer-day/scripts/run-trusted-check-gates.sh) <pr-number>
 ```
 
-Five gates, all mandatory. See `checks/tier-0-gates.md` for the full list and interpretation.
+All six gates are required.
+Gate 3 accepts `BEHIND`, but fails closed on transient `UNSTABLE` evidence and on `BLOCKED` because
+the comparator cannot prove a stable merge result or every GitHub branch-protection condition.
+Separately confirm whether an active rule requires an up-to-date branch. If so, integrate the base
+and rerun all candidate evidence before declaring the PR eligible to merge.
+Treat PR Review Advisor output as input for maintainer review. Do not treat it as merge authorization.
+See `checks/tier-0-gates.md`.
 
 ### Step 5: Tier 1 correctness
 
-Six checks, all LLM judgments. See `checks/tier-1-correctness.md` for evidence requirements per check.
+Apply the six model checks in `checks/tier-1-correctness.md`.
 
 ### Step 6: Tier 2 quality
 
-Three checks, all LLM judgments. See `checks/tier-2-quality.md`.
+Apply the four model checks in `checks/tier-2-quality.md`.
 
 ### Step 7: Weighted score
 
+- Build the Tier 0 eligibility set from these Boolean keys: `state_open`, `ci_green_sha`, `mergeable`, `contributor_compliance`, `branch_protection`, and `coderabbit_threads_resolved`.
+- Stop if a candidate omits a required key, has an unknown key, or has a value that is not Boolean.
+- Only PRs for which all six gates are `true` enter happy-path scoring.
 - Each pass = full points
 - Each yellow = half points
 - Each fail = zero
@@ -87,35 +114,47 @@ Three checks, all LLM judgments. See `checks/tier-2-quality.md`.
 
 ### Step 8: Tier 3 ranking
 
-Branch on whether any PR passes all Tier 0 gates. See `tiebreakers.md` for happy-path tiebreakers, degraded-mode distance-to-ready ranking, and the behavior-coverage matrix.
+Compute the mode from the Tier 0 results. Do not accept a mode from the caller.
+In happy mode, set `winner` only to an eligible PR and set `closest_to_ready` to null.
+Leave `winner` null when the evidence does not support a merge recommendation.
+Do not set `winner` for a replacement with transferred work until the required attribution is present and verified.
+In degraded mode, set `winner` to null.
+Set `closest_to_ready` only to an open PR that passes contributor requirements.
+See `tiebreakers.md`.
 
 ### Step 9: Emit verdict
 
-Use `templates/verdict.md`. Every judgment must carry evidence (file:line refs, diff snippets), reasoning chain, and the score it contributed.
+Use `templates/verdict.md` and render the result with `scripts/render-verdict.py`.
+Stop if the renderer exits with a nonzero status. Do not recommend a merge.
+The renderer validates the gate schema, mode, winner eligibility, and salvage-candidate eligibility.
+The reviewer remains responsible for the score, ranking, and evidence.
+For each judgment, include evidence, the inference, and the score.
 
 ## Reference files
 
-- `repo-policy.md` — configurable defaults per target repo
-- `checks/tier-0-gates.md` — plumbing gates
-- `checks/tier-1-correctness.md` — six correctness checks
-- `checks/tier-2-quality.md` — three quality checks
-- `tiebreakers.md` — Tier 3 ranking and degraded mode
-- `templates/verdict.md` — output template
-- `validation/backtest.md` — backtest the skill against historical cases
+- [repo-policy.md](repo-policy.md) — Repository settings.
+- [checks/tier-0-gates.md](checks/tier-0-gates.md) — Six eligibility gates.
+- [checks/tier-1-correctness.md](checks/tier-1-correctness.md) — Six correctness checks.
+- [checks/tier-2-quality.md](checks/tier-2-quality.md) — Four quality checks.
+- [tiebreakers.md](tiebreakers.md) — Tier 3 ranking and degraded mode.
+- [templates/verdict.md](templates/verdict.md) — Output template.
+- [validation/backtest.md](validation/backtest.md) — Historical test cases for the skill.
 
-## Scripts (execute, do not read)
+## Scripts
 
 - `scripts/find-candidates.sh` — PR discovery
 - `scripts/collect-gates.sh` — Tier 0 gate evaluation
-- `scripts/check-coderabbit-threads.sh` — GraphQL thread resolution
+- `scripts/check-coderabbit-threads.sh` — GraphQL thread-resolution check
 - `scripts/parse-supersession.sh` — body parsing for supersession refs
 - `scripts/render-verdict.py` — verdict scorecard renderer
 
-## What this skill does NOT do
+## Limits
 
-These require infrastructure beyond GitHub API + LLM and are deferred to v2 modules:
+Run `nemoclaw-maintainer-cross-issue-sweep` separately when you need related-issue evidence.
 
-- Running each PR's code against adversarial inputs (sandboxed execution)
-- Cross-issue regression sweep (separate skill)
-- Revert simulation against neighbor PRs
-- Static analyzer integration (CodeQL, Semgrep)
+This skill does not:
+
+- run PR code against adversarial inputs
+- scan other issues for related behavior
+- simulate reverts against related PRs
+- run static analyzers such as CodeQL or Semgrep

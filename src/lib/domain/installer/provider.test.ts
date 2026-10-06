@@ -14,6 +14,8 @@ import {
 describe("installer provider helpers", () => {
   it("normalizes installer provider aliases and case variants", () => {
     expect(normalizeInstallerProvider("cloud")).toBe("build");
+    expect(normalizeInstallerProvider("open-router")).toBe("openrouter");
+    expect(normalizeInstallerProvider("OpenRouterAI")).toBe("openrouter");
     expect(normalizeInstallerProvider("nim")).toBe("nim-local");
     expect(normalizeInstallerProvider("anthropiccompatible")).toBe("anthropicCompatible");
     expect(normalizeInstallerProvider(" AnthropicCompatible ")).toBe("anthropicCompatible");
@@ -23,23 +25,25 @@ describe("installer provider helpers", () => {
     expect(normalizeInstallerProvider("unsupported")).toBeNull();
   });
 
-  it("keeps provider values and aliases aligned with normalization", () => {
-    for (const provider of INSTALLER_PROVIDER_VALUES) {
-      expect(normalizeInstallerProvider(provider)).toBe(provider);
-    }
-    for (const [alias, provider] of Object.entries(INSTALLER_PROVIDER_ALIASES)) {
-      expect(normalizeInstallerProvider(alias)).toBe(provider);
-    }
+  it.each(INSTALLER_PROVIDER_VALUES)("preserves canonical provider %s", (provider) => {
+    expect(normalizeInstallerProvider(provider)).toBe(provider);
   });
+
+  it.each(Object.entries(INSTALLER_PROVIDER_ALIASES))(
+    "normalizes provider alias %s to %s",
+    (alias, provider) => {
+      expect(normalizeInstallerProvider(alias)).toBe(provider);
+    },
+  );
 
   it("keeps help text values aligned with install.sh usage", () => {
     expect(installerProviderHelpValues()).toBe(
-      "build, openai, anthropic, anthropicCompatible, gemini, ollama, custom, nim-local, vllm, routed",
+      "build, openrouter, openai, anthropic, anthropicCompatible, gemini, ollama, custom, nim-local, vllm, routed",
     );
     expect(installerProviderUsageLines()).toEqual([
-      "build | openai | anthropic | anthropicCompatible",
-      "gemini | ollama | custom | nim-local | vllm | routed",
-      "aliases: anthropiccompatible -> anthropicCompatible, cloud -> build, nim -> nim-local",
+      "build | openrouter | openai | anthropic",
+      "anthropicCompatible | gemini | ollama | custom | nim-local | vllm | routed",
+      "aliases: anthropiccompatible -> anthropicCompatible, cloud -> build, nim -> nim-local, open-router -> openrouter, openrouterai -> openrouter",
     ]);
   });
 });

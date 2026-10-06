@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { dockerSpawnSync } from "../../adapters/docker/exec";
+import { retryUntil } from "../../core/retry";
 import {
   buildCoreDnsPatchJson,
   dockerHostRuntime,
@@ -15,6 +16,12 @@ import {
   selectOpenshellClusterContainer,
   type ContainerRuntime,
 } from "../../domain/dns/coredns";
+import type {
+  ContainerRuntime as PlatformContainerRuntime,
+  DockerHostProbe,
+  DockerHostProbeResult,
+} from "../../platform";
+import { detectDockerHost, inferContainerRuntime, probeDockerHost } from "../../platform";
 import {
   buildDnsProxyPython,
   buildDnsReadyProbePython,
@@ -34,6 +41,7 @@ export interface FixCoreDnsDeps {
   existsSocket?: (socketPath: string) => boolean;
   log?: (message: string) => void;
   platform?: NodeJS.Platform;
+  probeDockerHost?: DockerHostProbe;
   readFile?: (filePath: string) => string;
   run?: (command: string, args: string[], options?: { env?: NodeJS.ProcessEnv }) => CommandResult;
   runDocker?: (args: string[], options?: { env?: NodeJS.ProcessEnv }) => CommandResult;
@@ -100,40 +108,95 @@ function socketExists(socketPath: string, env: NodeJS.ProcessEnv): boolean {
   }
 }
 
-function findFirstSocket(candidates: string[], deps: Required<Pick<FixCoreDnsDeps, "existsSocket">>): string | null {
-  return candidates.find((candidate) => deps.existsSocket(candidate)) ?? null;
+function parseUid(uid: string | undefined): number | undefined {
+  const parsed = Number.parseInt(uid ?? "", 10);
+  return Number.isNaN(parsed) ? undefined : parsed;
 }
 
-function detectDockerHost(env: NodeJS.ProcessEnv, deps: FixCoreDnsDeps): { dockerHost?: string; runtime: ContainerRuntime } {
-  if (env.DOCKER_HOST) return { dockerHost: env.DOCKER_HOST, runtime: dockerHostRuntime(env.DOCKER_HOST) ?? "custom" };
+interface DockerAuthority {
+  dockerHost?: string;
+  socketIdentity?: DockerHostProbeResult["identity"];
+  probeDefault: () => DockerHostProbeResult;
+}
 
-  const home = env.HOME || os.tmpdir();
-  const existsSocket = deps.existsSocket ?? ((socketPath: string) => socketExists(socketPath, env));
-  const colimaSocket = findFirstSocket(
-    [path.join(home, ".colima/default/docker.sock"), path.join(home, ".config/colima/default/docker.sock")],
-    { existsSocket },
-  );
-  if (colimaSocket) return { dockerHost: `unix://${colimaSocket}`, runtime: "colima" };
+/**
+ * Choose the Docker authority for the DNS commands.
+ *
+ * These commands run outside `runner.ts`, so the `DOCKER_HOST` it pins never
+ * reaches them and they have to select the authority themselves. They do it
+ * through the shared selector, which keeps a Docker CLI default that already
+ * answers, adopts a discovered socket only once that socket answers and names
+ * its engine, and refuses to choose when two engines answer. A socket file that
+ * merely exists is not evidence of a daemon behind it (#10632).
+ */
+function resolveDockerAuthority(env: NodeJS.ProcessEnv, deps: FixCoreDnsDeps): DockerAuthority {
+  const probe = deps.probeDockerHost ?? ((host?: string) => probeDockerHost(host, env));
+  const observed = new Map<string | undefined, DockerHostProbeResult>();
+  const probeOnce = (host: string | undefined): DockerHostProbeResult => {
+    const cached = observed.get(host);
+    if (cached) return cached;
+    const observation = probe(host);
+    observed.set(host, observation);
+    return observation;
+  };
 
-  const podmanCandidates =
-    (deps.platform ?? process.platform) === "darwin"
-      ? [path.join(home, ".local/share/containers/podman/machine/podman.sock")]
-      : [
-          path.join(env.XDG_RUNTIME_DIR || `/run/user/${deps.uid?.() ?? "1000"}`, "podman/podman.sock"),
-          `/run/user/${deps.uid?.() ?? "1000"}/podman/podman.sock`,
-          "/run/podman/podman.sock",
-        ];
-  const podmanSocket = findFirstSocket(podmanCandidates, { existsSocket });
-  if (podmanSocket) return { dockerHost: `unix://${podmanSocket}`, runtime: "podman" };
+  const detection = detectDockerHost({
+    env,
+    existsSync: deps.existsSocket ?? ((socketPath: string) => socketExists(socketPath, env)),
+    home: env.HOME || os.tmpdir(),
+    platform: deps.platform,
+    probeDockerHost: probeOnce,
+    uid: parseUid(deps.uid?.()),
+  });
 
-  return { runtime: "unknown" };
+  return {
+    dockerHost: detection?.dockerHost,
+    socketIdentity:
+      detection?.source === "socket" ? observed.get(detection.dockerHost)?.identity : undefined,
+    probeDefault: () => probeOnce(undefined),
+  };
+}
+
+// `inferContainerRuntime` reports the engine families the whole CLI recognises;
+// the DNS commands carry their own narrower vocabulary, where a plain Docker
+// Engine is just another host CoreDNS does not need patching for.
+const DEFAULT_HOST_RUNTIMES: Record<PlatformContainerRuntime, ContainerRuntime> = {
+  colima: "colima",
+  docker: "custom",
+  "docker-desktop": "docker-desktop",
+  podman: "podman",
+  unknown: "unknown",
+};
+
+/**
+ * Label the runtime behind the selected authority.
+ *
+ * Prefer the selected socket's probed Podman identity over its pathname.
+ * A working CLI default has no selected path, so its cached version probe
+ * identifies Podman and `docker info` distinguishes the Docker-family engines.
+ */
+function detectRuntime(
+  authority: DockerAuthority,
+  env: NodeJS.ProcessEnv,
+  runDocker: NonNullable<FixCoreDnsDeps["runDocker"]>,
+): ContainerRuntime {
+  if (authority.socketIdentity === "podman") return "podman";
+  const fromSocket = dockerHostRuntime(authority.dockerHost);
+  if (fromSocket) return fromSocket;
+  const observation = authority.probeDefault();
+  if (!observation.reachable) return "unknown";
+  if (observation.identity === "podman") return "podman";
+  return DEFAULT_HOST_RUNTIMES[inferContainerRuntime(commandOutput(runDocker(["info"], { env })))];
 }
 
 function commandOutput(result: CommandResult): string {
   return result.status === 0 ? result.stdout : "";
 }
 
-function defaultRunDocker(args: string[], options: { env?: NodeJS.ProcessEnv } = {}): CommandResult {
+function defaultRunDocker(
+  args: string[],
+  options: { env?: NodeJS.ProcessEnv } = {},
+): CommandResult {
   const result = dockerSpawnSync(args, { encoding: "utf-8", env: options.env });
   return {
     status: result.status,
@@ -153,7 +216,9 @@ function kctl(
   env: NodeJS.ProcessEnv,
 ): CommandResult {
   if (args[0] === "exec") {
-    return runDocker(["exec", cluster, "kubectl", "exec", "-c", "agent", ...args.slice(1)], { env });
+    return runDocker(["exec", cluster, "kubectl", "exec", "-c", "agent", ...args.slice(1)], {
+      env,
+    });
   }
   return runDocker(["exec", cluster, "kubectl", ...args], { env });
 }
@@ -167,9 +232,13 @@ function getColimaVmResolvConf(deps: FixCoreDnsDeps, env: NodeJS.ProcessEnv): st
   if (!commandExists("colima")) return "";
   const run = deps.run ?? defaultRun;
   return commandOutput(
-    run("colima", ["ssh", "--profile", env.COLIMA_PROFILE || "default", "--", "cat", "/etc/resolv.conf"], {
-      env,
-    }),
+    run(
+      "colima",
+      ["ssh", "--profile", env.COLIMA_PROFILE || "default", "--", "cat", "/etc/resolv.conf"],
+      {
+        env,
+      },
+    ),
   );
 }
 
@@ -181,14 +250,15 @@ export function runFixCoreDns(
   const log = deps.log ?? console.log;
   const readFile = deps.readFile ?? ((filePath: string) => fs.readFileSync(filePath, "utf-8"));
   const runDocker = deps.runDocker ?? defaultRunDocker;
-  const detected = detectDockerHost(env, deps);
+  const authority = resolveDockerAuthority(env, deps);
+  const runtime = detectRuntime(authority, env, runDocker);
 
-  if (!detected.dockerHost || (detected.runtime !== "colima" && detected.runtime !== "podman")) {
+  if (runtime !== "colima" && runtime !== "podman") {
     log("Skipping CoreDNS patch: no supported Colima or Podman Docker socket found.");
-    return { exitCode: 0, runtime: detected.runtime, skipped: true };
+    return { exitCode: 0, runtime, skipped: true };
   }
 
-  const dockerEnv = { ...env, DOCKER_HOST: detected.dockerHost };
+  const dockerEnv = authority.dockerHost ? { ...env, DOCKER_HOST: authority.dockerHost } : env;
   const clustersOutput = commandOutput(
     runDocker(["ps", "--filter", "name=openshell-cluster", "--format", "{{.Names}}"], {
       env: dockerEnv,
@@ -200,7 +270,7 @@ export function runFixCoreDns(
     return {
       exitCode: 1,
       message: `ERROR: Could not uniquely determine the openshell cluster container${target}.`,
-      runtime: detected.runtime,
+      runtime,
     };
   }
 
@@ -208,20 +278,21 @@ export function runFixCoreDns(
     runDocker(["exec", cluster, "cat", "/etc/resolv.conf"], { env: dockerEnv }),
   );
   const hostResolvConf = readFile("/etc/resolv.conf");
-  const colimaVmResolvConf = detected.runtime === "colima" ? getColimaVmResolvConf(deps, dockerEnv) : undefined;
+  const colimaVmResolvConf =
+    runtime === "colima" ? getColimaVmResolvConf(deps, dockerEnv) : undefined;
   const upstreamDns = resolveCoreDnsUpstream({
     colimaVmResolvConf,
     containerResolvConf,
     hostResolvConf,
-    runtime: detected.runtime,
+    runtime,
   });
 
   if (!upstreamDns) {
     return {
       cluster,
       exitCode: 1,
-      message: `ERROR: Could not determine a non-loopback DNS upstream for ${detected.runtime}.`,
-      runtime: detected.runtime,
+      message: `ERROR: Could not determine a non-loopback DNS upstream for ${runtime}.`,
+      runtime,
     };
   }
 
@@ -230,7 +301,7 @@ export function runFixCoreDns(
       cluster,
       exitCode: 1,
       message: `ERROR: UPSTREAM_DNS='${upstreamDns}' contains invalid characters. Aborting.`,
-      runtime: detected.runtime,
+      runtime,
       upstreamDns,
     };
   }
@@ -238,26 +309,61 @@ export function runFixCoreDns(
   log(`Patching CoreDNS to forward to ${upstreamDns}...`);
   const patchJson = buildCoreDnsPatchJson(upstreamDns);
   for (const args of [
-    ["exec", cluster, "kubectl", "patch", "configmap", "coredns", "-n", "kube-system", "--type", "merge", "-p", patchJson],
+    [
+      "exec",
+      cluster,
+      "kubectl",
+      "patch",
+      "configmap",
+      "coredns",
+      "-n",
+      "kube-system",
+      "--type",
+      "merge",
+      "-p",
+      patchJson,
+    ],
     ["exec", cluster, "kubectl", "rollout", "restart", "deploy/coredns", "-n", "kube-system"],
   ]) {
     const result = runDocker(args, { env: dockerEnv });
     if (result.status !== 0) {
-      return { cluster, exitCode: result.status ?? 1, message: result.stderr.trim(), runtime: detected.runtime, upstreamDns };
+      return {
+        cluster,
+        exitCode: result.status ?? 1,
+        message: result.stderr.trim(),
+        runtime,
+        upstreamDns,
+      };
     }
   }
 
   log("CoreDNS patched. Waiting for rollout...");
   const rollout = runDocker(
-    ["exec", cluster, "kubectl", "rollout", "status", "deploy/coredns", "-n", "kube-system", "--timeout=30s"],
+    [
+      "exec",
+      cluster,
+      "kubectl",
+      "rollout",
+      "status",
+      "deploy/coredns",
+      "-n",
+      "kube-system",
+      "--timeout=30s",
+    ],
     { env: dockerEnv },
   );
   if (rollout.status !== 0) {
-    return { cluster, exitCode: rollout.status ?? 1, message: rollout.stderr.trim(), runtime: detected.runtime, upstreamDns };
+    return {
+      cluster,
+      exitCode: rollout.status ?? 1,
+      message: rollout.stderr.trim(),
+      runtime,
+      upstreamDns,
+    };
   }
 
   log("Done. DNS should resolve in ~10 seconds.");
-  return { cluster, exitCode: 0, runtime: detected.runtime, upstreamDns };
+  return { cluster, exitCode: 0, runtime, upstreamDns };
 }
 
 export function runSetupDnsProxy(
@@ -268,8 +374,8 @@ export function runSetupDnsProxy(
   const log = deps.log ?? console.log;
   const runDocker = deps.runDocker ?? defaultRunDocker;
   const sleep = deps.sleep ?? sleepSync;
-  const detected = detectDockerHost(env, deps);
-  const dockerEnv = detected.dockerHost ? { ...env, DOCKER_HOST: detected.dockerHost } : env;
+  const authority = resolveDockerAuthority(env, deps);
+  const dockerEnv = authority.dockerHost ? { ...env, DOCKER_HOST: authority.dockerHost } : env;
 
   const clustersOutput = commandOutput(
     runDocker(["ps", "--filter", "name=openshell-cluster", "--format", "{{.Names}}"], {
@@ -318,10 +424,17 @@ export function runSetupDnsProxy(
     dnsUpstream = DEFAULT_DNS_UPSTREAM;
   }
   if (!isSafeDnsAddress(dnsUpstream)) {
-    return { cluster, dnsUpstream, exitCode: 1, message: `ERROR: DNS upstream '${dnsUpstream}' contains invalid characters.` };
+    return {
+      cluster,
+      dnsUpstream,
+      exitCode: 1,
+      message: `ERROR: DNS upstream '${dnsUpstream}' contains invalid characters.`,
+    };
   }
 
-  const podsOutput = commandOutput(kctl(runDocker, cluster, ["get", "pods", "-n", "openshell", "-o", "name"], dockerEnv));
+  const podsOutput = commandOutput(
+    kctl(runDocker, cluster, ["get", "pods", "-n", "openshell", "-o", "name"], dockerEnv),
+  );
   const pod = selectSandboxPod(options.sandboxName, podsOutput);
   if (!pod) {
     const message = `WARNING: Could not find pod for sandbox '${options.sandboxName}'. DNS proxy not installed.`;
@@ -349,15 +462,33 @@ export function runSetupDnsProxy(
     ),
   );
   if (!isSafeDnsAddress(vethGateway)) {
-    return { cluster, dnsUpstream, exitCode: 1, pod, message: `ERROR: VETH gateway '${vethGateway}' contains invalid characters.` };
+    return {
+      cluster,
+      dnsUpstream,
+      exitCode: 1,
+      pod,
+      message: `ERROR: VETH gateway '${vethGateway}' contains invalid characters.`,
+    };
   }
 
   log(`Setting up DNS proxy in pod '${pod}' (${vethGateway}:53 -> ${dnsUpstream})...`);
 
   const proxyWriter = `cat > /tmp/dns-proxy.py << 'DNSPROXY'\n${buildDnsProxyPython()}DNSPROXY`;
-  kctl(runDocker, cluster, ["exec", "-n", "openshell", pod, "--", "sh", "-c", proxyWriter], dockerEnv);
+  kctl(
+    runDocker,
+    cluster,
+    ["exec", "-n", "openshell", pod, "--", "sh", "-c", proxyWriter],
+    dockerEnv,
+  );
 
-  const oldPid = commandOutput(kctl(runDocker, cluster, ["exec", "-n", "openshell", pod, "--", "cat", "/tmp/dns-proxy.pid"], dockerEnv)).trim();
+  const oldPid = commandOutput(
+    kctl(
+      runDocker,
+      cluster,
+      ["exec", "-n", "openshell", pod, "--", "cat", "/tmp/dns-proxy.pid"],
+      dockerEnv,
+    ),
+  ).trim();
   if (oldPid) {
     kctl(runDocker, cluster, ["exec", "-n", "openshell", pod, "--", "kill", oldPid], dockerEnv);
     sleep(1000);
@@ -379,24 +510,43 @@ export function runSetupDnsProxy(
     dockerEnv,
   );
 
-  let dnsReady = false;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const probe = kctl(
-      runDocker,
-      cluster,
-      ["exec", "-n", "openshell", pod, "--", "python3", "-c", buildDnsReadyProbePython(vethGateway)],
-      dockerEnv,
+  const dnsReady = retryUntil(
+    () =>
+      kctl(
+        runDocker,
+        cluster,
+        [
+          "exec",
+          "-n",
+          "openshell",
+          pod,
+          "--",
+          "python3",
+          "-c",
+          buildDnsReadyProbePython(vethGateway),
+        ],
+        dockerEnv,
+      ).stdout.includes("ok"),
+    {
+      accept: Boolean,
+      retryDelaysMs: Array.from({ length: 9 }, () => 1_000),
+      sleep,
+    },
+  );
+  if (!dnsReady)
+    log(
+      "WARNING: DNS forwarder did not respond after 10 attempts. The following DNS checks can report failures.",
     );
-    if (probe.stdout.includes("ok")) {
-      dnsReady = true;
-      break;
-    }
-    sleep(1000);
-  }
-  if (!dnsReady) log("WARNING: DNS forwarder not responding after 10s — verification may fail");
 
   const sandboxNamespace = selectSandboxNamespace(
-    commandOutput(kctl(runDocker, cluster, ["exec", "-n", "openshell", pod, "--", "sh", "-c", "ls /run/netns/ 2>/dev/null"], dockerEnv)),
+    commandOutput(
+      kctl(
+        runDocker,
+        cluster,
+        ["exec", "-n", "openshell", pod, "--", "sh", "-c", "ls /run/netns/ 2>/dev/null"],
+        dockerEnv,
+      ),
+    ),
   );
 
   let iptablesBin = "";
@@ -407,7 +557,16 @@ export function runSetupDnsProxy(
       const test = kctl(
         runDocker,
         cluster,
-        ["exec", "-n", "openshell", pod, "--", "sh", "-c", `test -x "$(command -v ${candidate} 2>/dev/null || echo ${candidate})"`],
+        [
+          "exec",
+          "-n",
+          "openshell",
+          pod,
+          "--",
+          "sh",
+          "-c",
+          `test -x "$(command -v ${candidate} 2>/dev/null || echo ${candidate})"`,
+        ],
         dockerEnv,
       );
       if (test.status === 0) {
@@ -450,9 +609,19 @@ export function runSetupDnsProxy(
         iptablesBin,
       ];
       const iptablesRule = ["-p", "udp", "-d", vethGateway, "--dport", "53", "-j", "ACCEPT"];
-      const check = kctl(runDocker, cluster, [...iptablesPrefix, "-C", "OUTPUT", ...iptablesRule], dockerEnv);
+      const check = kctl(
+        runDocker,
+        cluster,
+        [...iptablesPrefix, "-C", "OUTPUT", ...iptablesRule],
+        dockerEnv,
+      );
       if (check.status !== 0) {
-        kctl(runDocker, cluster, [...iptablesPrefix, "-I", "OUTPUT", "1", ...iptablesRule], dockerEnv);
+        kctl(
+          runDocker,
+          cluster,
+          [...iptablesPrefix, "-I", "OUTPUT", "1", ...iptablesRule],
+          dockerEnv,
+        );
       }
 
       kctl(
@@ -501,8 +670,22 @@ export function runSetupDnsProxy(
 
   let verificationPass = 0;
   let verificationFail = 0;
-  const pid = commandOutput(kctl(runDocker, cluster, ["exec", "-n", "openshell", pod, "--", "cat", "/tmp/dns-proxy.pid"], dockerEnv)).trim();
-  const dnsLog = commandOutput(kctl(runDocker, cluster, ["exec", "-n", "openshell", pod, "--", "cat", "/tmp/dns-proxy.log"], dockerEnv)).trim();
+  const pid = commandOutput(
+    kctl(
+      runDocker,
+      cluster,
+      ["exec", "-n", "openshell", pod, "--", "cat", "/tmp/dns-proxy.pid"],
+      dockerEnv,
+    ),
+  ).trim();
+  const dnsLog = commandOutput(
+    kctl(
+      runDocker,
+      cluster,
+      ["exec", "-n", "openshell", pod, "--", "cat", "/tmp/dns-proxy.log"],
+      dockerEnv,
+    ),
+  ).trim();
   if (pid && dnsLog.includes("dns-proxy:")) {
     log(`  [PASS] DNS forwarder running (pid=${pid}): ${dnsLog}`);
     verificationPass += 1;
@@ -513,11 +696,18 @@ export function runSetupDnsProxy(
 
   const sbExec = (args: string[]) =>
     sandboxNamespace
-      ? kctl(runDocker, cluster, ["exec", "-n", "openshell", pod, "--", "ip", "netns", "exec", sandboxNamespace, ...args], dockerEnv)
+      ? kctl(
+          runDocker,
+          cluster,
+          ["exec", "-n", "openshell", pod, "--", "ip", "netns", "exec", sandboxNamespace, ...args],
+          dockerEnv,
+        )
       : null;
 
   if (sandboxNamespace) {
-    const resolv = commandOutput(sbExec(["cat", "/etc/resolv.conf"]) ?? { status: 1, stdout: "", stderr: "" });
+    const resolv = commandOutput(
+      sbExec(["cat", "/etc/resolv.conf"]) ?? { status: 1, stdout: "", stderr: "" },
+    );
     if (resolv.includes(`nameserver ${vethGateway}`)) {
       log(`  [PASS] resolv.conf -> nameserver ${vethGateway}`);
       verificationPass += 1;
@@ -526,7 +716,19 @@ export function runSetupDnsProxy(
       verificationFail += 1;
     }
 
-    const iptablesCheck = sbExec([iptablesBin || "iptables", "-C", "OUTPUT", "-p", "udp", "-d", vethGateway, "--dport", "53", "-j", "ACCEPT"]);
+    const iptablesCheck = sbExec([
+      iptablesBin || "iptables",
+      "-C",
+      "OUTPUT",
+      "-p",
+      "udp",
+      "-d",
+      vethGateway,
+      "--dport",
+      "53",
+      "-j",
+      "ACCEPT",
+    ]);
     if (iptablesCheck?.status === 0) {
       log(`  [PASS] iptables: UDP ${vethGateway}:53 ACCEPT rule present`);
       verificationPass += 1;
@@ -535,12 +737,17 @@ export function runSetupDnsProxy(
       verificationFail += 1;
     }
 
-    let dnsResult = "";
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      dnsResult = commandOutput(sbExec(["getent", "hosts", "github.com"]) ?? { status: 1, stdout: "", stderr: "" }).trim();
-      if (dnsResult) break;
-      if (attempt < 3) sleep(2000);
-    }
+    const dnsResult = retryUntil(
+      () =>
+        commandOutput(
+          sbExec(["getent", "hosts", "github.com"]) ?? { status: 1, stdout: "", stderr: "" },
+        ).trim(),
+      {
+        accept: Boolean,
+        retryDelaysMs: [2_000, 2_000],
+        sleep,
+      },
+    );
     if (dnsResult) {
       log(`  [PASS] getent hosts github.com -> ${dnsResult}`);
       verificationPass += 1;
@@ -553,7 +760,10 @@ export function runSetupDnsProxy(
   }
 
   log(`  DNS verification: ${verificationPass} passed, ${verificationFail} failed`);
-  if (verificationFail > 0) log("WARNING: DNS setup incomplete. Sandbox DNS resolution may not work. See issue #626, #557.");
+  if (verificationFail > 0)
+    log(
+      "WARNING: DNS setup incomplete. Sandbox DNS resolution may not work. See issue #626, #557.",
+    );
 
   return {
     cluster,

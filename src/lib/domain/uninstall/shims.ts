@@ -29,17 +29,21 @@ function stripCommandSubstitutionTrailingNewlines(contents: string): string {
   return contents.replace(/\n+$/u, "");
 }
 
-export function isInstallerManagedWrapperContents(contents: string): boolean {
+export function isInstallerManagedWrapperContents(contents: string, binName = "nemoclaw"): boolean {
   const normalized = stripCommandSubstitutionTrailingNewlines(contents);
   const lines = normalized.split("\n");
   if (lines.length !== 3) return false;
   const [shebang, pathLine, execLine] = lines;
+  const legacyPathLine = pathLine.startsWith('export PATH="') && pathLine.endsWith(':$PATH"');
+  const stablePathLine =
+    /^\[\[ "\$\(command -v node 2>\/dev\/null\)" == "(.+)\/node" \]\] \|\| export PATH="\1:\$PATH"$/u.test(
+      pathLine,
+    );
   return (
     shebang === "#!/usr/bin/env bash" &&
-    pathLine.startsWith('export PATH="') &&
-    pathLine.endsWith(':$PATH"') &&
+    (legacyPathLine || stablePathLine) &&
     execLine.startsWith('exec "') &&
-    execLine.endsWith('/nemoclaw" "$@"')
+    execLine.endsWith(`/${binName}" "$@"`)
   );
 }
 
@@ -58,7 +62,7 @@ export function isDevShimContents(contents: string): boolean {
   );
 }
 
-export function classifyNemoclawShim(input: ShimInput): ShimClassification {
+export function classifyNemoclawShim(input: ShimInput, binName = "nemoclaw"): ShimClassification {
   if (!input.exists) {
     return { kind: "missing", remove: false, reason: "shim path does not exist" };
   }
@@ -68,11 +72,15 @@ export function classifyNemoclawShim(input: ShimInput): ShimClassification {
   }
 
   if (!input.isFile) {
-    return { kind: "unsupported-path-type", remove: false, reason: "shim path is not a regular file" };
+    return {
+      kind: "unsupported-path-type",
+      remove: false,
+      reason: "shim path is not a regular file",
+    };
   }
 
   const contents = input.contents ?? "";
-  if (isInstallerManagedWrapperContents(contents)) {
+  if (isInstallerManagedWrapperContents(contents, binName)) {
     return { kind: "managed-wrapper", remove: true, reason: "installer-managed wrapper contents" };
   }
 

@@ -3,16 +3,13 @@
 """
 NemoClaw plugin for Hermes Agent.
 
-Provides sandbox status tools, skill hot-reload, managed-tool broker patches,
-and quiet runtime grounding when Hermes runs inside an OpenShell sandbox
+Provides sandbox status tools, managed-tool broker patches, and quiet runtime
+grounding when Hermes runs inside an OpenShell sandbox
 managed by NemoClaw.
 
-Skill hot-reload: Hermes caches its skill slash-command registry in a
-module-global dict on first scan. New skills dropped on disk are invisible
-until the cache is cleared. This plugin provides a nemoclaw_reload_skills
-tool that clears the cache and re-scans, letting the agent pick up new
-skills without a gateway restart. The on_session_start hook also refreshes
-skills automatically at session boundaries.
+Layout: channel-specific runtime overrides live in sibling modules loaded by
+register() only when that channel is configured, so a sandbox without the
+channel carries none of its behavior. Today that is googlechat_adapter.py.
 
 Runtime grounding: earlier versions injected a visible startup banner, but
 Hermes TUI renders plugin-injected messages through the interrupt queue. This
@@ -22,9 +19,13 @@ chat transcript.
 """
 
 import atexit
+import importlib.util
+import inspect
 import ipaddress
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import replace as dataclass_replace
@@ -41,6 +42,7 @@ _FIRECRAWL_PATH_PATCH_ATTR = "_nemoclaw_firecrawl_path_patch_installed"
 _URL_SAFETY_PATCH_ATTR = "_nemoclaw_broker_url_safety_patch_installed"
 _BROWSER_CDP_TUNNEL_PATCH_ATTR = "_nemoclaw_browser_use_cdp_tunnel_patch_installed"
 _BROWSER_SESSION_STATE_PATCH_ATTR = "_nemoclaw_browser_use_session_state_patch_installed"
+_MESSAGING_RESPONSE_PATCH_ATTR = "_nemoclaw_messaging_response_patch_installed"
 _BROWSER_USE_CDP_TUNNELS = {}
 
 _TOOL_GATEWAY_URL_ENV = {
@@ -50,6 +52,8 @@ _TOOL_GATEWAY_URL_ENV = {
     "browser-use": "BROWSER_USE_GATEWAY_URL",
     "modal": "MODAL_GATEWAY_URL",
 }
+_TOOL_GATEWAY_REFRESH_TOKEN_ENV = "NEMOCLAW_HERMES_TOOL_GATEWAY_REFRESH_TOKEN"
+_LEGACY_TOOL_GATEWAY_USER_TOKEN_ENV = "TOOL_GATEWAY_USER_TOKEN"
 
 _NEMOCLAW_CONTEXT_KEYWORDS = (
     "browser",
@@ -71,6 +75,37 @@ _NEMOCLAW_CONTEXT_KEYWORDS = (
     "tool",
     "where am i",
     "whoami",
+)
+
+_MESSAGING_PLATFORMS = (
+    "telegram",
+    "discord",
+    "slack",
+    "whatsapp",
+    "signal",
+    "sms",
+    "email",
+    "matrix",
+    "mattermost",
+    "dingtalk",
+    "feishu",
+    "wecom",
+    "wecom_callback",
+    "weixin",
+    "qqbot",
+    "yuanbao",
+    "webhook",
+    "google_chat",
+)
+_RAW_MESSAGING_TOOL_RE = re.compile(
+    r"^\s*send_message\s*:\s*(?P<body>.+?)\s*$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_RAW_MESSAGING_TARGET_RE = re.compile(
+    r"^(?:to\s+)?(?P<platform>"
+    + "|".join(re.escape(platform) for platform in _MESSAGING_PLATFORMS)
+    + r")\s*:\s*(?P<message>.+)$",
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 _BROKER_ALWAYS_BLOCKED_HOSTNAMES = {
@@ -116,7 +151,6 @@ def _get_env_value(key, default=None):
         env_paths.append(os.path.join(hermes_home, ".env"))
     env_paths.extend(
         [
-            "/sandbox/.hermes-data/.env",
             "/sandbox/.hermes/.env",
             os.path.expanduser("~/.hermes/.env"),
         ],
@@ -145,9 +179,7 @@ def _load_hermes_dotenv():
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
 
-        hermes_home = os.getenv("HERMES_HOME")
-        if not hermes_home and os.path.isdir("/sandbox/.hermes-data"):
-            hermes_home = "/sandbox/.hermes-data"
+        hermes_home = os.getenv("HERMES_HOME") or "/sandbox/.hermes"
         load_hermes_dotenv(hermes_home=hermes_home)
     except Exception:
         # Runtime env still works when Hermes' optional dotenv loader is absent.
@@ -176,8 +208,18 @@ def _broker_gateway_url(vendor):
 
 
 def _broker_user_token():
-    token = _get_env_value("TOOL_GATEWAY_USER_TOKEN", "")
-    return token.strip() if isinstance(token, str) and token.strip() else None
+    refresh_placeholder = _get_env_value(_TOOL_GATEWAY_REFRESH_TOKEN_ENV, "")
+    if isinstance(refresh_placeholder, str) and refresh_placeholder.strip():
+        return refresh_placeholder.strip()
+
+    legacy_placeholder = _get_env_value(_LEGACY_TOOL_GATEWAY_USER_TOKEN_ENV, "")
+    if (
+        isinstance(legacy_placeholder, str)
+        and legacy_placeholder.strip().startswith("openshell:resolve:env:")
+    ):
+        return legacy_placeholder.strip()
+
+    return f"openshell:resolve:env:{_TOOL_GATEWAY_REFRESH_TOKEN_ENV}"
 
 
 def _broker_resolve_managed_tool_gateway(vendor, gateway_builder=None, token_reader=None):
@@ -277,7 +319,14 @@ def _install_broker_url_safety_patch():
     if browser_tool is not None and hasattr(browser_tool, "_is_safe_url"):
         setattr(browser_tool, "_is_safe_url", _broker_safe_url)
         if hasattr(browser_tool, "_allow_private_urls_resolved"):
-            setattr(browser_tool, "_allow_private_urls_resolved", False)
+            config = _load_hermes_config() or {}
+            security = config.get("security", {}) if isinstance(config, dict) else {}
+            allow_private_urls = (
+                security.get("allow_private_urls") is True
+                if isinstance(security, dict)
+                else False
+            )
+            setattr(browser_tool, "_allow_private_urls_resolved", allow_private_urls)
         patched = True
 
     return patched
@@ -897,7 +946,7 @@ def _install_nous_tool_broker_patch():
     auth happen on the host instead:
 
       sandbox tool call -> host.openshell.internal:11436/<service>
-      broker token placeholder -> host broker -> Nous access token upstream
+      OpenShell resolver placeholder -> host broker -> Nous access token upstream
 
     This shim only tells Hermes that externally managed gateway auth is
     available when NEMOCLAW_HERMES_TOOL_GATEWAY_BROKER=1. It does not mint,
@@ -987,6 +1036,30 @@ def _load_hermes_config():
     return None
 
 
+def _hermes_api_port():
+    """Read the per-sandbox port the OpenAI-compatible API is exposed on.
+
+    NemoClaw allocates this port per sandbox so two Hermes sandboxes can serve
+    inference on one host. The plugin normally inherits the allocated value
+    from the managed supervisor. The root-separated topology also publishes a
+    root-owned marker for processes that do not inherit that environment.
+    """
+    raw = os.environ.get("NEMOCLAW_HERMES_API_PORT", "").strip()
+    if not raw:
+        try:
+            with open("/run/nemoclaw/hermes-api-port") as f:
+                raw = f.read().strip()
+        except OSError:
+            return 8642
+    if re.fullmatch(r"[0-9]+", raw) is None:
+        return 8642
+    try:
+        port = int(raw)
+    except ValueError:
+        return 8642
+    return port if 8642 <= port <= 8652 else 8642
+
+
 def _get_sandbox_info():
     """Gather sandbox status information."""
     hermes_cfg = _load_hermes_config()
@@ -1007,10 +1080,11 @@ def _get_sandbox_info():
         provider = nemoclaw_cfg.get("provider", provider)
 
     # Check gateway health
+    api_port = _hermes_api_port()
     gateway_ok = False
     try:
         result = subprocess.run(
-            ["curl", "-sf", "http://localhost:8642/health"],
+            ["curl", "-sf", f"http://localhost:{api_port}/health"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1027,7 +1101,7 @@ def _get_sandbox_info():
         "provider": provider,
         "base_url": base_url,
         "gateway": "running" if gateway_ok else "stopped",
-        "port": 8642,
+        "port": api_port,
     }
 
 
@@ -1038,6 +1112,121 @@ def _active_managed_gateway_services():
         if _get_env_value(env_key, ""):
             services.append(service)
     return services
+
+
+def _strip_wrapping_quotes(text):
+    value = str(text or "").strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
+# Tracks the messaging platform of the active LLM call so the normalizer
+# below can refuse to silently rewrite cross-platform send_message pseudo-calls
+# into the wrong chat (PR #4175 review feedback from @cv). Updated on every
+# `_pre_llm_call` and read by the patched `_strip_think_blocks`.
+_current_messaging_platform = {"value": None}
+
+
+def _set_current_messaging_platform(platform):
+    raw = str(platform or "").strip().lower()
+    _current_messaging_platform["value"] = raw if raw in _MESSAGING_PLATFORMS else None
+
+
+def _get_current_messaging_platform():
+    return _current_messaging_platform["value"]
+
+
+def _normalize_raw_messaging_tool_response(response, current_platform=None):
+    """Convert a raw send_message pseudo-call into the message body.
+
+    Defense-in-depth fallback for the first-turn race in #3893 where the
+    Hermes tool-dispatch isn't ready when the messaging adapter delivers the
+    first user turn, so the model emits text like
+    ``send_message: "to telegram: Hello"`` as the final answer instead of
+    using the structured tool-calling channel. Returning the body is the
+    correct delivery path **only when the target platform matches the current
+    chat platform** — otherwise (per the #4175 review) a stray
+    ``send_message: "to slack: ..."`` from a Telegram chat would be silently
+    delivered back to Telegram, misrouting a cross-platform send_message
+    intent.
+
+    Source of truth for send_message routing is the Hermes tool dispatcher
+    in ``agents/hermes/run_agent.py`` (openclaw runtime); this normalizer is
+    purely an output filter on `AIAgent._strip_think_blocks`. End-to-end
+    coverage runs via ``hermes-e2e``, ``hermes-discord-e2e``, and
+    ``hermes-slack-e2e`` against a real gateway first-message path.
+    """
+    if not isinstance(response, str):
+        return response
+    match = _RAW_MESSAGING_TOOL_RE.match(response)
+    if not match:
+        return response
+
+    body = _strip_wrapping_quotes(match.group("body"))
+    target_match = _RAW_MESSAGING_TARGET_RE.match(body)
+    if not target_match:
+        return response
+
+    target_platform = (target_match.group("platform") or "").strip().lower()
+    current = (str(current_platform or "").strip().lower()) or None
+    if current is None or target_platform != current:
+        # Cross-platform or unknown-platform pseudo-call — leave it intact so
+        # it surfaces as a dispatch/error path rather than getting silently
+        # delivered into the wrong chat.
+        return response
+
+    message = _strip_wrapping_quotes(target_match.group("message"))
+    return message if message else response
+
+
+def _install_messaging_response_patch():
+    """Prevent raw messaging pseudo-tool calls from leaking as final text."""
+    try:
+        module = __import__("run_agent", fromlist=["AIAgent"])
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+    agent_cls = getattr(module, "AIAgent", None)
+    if agent_cls is None or getattr(agent_cls, _MESSAGING_RESPONSE_PATCH_ATTR, False):
+        return False
+
+    raw_original = inspect.getattr_static(agent_cls, "_strip_think_blocks", None)
+    original = getattr(agent_cls, "_strip_think_blocks", None)
+    if not callable(original):
+        return False
+
+    if isinstance(raw_original, staticmethod):
+        original_func = raw_original.__func__
+
+        def _strip_think_blocks(content):
+            return _normalize_raw_messaging_tool_response(
+                original_func(content),
+                current_platform=_get_current_messaging_platform(),
+            )
+
+        agent_cls._strip_think_blocks = staticmethod(_strip_think_blocks)
+    elif isinstance(raw_original, classmethod):
+        original_func = raw_original.__func__
+
+        def _strip_think_blocks(cls, content):
+            return _normalize_raw_messaging_tool_response(
+                original_func(cls, content),
+                current_platform=_get_current_messaging_platform(),
+            )
+
+        agent_cls._strip_think_blocks = classmethod(_strip_think_blocks)
+    else:
+        def _strip_think_blocks(self, content):
+            return _normalize_raw_messaging_tool_response(
+                original(self, content),
+                current_platform=_get_current_messaging_platform(),
+            )
+
+        agent_cls._strip_think_blocks = _strip_think_blocks
+
+    setattr(agent_cls, _MESSAGING_RESPONSE_PATCH_ATTR, True)
+    return True
 
 
 def _should_inject_nemoclaw_context(user_message=None, is_first_turn=False):
@@ -1054,7 +1243,7 @@ def _build_nemoclaw_agent_context(platform=None):
     hermes_home = (
         os.getenv("HERMES_HOME")
         or _get_env_value("HERMES_HOME", "")
-        or "/sandbox/.hermes-data"
+        or "/sandbox/.hermes"
     )
     services = _active_managed_gateway_services()
     service_text = ", ".join(services) if services else "none detected"
@@ -1068,6 +1257,14 @@ def _build_nemoclaw_agent_context(platform=None):
         else "- Messaging adapters run in the parent Hermes gateway sandbox; child "
         + "tool-execution containers will not show their host/gateway config."
     )
+    reply_line = None
+    if platform_text.lower() in _MESSAGING_PLATFORMS:
+        reply_line = (
+            f"- Reply to the current {platform_text} chat by returning normal assistant text. "
+            + "Use send_message only when the user explicitly asks you to send a separate "
+            + "cross-platform message; never write raw text such as `send_message: ...` "
+            + "or `to telegram: ...` as the final answer."
+        )
     agent_identity_line = (
         "- You are Hermes Agent running in a NemoClaw-managed OpenShell sandbox, "
         + "not a host-only assistant."
@@ -1075,7 +1272,7 @@ def _build_nemoclaw_agent_context(platform=None):
     child_tool_line = (
         "- Some tools, especially managed code/terminal tools, execute in child "
         + "tool sandboxes such as Modal. Seeing /__modal, MODAL_SANDBOX_ID, a "
-        + "missing hermes binary, or missing ~/.hermes-data inside a tool shell "
+        + "missing hermes binary, or missing ~/.hermes inside a tool shell "
         + "means that shell is a child tool sandbox, not proof that Hermes is "
         + "running on the host."
     )
@@ -1085,36 +1282,41 @@ def _build_nemoclaw_agent_context(platform=None):
         + "nemoclaw_info for NemoClaw environment questions."
     )
     tools_line = (
-        "- NemoClaw tools available: nemoclaw_status, nemoclaw_info, "
-        + "nemoclaw_reload_skills, transcribe_audio."
+        "- NemoClaw tools available: nemoclaw_status, nemoclaw_info, transcribe_audio."
     )
 
-    return "\n".join(
-        [
-            "NemoClaw runtime context:",
-            agent_identity_line,
-            child_tool_line,
-            config_line,
-            f"- NemoClaw provider state: model={info['model']}, "
-            f"provider={info['provider']}, endpoint={info['base_url']}, "
-            f"gateway={info['gateway']}.",
-            tools_line,
-            f"- Managed Nous tool broker: {broker_state}; configured services: "
-            f"{service_text}. Raw Nous OAuth tokens are host-managed by NemoClaw "
-            "and should not be expected inside the sandbox.",
-            platform_line,
-        ],
-    )
+    lines = [
+        "NemoClaw runtime context:",
+        agent_identity_line,
+        child_tool_line,
+        config_line,
+        f"- NemoClaw provider state: model={info['model']}, "
+        f"provider={info['provider']}, endpoint={info['base_url']}, "
+        f"gateway={info['gateway']}.",
+        tools_line,
+        f"- Managed Nous tool broker: {broker_state}; configured services: "
+        f"{service_text}. Raw Nous OAuth tokens are host-managed by NemoClaw "
+        "and should not be expected inside the sandbox.",
+        platform_line,
+    ]
+    if reply_line:
+        lines.append(reply_line)
+    return "\n".join(lines)
 
 
 def _pre_llm_call(**kwargs):
     """Inject non-visible NemoClaw runtime context into relevant Hermes turns."""
+    # Track platform on every turn (not gated on context injection) so the
+    # `_strip_think_blocks` normalizer (#4175) has a current-platform anchor
+    # even on non-first turns and non-grounding turns.
+    _set_current_messaging_platform(kwargs.get("platform"))
     if not _should_inject_nemoclaw_context(
         user_message=kwargs.get("user_message"),
         is_first_turn=bool(kwargs.get("is_first_turn")),
     ):
         return None
     _install_nous_tool_broker_patch()
+    _install_messaging_response_patch()
     return {"context": _build_nemoclaw_agent_context(platform=kwargs.get("platform"))}
 
 
@@ -1169,67 +1371,63 @@ def _handle_transcribe_audio(tool_input=None, context=None, **_kwargs):
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
-def _reload_skills():
-    """Clear the Hermes skill slash-command cache and re-scan skill directories.
+# Google Chat: the channel owns the override. Source lives in
+# src/lib/messaging/channels/googlechat/runtime/hermes-adapter.py; the Hermes
+# image copies it in beside this file. Loaded only when the channel is
+# configured, so other sandboxes never replace the bundled platform entry.
+_GOOGLE_CHAT_SUBSCRIPTION_ENV = "GOOGLE_CHAT_SUBSCRIPTION_NAME"
+_GOOGLE_CHAT_MODULE = "googlechat_adapter.py"
 
-    Hermes's ``agent.skill_commands`` module caches discovered skills in a
-    module-global dict (``_skill_commands``).  ``get_skill_commands()`` only
-    scans on first call, so skills installed after gateway startup are
-    invisible.  We clear the dict and call ``scan_skill_commands()`` to force
-    a fresh scan.
 
-    Returns the dict of discovered skills, or None on failure.
+def _install_googlechat_adapter(ctx):
+    """Install the Google Chat override when that channel is configured.
+
+    The module is loaded by path: Hermes imports this plugin as a directory
+    module under a synthetic name, so a relative import has no package context.
+    Load failure must not abort plugin registration, but it has to be visible —
+    without the override the bundled gRPC adapter hangs under the REST-only
+    egress policy and the channel goes quiet with no other clue.
     """
+    if not _get_env_value(_GOOGLE_CHAT_SUBSCRIPTION_ENV):
+        return False
+    path = os.path.join(os.path.dirname(__file__), _GOOGLE_CHAT_MODULE)
     try:
-        import agent.skill_commands as sc
-
-        sc._skill_commands.clear()
-        return sc.scan_skill_commands()
-    except ImportError:
-        return None
+        spec = importlib.util.spec_from_file_location("nemoclaw_hermes_googlechat", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.install(ctx)
     except Exception:
-        return None
-
-
-def _handle_reload_skills(tool_input=None, context=None, **_kwargs):
-    """Handle the nemoclaw_reload_skills tool call."""
-    commands = _reload_skills()
-    if commands is None:
-        return (
-            "Failed to reload skills. The agent.skill_commands module may "
-            "not be available in this Hermes version."
+        logging.getLogger("gateway.platforms.google_chat").exception(
+            "[GoogleChat][NemoClaw] loading %s failed", _GOOGLE_CHAT_MODULE,
         )
-
-    if not commands:
-        return "Skill reload complete. No skills found in skill directories."
-
-    names = sorted(commands.keys())
-    lines = [f"Skill reload complete. {len(names)} skill(s) discovered:", ""]
-    for name in names:
-        info = commands[name]
-        desc = info.get("description", "no description")
-        lines.append(f"  {name}: {desc}")
-    return "\n".join(lines)
+        return False
+    return True
 
 
 def register(ctx):
     """Register NemoClaw tools and hooks with Hermes."""
     _install_nous_tool_broker_patch()
+    # Hermes 0.20.6 discovers plugins on a background thread while run_agent
+    # imports model_tools and waits for discovery to finish. Importing
+    # run_agent from this registration path deadlocks those two threads. The
+    # pre_llm_call hook below installs the patch before response processing.
+    _install_googlechat_adapter(ctx)
 
     # Register status tool
     ctx.register_tool(
         name="nemoclaw_status",
         toolset="nemoclaw",
+        # Pass the bare function object; Hermes wraps it in the
+        # {"type":"function","function":{...}} envelope at request-build time.
+        # Pre-wrapping here double-wraps the tool, which strict providers
+        # (Gemini) reject with HTTP 400 (#7067).
         schema={
-            "type": "function",
-            "function": {
-                "name": "nemoclaw_status",
-                "description": (
-                    "Show NemoClaw sandbox status: agent type, gateway health, "
-                    "model, provider, and inference endpoint."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "nemoclaw_status",
+            "description": (
+                "Show NemoClaw sandbox status: agent type, gateway health, "
+                "model, provider, and inference endpoint."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
         handler=_handle_status,
         description="NemoClaw sandbox status",
@@ -1240,12 +1438,9 @@ def register(ctx):
         name="nemoclaw_info",
         toolset="nemoclaw",
         schema={
-            "type": "function",
-            "function": {
-                "name": "nemoclaw_info",
-                "description": "Get NemoClaw sandbox info as structured JSON.",
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "name": "nemoclaw_info",
+            "description": "Get NemoClaw sandbox info as structured JSON.",
+            "parameters": {"type": "object", "properties": {}},
         },
         handler=_handle_info,
         description="NemoClaw sandbox info (JSON)",
@@ -1255,64 +1450,37 @@ def register(ctx):
         name="transcribe_audio",
         toolset="audio",
         schema={
-            "type": "function",
-            "function": {
-                "name": "transcribe_audio",
-                "description": (
-                    "Transcribe an audio file that already exists in the Hermes "
-                    "sandbox. In NemoClaw broker mode this uses the managed "
-                    "OpenAI-audio gateway instead of direct OpenAI credentials."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "Path to an audio file inside the Hermes sandbox.",
-                        },
-                        "model": {
-                            "type": "string",
-                            "description": "Optional transcription model override.",
-                        },
+            "name": "transcribe_audio",
+            "description": (
+                "Transcribe an audio file that already exists in the Hermes "
+                "sandbox. In NemoClaw broker mode this uses the managed "
+                "OpenAI-audio gateway instead of direct OpenAI credentials."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to an audio file inside the Hermes sandbox.",
                     },
-                    "required": ["file_path"],
+                    "model": {
+                        "type": "string",
+                        "description": "Optional transcription model override.",
+                    },
                 },
+                "required": ["file_path"],
             },
         },
         handler=_handle_transcribe_audio,
         description="Transcribe audio through the configured Hermes STT backend",
     )
 
-    # Register skill reload tool
-    ctx.register_tool(
-        name="nemoclaw_reload_skills",
-        toolset="nemoclaw",
-        schema={
-            "type": "function",
-            "function": {
-                "name": "nemoclaw_reload_skills",
-                "description": (
-                    "Reload and re-discover skills from the skill directories. "
-                    "Call this after new skills have been installed to make them "
-                    "available as slash commands without restarting the gateway."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        handler=_handle_reload_skills,
-        description="Reload skills from disk without gateway restart",
-    )
-
     # Ground the model quietly through Hermes' context hook. This replaces the
     # old visible startup banner without reintroducing TUI interrupt noise.
     ctx.register_hook("pre_llm_call", _pre_llm_call)
 
-    # Refresh skills silently on session start. Earlier versions injected a
-    # system banner here, but that can interrupt the user's first prompt in the
-    # Hermes TUI because plugin-injected messages travel through Hermes's
-    # interrupt queue. Keep startup native and expose status through tools.
     def _on_session_start(**kwargs):
         _install_nous_tool_broker_patch()
-        _reload_skills()
+        _install_messaging_response_patch()
 
     ctx.register_hook("on_session_start", _on_session_start)

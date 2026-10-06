@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+
+import { DEFAULT_GATEWAY_PORT, GATEWAY_PORT, OLLAMA_PORT } from "../core/ports";
+import { waitUntilAsync } from "../core/wait";
+import { rejectSymlinksOnPath } from "../state/config-io";
+import { nemoclawStateRoot } from "../state/state-root";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -20,13 +25,84 @@ export type RunFn = (
   options?: { ignoreError?: boolean; suppressOutput?: boolean },
 ) => unknown;
 
-export const DEFAULT_LOCAL_ADAPTER_STATE_DIR = path.join(os.homedir(), ".nemoclaw");
+export type LocalAdapterProcessMatcher = string | RegExp | ((commandLine: string) => boolean);
 
-export function ensureLocalAdapterStateDir(
-  stateDir = DEFAULT_LOCAL_ADAPTER_STATE_DIR,
-): void {
+export function resolveLocalAdapterStateRoot(
+  homeDir: string = os.homedir(),
+  gatewayPort: number = GATEWAY_PORT,
+): string {
+  return nemoclawStateRoot(homeDir, gatewayPort);
+}
+
+export const DEFAULT_LOCAL_ADAPTER_STATE_DIR = resolveLocalAdapterStateRoot();
+
+export function resolveSharedLocalAdapterStateRoot(homeDir: string = os.homedir()): string {
+  return nemoclawStateRoot(homeDir, DEFAULT_GATEWAY_PORT);
+}
+
+export const SHARED_LOCAL_ADAPTER_STATE_DIR = resolveSharedLocalAdapterStateRoot();
+export const LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES = 64 * 1024;
+export const OLLAMA_LOCALHOST = "127.0.0.1";
+export const OLLAMA_HOST_DOCKER_INTERNAL = "host.docker.internal";
+
+export type OllamaHostRoute = typeof OLLAMA_LOCALHOST | typeof OLLAMA_HOST_DOCKER_INTERNAL;
+
+/** Registry fields that identify a route backed by NemoClaw's host Ollama daemon. */
+export type OllamaRouteHolder = {
+  readonly provider?: string | null;
+  readonly endpointUrl?: string | null;
+};
+
+function isSupportedOllamaRouteHost(host: string): host is OllamaHostRoute {
+  return host === OLLAMA_LOCALHOST || host === OLLAMA_HOST_DOCKER_INTERNAL;
+}
+
+/**
+ * Return whether a recorded inference route uses NemoClaw's host Ollama daemon.
+ *
+ * Direct and legacy Ollama providers own that daemon by definition. A
+ * compatible endpoint owns it only when its credential-free HTTP URL names
+ * the selected fixed host route and Ollama port. Remote compatible endpoints
+ * are never classified as local owners.
+ */
+export function isLocalOllamaRouteOwner(
+  route: OllamaRouteHolder,
+  selectedHost: OllamaHostRoute | null = null,
+): boolean {
+  if (route.provider === "ollama-local" || route.provider?.startsWith("ollama/")) return true;
+  if (route.provider !== "compatible-endpoint" || !route.endpointUrl) return false;
+
+  try {
+    const endpoint = new URL(route.endpointUrl);
+    const endpointHost = endpoint.hostname.toLowerCase();
+    const hostMatches = selectedHost
+      ? endpointHost === selectedHost
+      : isSupportedOllamaRouteHost(endpointHost);
+    return (
+      endpoint.protocol === "http:" &&
+      endpoint.username === "" &&
+      endpoint.password === "" &&
+      Number(endpoint.port) === OLLAMA_PORT &&
+      hostMatches
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function ensureLocalAdapterStateDir(stateDir = DEFAULT_LOCAL_ADAPTER_STATE_DIR): void {
+  rejectSymlinksOnPath(stateDir);
   if (!fs.existsSync(stateDir)) {
-    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  }
+  rejectSymlinksOnPath(stateDir);
+  // Tighten permissions in case the directory was created with a lax umask.
+  const stat = fs.lstatSync(stateDir);
+  if (!stat.isDirectory()) {
+    throw new Error(`Refusing to use local adapter state path: ${stateDir} is not a directory`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    fs.chmodSync(stateDir, 0o700);
   }
 }
 
@@ -34,10 +110,41 @@ function ensureParentDir(filePath: string): void {
   ensureLocalAdapterStateDir(path.dirname(filePath));
 }
 
-export function writeLocalAdapterSecretFile(filePath: string, value: string): void {
+function writePrivateLocalAdapterFile(filePath: string, value: string, append = false): void {
   ensureParentDir(filePath);
-  fs.writeFileSync(filePath, `${value}\n`, { mode: 0o600 });
-  fs.chmodSync(filePath, 0o600);
+
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  if (noFollow === 0) {
+    try {
+      if (fs.lstatSync(filePath).isSymbolicLink()) {
+        throw new Error(`Refusing to write local adapter state through symbolic link: ${filePath}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  const flags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    (append ? fs.constants.O_APPEND : fs.constants.O_TRUNC) |
+    noFollow |
+    (fs.constants.O_NONBLOCK ?? 0);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, flags, 0o600);
+    if (!fs.fstatSync(fd).isFile()) {
+      throw new Error(`Refusing to write local adapter state to non-file path: ${filePath}`);
+    }
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, value, "utf8");
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+export function writeLocalAdapterSecretFile(filePath: string, value: string): void {
+  writePrivateLocalAdapterFile(filePath, `${value}\n`);
 }
 
 export function readLocalAdapterTextFile(filePath: string): string | null {
@@ -50,15 +157,11 @@ export function readLocalAdapterTextFile(filePath: string): string | null {
 }
 
 export function writeLocalAdapterJsonFile(filePath: string, value: unknown): void {
-  ensureParentDir(filePath);
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  fs.chmodSync(filePath, 0o600);
+  writePrivateLocalAdapterFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 export function appendLocalAdapterJsonLine(filePath: string, value: unknown): void {
-  ensureParentDir(filePath);
-  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  fs.chmodSync(filePath, 0o600);
+  writePrivateLocalAdapterFile(filePath, `${JSON.stringify(value)}\n`, true);
 }
 
 export function readLocalAdapterJsonFile(filePath: string): JsonObject | null {
@@ -96,25 +199,50 @@ export function loadLocalAdapterPid(filePath: string): number | null {
 
 export function isLocalAdapterProcess(
   pid: number | null | undefined,
-  processNeedle: string,
+  processMatcher: LocalAdapterProcessMatcher,
   runCapture: RunCaptureFn,
 ): boolean {
   if (!Number.isInteger(pid) || !pid || pid <= 0) return false;
-  const cmdline = runCapture(["ps", "-p", String(pid), "-o", "args="], { ignoreError: true });
-  return Boolean(String(cmdline || "").includes(processNeedle));
+  const commandLine = String(
+    runCapture(["ps", "-p", String(pid), "-o", "args="], { ignoreError: true }) || "",
+  );
+  if (typeof processMatcher === "string") return commandLine.includes(processMatcher);
+  return processMatcher instanceof RegExp
+    ? processMatcher.test(commandLine)
+    : processMatcher(commandLine);
 }
 
-export function killLocalAdapterPid(options: {
+export type LocalAdapterProcessOptions = {
   pidPath: string;
-  processNeedle: string;
+  processMatcher: LocalAdapterProcessMatcher;
   run: RunFn;
   runCapture: RunCaptureFn;
-}): void {
-  const persistedPid = loadLocalAdapterPid(options.pidPath);
-  if (isLocalAdapterProcess(persistedPid, options.processNeedle, options.runCapture)) {
-    options.run(["kill", String(persistedPid)], { ignoreError: true, suppressOutput: true });
+};
+
+export function killLocalAdapterPid(
+  options: LocalAdapterProcessOptions,
+  pid: number | null | undefined = loadLocalAdapterPid(options.pidPath),
+): void {
+  if (isLocalAdapterProcess(pid, options.processMatcher, options.runCapture)) {
+    options.run(["kill", String(pid)], { ignoreError: true, suppressOutput: true });
   }
   removeLocalAdapterFile(options.pidPath);
+}
+
+/**
+ * Undoes a partial adapter startup so a failed `ensure` leaves no adapter holding the port and no
+ * state file describing an adapter that is not running. It removes the pid and state files only,
+ * so any other file an adapter deliberately reuses across a respawn survives.
+ *
+ * Callers pass `spawnedPid` so the child of the failed startup is still signalled when the pid file
+ * was never written — persisting it can itself fail, and the pid file is then the wrong source.
+ */
+export function cleanupFailedLocalAdapterStartup(
+  options: LocalAdapterProcessOptions & { statePath: string },
+  spawnedPid?: number,
+): void {
+  killLocalAdapterPid(options, spawnedPid);
+  removeLocalAdapterFile(options.statePath);
 }
 
 export function spawnDetachedNodeAdapter(options: {
@@ -122,7 +250,7 @@ export function spawnDetachedNodeAdapter(options: {
   env: Record<string, string>;
   buildEnv: (extraEnv?: Record<string, string>) => NodeJS.ProcessEnv;
 }): ChildProcess {
-  const child = spawn(process.execPath, [options.scriptPath], {
+  const child = spawn(process.execPath, ["--no-warnings", options.scriptPath], {
     detached: true,
     stdio: "ignore",
     env: options.buildEnv(options.env),
@@ -144,6 +272,12 @@ export function probeLocalAdapterHealth(options: {
   tokenHashField?: string;
 }): Promise<boolean> {
   return new Promise((resolve) => {
+    let settled = false;
+    const settle = (healthy: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(healthy);
+    };
     const req = http.request(
       {
         hostname: options.host,
@@ -153,31 +287,59 @@ export function probeLocalAdapterHealth(options: {
         timeout: options.timeoutMs || 1000,
       },
       (res) => {
+        const declaredBytes = Number(res.headers["content-length"]);
+        if (
+          Number.isFinite(declaredBytes) &&
+          declaredBytes > LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES
+        ) {
+          res.destroy();
+          settle(false);
+          return;
+        }
+
         const chunks: Buffer[] = [];
-        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        let receivedBytes = 0;
+        res.on("data", (chunk) => {
+          if (settled) return;
+          const chunkBytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+          if (receivedBytes + chunkBytes > LOCAL_ADAPTER_HEALTH_MAX_RESPONSE_BYTES) {
+            chunks.length = 0;
+            res.destroy();
+            settle(false);
+            return;
+          }
+          receivedBytes += chunkBytes;
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          chunks.push(buffer);
+        });
+        res.on("close", () => {
+          if (!res.complete) settle(false);
+        });
+        res.on("error", () => settle(false));
         res.on("end", () => {
+          if (settled) return;
           if (res.statusCode !== 200) {
-            resolve(false);
+            settle(false);
             return;
           }
           if (!options.expectedTokenHash) {
-            resolve(true);
+            settle(true);
             return;
           }
           try {
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as JsonObject;
-            resolve(body[options.tokenHashField || "tokenHash"] === options.expectedTokenHash);
+            settle(body[options.tokenHashField || "tokenHash"] === options.expectedTokenHash);
           } catch {
-            resolve(false);
+            settle(false);
           }
         });
       },
     );
     req.on("timeout", () => {
       req.destroy();
-      resolve(false);
+      settle(false);
     });
-    req.on("error", () => resolve(false));
+    req.on("error", () => settle(false));
     req.end();
   });
 }
@@ -188,9 +350,10 @@ export async function waitForLocalAdapterHealth(
 ): Promise<boolean> {
   const attempts = options.attempts || 20;
   const intervalMs = options.intervalMs || 100;
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    if (await probe()) return true;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return false;
+  return waitUntilAsync(probe, {
+    initialIntervalMs: intervalMs,
+    maxIntervalMs: intervalMs,
+    backoffFactor: 1,
+    maxAttempts: attempts,
+  });
 }

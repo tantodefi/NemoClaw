@@ -1,167 +1,55 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Backup and Restore Workspace Files"
-sidebar-title: "Backup and Restore"
-description: "How to back up and restore OpenClaw workspace files before destructive operations."
-description-agent: "Backs up and restores OpenClaw workspace files before destructive operations such as sandbox rebuilds. Use when downloading workspace files from a sandbox, uploading restored files into a new sandbox, or preserving sandbox state across rebuilds."
-keywords: ["nemoclaw backup", "nemoclaw restore", "workspace backup", "openshell sandbox download upload"]
+title: "Persist Sandbox State"
+sidebar-title: "Persist Sandbox State"
+description: "Understand OpenShell native home persistence and NemoClaw's whole-workspace replacement handoff."
+description-agent: "Explains which sandbox state OpenShell preserves and how rebuild transfers the complete native home when replacement is required."
+keywords: ["openshell storage", "nemoclaw rebuild", "sandbox state", "workspace persistence"]
 content:
-  type: "how_to"
+  type: "explanation"
 skill:
   priority: 20
 ---
-Workspace files define your agent's personality, memory, and user context.
-They persist across sandbox restarts but are **permanently deleted** when you run `nemoclaw <name> destroy`.
 
-This guide covers snapshot commands, manual backup with CLI commands, and an automated script.
+OpenShell owns the sandbox lifecycle and its native home/workspace storage. Routine stop, start, reconnect, and host gateway restart operations keep that storage in place. NemoClaw does not maintain a per-agent persistence allowlist for those operations.
 
-## When to Back Up
+## What Persists
 
-- **Before running `nemoclaw <name> destroy`**
-- Before major NemoClaw version upgrades
-- Periodically, if you've invested time customizing your agent
+Everything the agent writes under its OpenShell-provided native home/workspace persists as ordinary sandbox state during routine lifecycle operations. This includes undeclared files as well as configuration, histories, hooks, plugins, packages, cron data, skills, memory, and child-agent state.
 
-## Snapshot Commands
+OpenShell-owned credential stores and host-only secrets are outside the agent home/workspace. NemoClaw does not copy those stores into agent-visible state. Continue to provision credentials through supported OpenShell providers and bindings.
 
-The fastest way to back up and restore sandbox state is with the built-in snapshot commands.
-Snapshots capture all workspace state directories defined in the agent manifest and store them in `~/.nemoclaw/rebuild-backups/<name>/`.
-Agent manifests may also declare durable top-level state files. For Hermes,
-snapshots include `SOUL.md` and the SQLite database behind `.hermes/state.db`
-using SQLite's online backup API, then restore that database through SQLite
-instead of copying a live raw database file.
-Treat snapshot directories as private local data: the Hermes database can
-contain session metadata and message history needed for a faithful restore.
+## Rebuild and Recreation
 
-```console
-$ nemoclaw my-assistant snapshot create
-$ nemoclaw my-assistant snapshot list
-$ nemoclaw my-assistant snapshot restore
-```
+Most lifecycle operations do not need a backup or restore step. When `$$nemoclaw <name> rebuild` or onboarding must replace a sandbox, NemoClaw performs one bounded migration:
 
-`snapshot list` prints a table of version, name, timestamp, and path. Versions (`v1`, `v2`, ..., `vN`) are computed from the timestamp order, so `vN` is always the newest snapshot.
+1. Capture the native home/workspace as an opaque private archive, remove machine-local agent authority from the archive copy, and verify that the archive does not contain credential material.
+2. Create the replacement through OpenShell.
+3. Clear the replacement's fresh native home/workspace and restore the complete archive.
+4. Validate the replacement before retiring the temporary handoff.
 
-To tag a snapshot with a human-readable label, pass `--name`:
+OpenClaw's `gateway.auth` value and Hermes's `.hermes/.env` `API_SERVER_KEY` are machine-local. NemoClaw leaves both live source files unchanged, omits those values only from the private archive copy, and lets the replacement establish fresh local authority. Existing OpenClaw device and scope approvals do not transfer; approve the replacement's fresh pairing or scope-upgrade request when prompted. NemoClaw also removes credential fields from OpenClaw credential, device, identity, pairing, and pending-state JSON; replaces the archived OpenClaw device identity with a fresh non-secret identity; and removes credential fields from Hermes configuration and configuration backups. An invalid or uninspectable recognized authority file stops the transfer instead of being copied unchanged.
 
-```console
-$ nemoclaw my-assistant snapshot create --name before-upgrade
-```
+Hermes PID and lock receipts, OpenClaw's post-upgrade doctor marker, warm-up sessions, and transient SQLite write-ahead-log, shared-memory, and rollback-journal companions, and NemoClaw's configuration and blueprint cache are replacement-owned or generation-local. The replacement keeps its fresh copies instead of restoring the retired sandbox's values. NemoClaw sanitizes machine-local authority from the durable OpenClaw database copy and rejects an archive that still contains one of those database companions, because replaying it could restore removed authority. All other unknown agent paths transfer intact, but any credential-bearing or otherwise uninspectable archive content stops the workflow before replacement. A restore failure happens after the replacement is created; NemoClaw retains the backup for manual recovery and does not publish the replacement as successful. Move credentials into supported OpenShell credential storage or bindings, remove them from the native home, and retry.
 
-To restore a specific snapshot instead of the latest, pass a version, name, or timestamp prefix:
+For an eligible stopped OpenClaw or Deep Agents Code container, NemoClaw captures the provider-owned stopped state without executing in the source sandbox. The operation fails before replacement if that stopped-state authority changes during capture. Stopped Hermes rebuilds instead use the bounded OpenShell start, capture, and return-to-`Stopped` lifecycle described below.
 
-```console
-$ nemoclaw my-assistant snapshot restore v3
-$ nemoclaw my-assistant snapshot restore before-upgrade
-$ nemoclaw my-assistant snapshot restore 2026-04-14T
-```
+For Hermes, the restored complete home may contain the retired `profiles/dashboard-home` layout from an older release. After restore, NemoClaw runs a one-time migration that moves safe legacy files, including a legacy WhatsApp session, into the shared native Hermes home and removes the retired directory. User-created named profiles remain unchanged. A collision, unsafe link, or other unsafe legacy path fails closed and leaves both copies available for trusted recovery instead of choosing one.
 
-The `nemoclaw <name> rebuild` command uses the same snapshot mechanism automatically.
-Snapshot restore performs a targeted repair for legacy `.openclaw-data` symlinks that were created by older images.
-Unsafe symlinks and hard links inside sandbox state are rejected during backup creation before they can enter a snapshot.
-Credential-bearing Hermes files such as `auth.json` are intentionally excluded
-from snapshots. NemoClaw-regenerated Hermes config files (`config.yaml` and
-`.env`) are also excluded; model/provider and messaging credentials are
-recreated from host-side onboarding and OpenShell provider state during rebuild.
-For full details, see the [Commands reference](/reference/commands).
+## Backup Before Upgrade
 
-## Manual Backup
+`$$nemoclaw backup-all` remains an installer-facing safety operation. It normally captures the same complete native home/workspace for every eligible registered sandbox before an OpenShell upgrade. A standalone run with `NEMOCLAW_SKIP_UNREACHABLE_SANDBOX_BACKUP=1` can skip a running sandbox whose SSH endpoint is unreachable; changes in that skipped sandbox are absent from the new backup. The installer uses strict pre-upgrade mode, which rejects ordinary skipped or failed sandboxes instead of treating the batch as complete. Refer to [`$$nemoclaw backup-all`](../../reference/commands#$$nemoclaw-backup-all) for the exact skip and strict-mode behavior. It is not a general snapshot create/list/restore interface.
 
-Use `openshell sandbox download` to copy files from the sandbox to your host.
+For a stopped sandbox, `backup-all` first asks OpenShell to start it in a separate bounded operation. This path is available only for a registered sandbox whose lifecycle identity resolves to a supported container provider, whose ownership probe finds exactly one attributed container, and whose container state is `exited` or `created`. After OpenShell accepts the start, one lifecycle transaction covers readiness, complete native-home capture, and returning the sandbox to `Stopped`. Other ordinary non-ready sandboxes that do not meet those conditions are skipped; strict pre-upgrade mode rejects the batch when a registered sandbox is skipped this way.
 
-```console
-$ SANDBOX=my-assistant
-$ BACKUP_DIR=~/.nemoclaw/backups/$(date +%Y%m%d-%H%M%S)
-$ mkdir -p "$BACKUP_DIR"
+Backups created by older NemoClaw versions from a selective per-agent path inventory are not candidates for automatic rebuild or recreation restore. Recover files from those legacy backup directories manually, then create a current complete native-home backup before replacement.
 
-$ openshell sandbox download "$SANDBOX" /sandbox/.openclaw/workspace/SOUL.md "$BACKUP_DIR/"
-$ openshell sandbox download "$SANDBOX" /sandbox/.openclaw/workspace/USER.md "$BACKUP_DIR/"
-$ openshell sandbox download "$SANDBOX" /sandbox/.openclaw/workspace/IDENTITY.md "$BACKUP_DIR/"
-$ openshell sandbox download "$SANDBOX" /sandbox/.openclaw/workspace/AGENTS.md "$BACKUP_DIR/"
-$ openshell sandbox download "$SANDBOX" /sandbox/.openclaw/workspace/MEMORY.md "$BACKUP_DIR/"
-$ openshell sandbox download "$SANDBOX" /sandbox/.openclaw/workspace/memory/ "$BACKUP_DIR/memory/"
-```
+## Destroy
 
-## Manual Restore
+`$$nemoclaw <name> destroy` removes NemoClaw-owned managed state volumes and, for Deep Agents Code, clears the complete retained `/sandbox` root before asking OpenShell to delete the sandbox. Download files you need before destroy. To replace software while preserving the complete native state, use `$$nemoclaw <name> rebuild`.
 
-Use `openshell sandbox upload` to push files back into a sandbox.
+## Related Topics
 
-```console
-$ SANDBOX=my-assistant
-$ BACKUP_DIR=~/.nemoclaw/backups/20260320-120000  # pick a timestamp
-
-$ openshell sandbox upload "$SANDBOX" "$BACKUP_DIR/SOUL.md" /sandbox/.openclaw/workspace/
-$ openshell sandbox upload "$SANDBOX" "$BACKUP_DIR/USER.md" /sandbox/.openclaw/workspace/
-$ openshell sandbox upload "$SANDBOX" "$BACKUP_DIR/IDENTITY.md" /sandbox/.openclaw/workspace/
-$ openshell sandbox upload "$SANDBOX" "$BACKUP_DIR/AGENTS.md" /sandbox/.openclaw/workspace/
-$ openshell sandbox upload "$SANDBOX" "$BACKUP_DIR/MEMORY.md" /sandbox/.openclaw/workspace/
-$ openshell sandbox upload "$SANDBOX" "$BACKUP_DIR/memory/" /sandbox/.openclaw/workspace/memory/
-```
-
-## Using the Backup Script
-
-The repository includes a convenience script at `scripts/backup-workspace.sh`.
-
-### Backup
-
-```console
-$ ./scripts/backup-workspace.sh backup my-assistant
-Backing up workspace from sandbox 'my-assistant'...
-Backup saved to /home/user/.nemoclaw/backups/20260320-120000/ (6 items)
-```
-
-### Restore
-
-Restore from the most recent backup:
-
-```console
-$ ./scripts/backup-workspace.sh restore my-assistant
-```
-
-Restore from a specific timestamp:
-
-```console
-$ ./scripts/backup-workspace.sh restore my-assistant 20260320-120000
-```
-
-## Verifying a Backup
-
-List backed-up files to confirm completeness:
-
-```console
-$ ls -la ~/.nemoclaw/backups/20260320-120000/
-AGENTS.md
-IDENTITY.md
-MEMORY.md
-SOUL.md
-USER.md
-memory/
-```
-
-## Multi-Agent Deployments
-
-When OpenClaw is configured with multiple named agents, each agent has its own
-workspace directory (`workspace-main/`, `workspace-support/`, `workspace-ops/`,
-and so on — see [Multi-Agent Deployments](/manage-sandboxes/workspace-files#multi-agent-deployments)).
-
-`nemoclaw <name> snapshot create` automatically discovers every `workspace-*/`
-directory under the sandbox state tree and includes it in the snapshot bundle
-alongside the default `workspace/`. `snapshot restore` re-applies the full
-per-agent set. No manual per-workspace backup pattern is needed.
-
-The sandbox entrypoint ensures every per-agent workspace lives directly under
-the persistent `.openclaw/` tree, so state also survives `openshell sandbox restart`.
-
-### Shared files across agents
-
-Files that operators typically want consistent across every per-agent workspace
-(`AGENTS.md`, shared skills, common templates) are **not** synced automatically.
-Each workspace is independent; changes in one don't propagate. Operators that
-need this either copy the shared files explicitly to each workspace after
-editing, or maintain a host-side sync layer. Tracking shared-file tooling
-(shared mount, `workspaces list` command) in
-[#1260](https://github.com/NVIDIA/NemoClaw/issues/1260).
-
-## Next Steps
-
-- [Workspace Files overview](/manage-sandboxes/workspace-files) to learn what each file does
-- [Commands reference](/reference/commands)
+- [Recover and Rebuild Sandboxes](../operate-sandboxes/recover-and-rebuild-sandboxes)
+- [Transfer State Manually](transfer-state-manually)

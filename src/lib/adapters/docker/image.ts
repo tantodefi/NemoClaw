@@ -2,17 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { ROOT } from "../../runner";
-import { dockerCapture, dockerRun, type DockerCaptureOptions, type DockerRunOptions } from "./run";
+import {
+  type DockerCaptureOptions,
+  type DockerRunOptions,
+  type DockerRunResult,
+  dockerCapture,
+  dockerRun,
+} from "./run";
 
-export type DockerBuildOptions = DockerRunOptions & { quiet?: boolean };
+export type DockerBuildOptions = DockerRunOptions & {
+  buildArgs?: Record<string, string>;
+
+  labels?: Record<string, string>;
+  quiet?: boolean;
+};
 
 export function dockerBuild(
   dockerfilePath: string,
   tag: string,
   contextDir: string = ROOT,
   opts: DockerBuildOptions = {},
-) {
-  const { quiet, ...rest } = opts;
+): DockerRunResult {
+  const { buildArgs, labels, quiet, ...rest } = opts;
   // Dockerfile.base relies on `RUN --mount=type=bind`, which is BuildKit-only.
   // Hosts whose Docker daemon defaults to the legacy builder (e.g. fresh
   // Debian/Ubuntu Docker 29 without /etc/docker/daemon.json) abort the
@@ -24,6 +35,19 @@ export function dockerBuild(
   const args = [
     "build",
     ...(quiet ? ["--quiet"] : []),
+
+    ...Object.entries(buildArgs ?? {})
+      .sort(([left], [right]) => {
+        if (left < right) return -1;
+        return left > right ? 1 : 0;
+      })
+      .flatMap(([key, value]) => ["--build-arg", `${key}=${value}`]),
+    ...Object.entries(labels ?? {})
+      .sort(([left], [right]) => {
+        if (left < right) return -1;
+        return left > right ? 1 : 0;
+      })
+      .flatMap(([key, value]) => ["--label", `${key}=${value}`]),
     "-f",
     dockerfilePath,
     "-t",
@@ -33,8 +57,16 @@ export function dockerBuild(
   return dockerRun(args, { ...rest, env });
 }
 
-export function dockerRmi(imageRef: string, opts: DockerRunOptions = {}) {
+export function dockerRmi(imageRef: string, opts: DockerRunOptions = {}): DockerRunResult {
   return dockerRun(["rmi", imageRef], opts);
+}
+
+export function dockerTag(
+  source: string,
+  target: string,
+  opts: DockerRunOptions = {},
+): DockerRunResult {
+  return dockerRun(["tag", source, target], opts);
 }
 
 export function dockerListImagesFormat(

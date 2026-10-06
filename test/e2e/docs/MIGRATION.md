@@ -1,148 +1,113 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# E2E Migration Tracker
+# NemoClaw E2E Migration Notes
 
-This PR migrates all existing `test/e2e/test-*.sh` scripts into the
-scenario-based runner introduced by PR #3363. Full deep migration
-(Strategy B). Legacy scripts remain in the repo during this PR and run
-in parallel for 1–2 nightly cycles after merge; a follow-up PR retires
-them once parity is verified.
+This file describes how to move coverage into the single E2E system
+without confusing that work with the retired typed-shell target runner or a
+second bash-driven harness. Vitest is the harness, GitHub Actions is the matrix,
+and NemoClaw fixtures may invoke real subprocess and system boundaries when
+those boundaries are the contract.
 
-**Merge gate:** All 40 legacy entry points must have a scenario-based
-equivalent that produces the same PASS/FAIL outcomes as the legacy
-script in a side-by-side CI run.
+Migration state is tracked outside the repository in GitHub issues and pull
+requests. Use GitHub issues and pull requests as the source of truth for status
+changes, ownership, replacement coverage, and contract-preserving migration
+decisions.
 
-## Reuse being absorbed
+## Current State
 
-Migrating 40 scripts collapses 13 distinct categories of duplication.
-Each row maps to a Wave 0 item or an existing helper.
+The target runner cutover is complete:
 
-| # | Category | Fan-in (legacy) | Target absorber | LOC |
-|---|---|---|---|---:|
-| 1 | Logging helpers (`section` / `info` / `pass` / `fail`) | 28–39 scripts redefine each | `runtime/lib/logging.sh` (Wave 0.B.5) | 1,556 |
-| 2 | Non-interactive env exports | 187 inlined lines across 40 scripts | `runtime/lib/env.sh::e2e_env_apply_noninteractive` + convention 0.G.1 | 175 |
-| 3 | Repo-root / `SCRIPT_DIR` discovery | 37 lines, 4 competing patterns | One convention (Wave 0.G.2) | 25 |
-| 4 | `nemoclaw list` / `status` / gateway state probes | 142 inlined sites | `validation_suites/assert/{gateway,sandbox}-alive.sh` | 500 |
-| 5 | `bash install.sh ...` invocations | 24 scripts | `nemoclaw_scenarios/install/dispatch.sh` dispatcher (Wave 0.C.1) | 300 |
-| 6 | `nemoclaw onboard ...` variants | 42 invocations, 8+ flag incantations | `nemoclaw_scenarios/onboard/dispatch.sh` + profile handlers | 800 |
-| 7 | Docker older-base-image pattern | 3 hand-rolled implementations | `nemoclaw_scenarios/fixtures/older-base-image.sh` (Wave 0.A.1) | 250 |
-| 8 | Trap / cleanup / teardown blocks | 112 lines, ~15 patterns | `runtime/lib/cleanup.sh` + convention 0.G.3 | 400 |
-| 9 | Fake-endpoint inline setups | 3 inline variants | `nemoclaw_scenarios/fixtures/fake-{openai,telegram,discord,slack}.sh` (Wave 0.A.2–5) | 150 |
-| 10 | Sandbox-scoped exec (`nemoclaw shell <sb> -- ...`) | 15 scripts reimplement with drift | `validation_suites/sandbox-exec.sh` (Wave 0.A.6) | 200 |
-| 11 | Hermes/OpenClaw pair-variant scripts | 7 paired scripts share ~70% | Shared suite steps; scenario agent via `expected_state.sandbox.agent` | 800 |
-| 12 | `section "Phase N: X"` markers | Every script inflates logs with phase text | Step-script filename carries the name (convention 0.G.4) | 300 |
-| 13 | Log-capture paths (`/tmp/*.log`) | 25 different conventions; CI artifact upload assumes one | `$E2E_CONTEXT_DIR/logs/` convention 0.G.5 | 300 |
-| **Total** | | | | **~5,556** |
+- `e2e.yaml` is the target workflow.
+- `test/e2e/live/registry-targets.test.ts` is the registry-driven
+  live target entrypoint.
+- `test/e2e/fixtures/` owns phase fixtures, clients, artifact
+  capture, redaction, cleanup, and shell-probe bridges.
+- `test/e2e/registry/run.ts` only lists targets and emits the live
+  matrix.
+- The typed-shell target runner, shell validation-suite tree, and retiring
+  target workflows are removed. See `RETIREMENT.md`.
 
-About **25% LOC reduction** net after legacy retirement. The larger win
-is drift reduction: when `--yes-i-accept-third-party-software` renames
-again, it's a 1-file change instead of a 24-file change.
+Direct E2E implementations have been migrated by contract. The former
+`test/e2e/test-*.sh` entry points are removed, and current workflows call
+E2E targets directly. Shell, install, platform, process, and full user-flow
+behavior should remain in E2E tests and fixtures when those boundaries are
+the contract.
 
-## Status summary
+## Target Architecture
 
-| Bucket | Legacy LOC | Status |
-|---|---:|---|
-| Wave 0 — fixtures, asserts, setup splits, conventions, parity workflow | — | ⬜ not started |
-| Wave 1 — onboarding baseline | 1,101 | ⬜ |
-| Wave 2 — onboarding lifecycle | 2,013 | ⬜ |
-| Wave 3 — sandbox lifecycle | 2,891 | ⬜ |
-| Wave 4 — rebuild / upgrade | 1,292 | ⬜ |
-| Wave 5 — inference variants | 2,593 | ⬜ |
-| Wave 6 — Hermes | 1,646 | ⬜ |
-| Wave 7 — messaging | 3,397 | ⬜ |
-| Wave 8 — security / policy | 2,241 | ⬜ |
-| Wave 9 — runtime / platform services | 1,696 | ⬜ |
-| Wave 10 — platform + remote | 1,589 | ⬜ |
-| Wave 11 — misc | 405 | ⬜ |
-| **Total** | **20,864** | **0 / 40 scripts migrated** |
+The durable E2E system has one execution path:
 
-## Per-script tracker
+- Vitest owns execution, filtering, reporters, timeouts, fixture lifecycle,
+  skip handling, and CI integration.
+- NemoClaw fixtures own setup, onboarding, lifecycle mutations,
+  expected-state probes, assertion helpers, expected-failure evidence,
+  cleanup, artifacts, and secret redaction.
+- Registry-driven live targets publish sanitized onboard trace timing evidence
+  at `e2e-artifacts/live/<target>/cloud-onboard-trace-timing-summary.json`.
+  The workflow owns `NEMOCLAW_TRACE_DIR`, keeps raw traces under runner
+  temporary storage, and deletes those raw traces before uploading artifacts.
+  Older issue and migration notes may call this the Vitest artifact path; in
+  the current consolidated workflow that path is the live registry-target
+  artifact root.
+  The dedicated `cloud-onboard` artifact remains the only source for the
+  Slack and GitHub scorecard timing comparison.
+- `test/e2e/fixtures/` is fixture/support code, not a test harness
+  or runner.
+- Typed target definitions and matrix helpers describe stable target IDs
+  and supported combinations without becoming a second runner.
+- Product-facing manifests describe desired setup/onboarding state, not test
+  execution logic.
+- Shell and system-boundary behavior should be exercised from the E2E test
+  when it is the contract or lowest-risk adapter.
 
-Legend: ⬜ not started · 🟨 in progress · ✅ migrated · 🔵 parity verified
+## Migration Governance
 
-### Wave 1 — onboarding baseline
+The former `test/e2e/migration/legacy-inventory.json` ledger and
+generated retired assertion inventories are removed because they duplicated live
+GitHub issues and pull requests and quickly became stale sources of truth.
 
-- ⬜ `test-full-e2e.sh` (473) → `onboarding/happy-path/` + scenario `ubuntu-curl-cloud-openclaw`
-- ⬜ `test-cloud-onboard-e2e.sh` (337) → `onboarding/public-installer/`
-- ⬜ `test-cloud-inference-e2e.sh` (291) → extends `inference/cloud/`
+The useful deletion invariant is deterministic and small: workflows call Vitest
+directly, source-shape checks reject reintroduced top-level shell E2E
+entrypoints, and workflow contract tests cover the current CI wiring.
 
-### Wave 2 — onboarding lifecycle
+GitHub issues and PRs still explain why a script is migrated or retired, but the
+repository should not depend on a separate PR-body proof format. The
+machine-checkable boundary is the source tree plus workflow tests.
 
-- ⬜ `test-double-onboard.sh` (717) → `onboarding/double-onboard/`
-- ⬜ `test-gpu-double-onboard.sh` (571) → `onboarding/double-onboard/` on GPU scenario
-- ⬜ `test-onboard-repair.sh` (372) → `onboarding/repair/`
-- ⬜ `test-onboard-resume.sh` (353) → `onboarding/resume/`
+## Migration Pattern
 
-### Wave 3 — sandbox lifecycle
+When moving behavior from a former E2E script:
 
-- ⬜ `test-sandbox-operations.sh` (828) → `sandbox/operations/`
-- ⬜ `test-sandbox-survival.sh` (721) → `sandbox/survival/`
-- ⬜ `test-snapshot-commands.sh` (281) → `sandbox/snapshot/`
-- ⬜ `test-diagnostics.sh` (452) → `sandbox/diagnostics/`
-- ⬜ `test-issue-2478-crash-loop-recovery.sh` (609) → `sandbox/crash-loop-recovery/`
+1. Identify the actual contract: CLI behavior, installer behavior, full user
+   journey, process boundary, platform boundary, or another observable behavior.
+2. Add or update manifests only when product setup/onboarding state changes.
+3. Add typed target registry coverage when the live matrix needs a stable
+   target ID.
+4. Add only the fixture or helper needed for the migration.
+5. Preserve real boundaries. Use `bash`, login shells, `/proc`, process
+   signals, `sudo`, Docker host state, installer scripts, or full journey flows
+   from the E2E test when they are the behavior being tested.
+6. Prove equivalence in the PR discussion, then remove the bash implementation
+   and update any workflow callers to invoke the E2E target directly.
 
-### Wave 4 — rebuild / upgrade
+## Useful Commands
 
-- ⬜ `test-rebuild-openclaw.sh` (453) → `sandbox/rebuild-openclaw/` (uses `nemoclaw_scenarios/fixtures/older-base-image.sh`)
-- ⬜ `test-rebuild-hermes.sh` (401) → `sandbox/rebuild-hermes/`
-- ⬜ `test-upgrade-stale-sandbox.sh` (241) → `sandbox/upgrade-stale/`
-- ⬜ `test-sandbox-rebuild.sh` (197) → folded into `sandbox/rebuild-openclaw/`
+```bash
+# Target registry and matrix
+npx tsx test/e2e/registry/run.ts --list
+npx tsx test/e2e/registry/run.ts --emit-live-matrix
+npx tsx test/e2e/registry/run.ts --emit-live-matrix --targets ubuntu-repo-cloud-openclaw
 
-### Wave 5 — inference variants
+# Fixture/support tests
+npx vitest run --project e2e-support --silent=false --reporter=default
 
-- ⬜ `test-gpu-e2e.sh` (565) → `inference/ollama-gpu/` (deep port)
-- ⬜ `test-ollama-auth-proxy-e2e.sh` (548) → `inference/ollama-auth-proxy/` (deep port)
-- ⬜ `test-inference-routing.sh` (715) → `inference/routing-errors/`
-- ⬜ `test-kimi-inference-compat.sh` (765) → `inference/kimi-compat/`
+# Opt-in live E2E targets
+npm run test:live-e2e -- --silent=false --reporter=default
+```
 
-### Wave 6 — Hermes
+The aggregate live command rebuilds the CLI before Vitest starts and runs live
+test files serially. Whole-test retries stay disabled because live targets
+mutate shared host, Docker, gateway, and sandbox state.
 
-- ⬜ `test-hermes-e2e.sh` (591) → `onboarding/hermes/` (deep port; currently 1-step health)
-- ⬜ `test-hermes-slack-e2e.sh` (537) → `messaging/slack/hermes/`
-- ⬜ `test-hermes-discord-e2e.sh` (518) → `messaging/discord/hermes/`
-
-### Wave 7 — messaging
-
-- ⬜ `test-messaging-providers.sh` (1,677) → `messaging/providers/{telegram,discord,slack}/`
-- ⬜ `test-token-rotation.sh` (575) → `messaging/token-rotation/`
-- ⬜ `test-telegram-injection.sh` (475) → `security/telegram-injection/`
-- ⬜ `test-messaging-compatible-endpoint.sh` (670) → `messaging/compatible-endpoint/`
-
-### Wave 8 — security / policy
-
-- ⬜ `test-shields-config.sh` (550) → `security/shields/`
-- ⬜ `test-network-policy.sh` (579) → `security/network-policy/`
-- ⬜ `test-credential-sanitization.sh` (810) → `security/credentials/sanitization/`
-- ⬜ `test-credential-migration.sh` (302) → `security/credentials/migration/`
-
-### Wave 9 — runtime / platform services
-
-- ⬜ `test-runtime-overrides.sh` (272) → `sandbox/runtime-overrides/`
-- ⬜ `test-overlayfs-autofix.sh` (537) → `sandbox/overlayfs-autofix/`
-- ⬜ `test-device-auth-health.sh` (373) → `lifecycle/device-auth-health/`
-- ⬜ `test-state-backup-restore.sh` (378) → `lifecycle/state-backup-restore/`
-- ⬜ `test-tunnel-lifecycle.sh` (472) → `lifecycle/tunnel-lifecycle/`
-
-### Wave 10 — platform + remote
-
-- ⬜ `test-spark-install.sh` (157) → `platform/spark/`
-- ⬜ `test-launchable-smoke.sh` (589) → `platform/launchable/`
-- ⬜ `brev-e2e.test.ts` (843) → `platform/brev-remote/`
-
-### Wave 11 — misc
-
-- ⬜ `test-skill-agent-e2e.sh` (244) → `onboarding/skill-agent/`
-- ⬜ `test-docs-validation.sh` (161) → `lifecycle/docs-validation/`
-
-## Parallel verification
-
-Before merge, `.github/workflows/e2e-parity-compare.yaml` (Wave 0.F.1)
-will run each migrated scenario next to its legacy counterpart and diff
-PASS/FAIL per assertion via `test/e2e/docs/parity-map.yaml` +
-`scripts/e2e/compare-parity.sh`.
-
-Merge gate: **zero divergence**. Documented flaky assertions are
-compared as "both-pass-or-both-fail" rather than strict equality.
-
-Internal plan document (not committed): `specs/2026-05-08_e2e-setup-scenario-matrix/migration-plan.md`.
+The old `--emit-matrix` and `--plan-only` interfaces are retired.

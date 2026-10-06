@@ -1,42 +1,48 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { listAgents } from "../agent/defs";
-import { runDeprecatedOnboardAliasCommand, runOnboardCommand } from "../onboard/legacy-command";
-import { NOTICE_ACCEPT_ENV, NOTICE_ACCEPT_FLAG } from "../onboard/usage-notice";
+import { loadServingCatalog } from "../inference/serving/catalog-loader";
+import type { GooglechatTunnelRuntimeDeps } from "../messaging/channels/googlechat/hooks/tunnel-runtime";
+import { type OnboardCommandOptions, runOnboardCommand } from "../onboard/command";
+import { type OnboardFlags, readAgentRegistryNames } from "../onboard/command-support";
+import { resolveOnboardResumeIntent } from "../onboard/session-bootstrap";
+import { loadOnboardCommandResumeSession } from "../onboard/sandbox-registration";
+import type { OnboardOptions } from "../onboard/types";
 
-const { onboard: runOnboard } = require("../onboard") as {
-  onboard: (options?: unknown) => Promise<void>;
-};
+export interface OnboardActionRuntimeDeps {
+  readonly googlechatTunnelRuntime?: Omit<GooglechatTunnelRuntimeDeps, "prompt" | "sandboxName">;
+}
 
-function buildOnboardCommandDeps(args: string[]) {
+async function runOnboard(
+  options: OnboardCommandOptions,
+  runtimeDeps: OnboardActionRuntimeDeps,
+): Promise<void> {
+  // Keep the monolithic legacy onboarding graph lazy so command metadata/help
+  // imports do not execute it. Resolve it only when the user invokes onboard.
+  const { onboard } = (await import("../onboard")) as unknown as {
+    onboard: (onboardOptions?: OnboardOptions) => Promise<void>;
+  };
+  await onboard({ ...options, googlechatTunnelRuntime: runtimeDeps.googlechatTunnelRuntime });
+}
+
+function buildOnboardCommandDeps(flags: OnboardFlags, runtimeDeps: OnboardActionRuntimeDeps) {
   return {
-    args,
-    noticeAcceptFlag: NOTICE_ACCEPT_FLAG,
-    noticeAcceptEnv: NOTICE_ACCEPT_ENV,
+    flags,
     env: process.env,
-    runOnboard,
-    listAgents,
+    runOnboard: (options: OnboardCommandOptions) => runOnboard(options, runtimeDeps),
+    listAgents: () => [...readAgentRegistryNames()],
+    loadServingCatalog,
+    loadSession: loadOnboardCommandResumeSession,
+    resolveResumeIntent: resolveOnboardResumeIntent,
     log: console.log,
     error: console.error,
     exit: (code: number) => process.exit(code),
   };
 }
 
-export async function runOnboardAction(args: string[]): Promise<void> {
-  await runOnboardCommand(buildOnboardCommandDeps(args));
-}
-
-export async function runSetupAction(args: string[] = []): Promise<void> {
-  await runDeprecatedOnboardAliasCommand({
-    ...buildOnboardCommandDeps(args),
-    kind: "setup",
-  });
-}
-
-export async function runSetupSparkAction(args: string[] = []): Promise<void> {
-  await runDeprecatedOnboardAliasCommand({
-    ...buildOnboardCommandDeps(args),
-    kind: "setup-spark",
-  });
+export async function runOnboardAction(
+  flags: OnboardFlags,
+  runtimeDeps: OnboardActionRuntimeDeps = {},
+): Promise<void> {
+  await runOnboardCommand(buildOnboardCommandDeps(flags, runtimeDeps));
 }

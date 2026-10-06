@@ -6,9 +6,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-
-import { shellQuote } from "../core/shell-quote";
 import { isErrnoException, isPermissionError } from "../core/errno";
+import { GATEWAY_PORT } from "../core/ports";
+import { shellQuote } from "../core/shell-quote";
+import { nemoclawStateRoot } from "./state-root";
 
 // Strict JSON types for file serialization — unlike json-types.ts,
 // these exclude undefined since actual JSON cannot contain it.
@@ -16,6 +17,32 @@ type JsonScalar = string | number | boolean | null;
 type JsonValue = JsonScalar | JsonObject | JsonValue[];
 type JsonObject = { [key: string]: JsonValue };
 type SerializableConfig = JsonScalar | JsonValue[] | object;
+
+// Host-state vs sandbox-internal scoping. `ensureConfigDir` is a general
+// helper, but the 700/600 perm-heal contract only applies to the host's
+// `~/.nemoclaw` state directory. The mutable-sandbox OpenClaw config tree
+// (`/sandbox/.openclaw`, `openclaw.json`) has a different contract — 2770
+// directory / 660 file — so silently normalizing it would reintroduce the
+// EACCES bug that #4538 / PR #4610 are fighting. These predicates let the
+// heal opt out cleanly when a caller routes a sandbox-internal path here.
+function hostNemoclawDir(): string {
+  const home = process.env.HOME ?? os.homedir();
+  return path.resolve(nemoclawStateRoot(home, GATEWAY_PORT));
+}
+
+function isHostNemoclawRoot(dirPath: string): boolean {
+  return path.resolve(dirPath) === hostNemoclawDir();
+}
+
+const MUTABLE_SANDBOX_CONFIG_ROOT = "/sandbox/.openclaw";
+
+function isMutableSandboxConfigPath(targetPath: string): boolean {
+  const resolved = path.resolve(targetPath);
+  return (
+    resolved === MUTABLE_SANDBOX_CONFIG_ROOT ||
+    resolved.startsWith(`${MUTABLE_SANDBOX_CONFIG_ROOT}/`)
+  );
+}
 
 function toError(error: Error | string | number | boolean | null | undefined): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -33,9 +60,18 @@ function cleanupTempFile(filePath: string): void {
   }
 }
 
+function fsyncDirectory(dirPath: string): void {
+  const directoryDescriptor = fs.openSync(dirPath, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(directoryDescriptor);
+  } finally {
+    fs.closeSync(directoryDescriptor);
+  }
+}
+
 function buildRemediation(): string {
   const home = process.env.HOME ?? os.homedir();
-  const nemoclawDir = path.join(home, ".nemoclaw");
+  const nemoclawDir = nemoclawStateRoot(home, GATEWAY_PORT);
   const backupDir = `${nemoclawDir}.backup.${String(process.pid)}`;
   const recoveryHome = path.join(
     os.tmpdir(),
@@ -61,6 +97,37 @@ function buildRemediation(): string {
     "  This usually happens when NemoClaw was first run with sudo",
     "  or the config directory was created by a different user.",
   ].join("\n");
+}
+
+function buildCorruptRemediation(filePath: string): string {
+  return [
+    "  NemoClaw stopped before writing, so this file is unchanged.",
+    "",
+    "  To fix, inspect the file. After you keep a copy, remove it:",
+    "",
+    `    cat ${shellQuote(filePath)}`,
+    `    cp ${shellQuote(filePath)} ${shellQuote(`${filePath}.bad`)}`,
+    `    rm ${shellQuote(filePath)}`,
+    "",
+    "  Removing a sandbox registry file makes NemoClaw forget its registered sandboxes.",
+    "  Then run the command again.",
+  ].join("\n");
+}
+
+export class ConfigCorruptError extends Error {
+  code = "ECONFIGCORRUPT";
+  configPath: string;
+  filePath: string;
+  remediation: string;
+
+  constructor(filePath: string) {
+    const remediation = buildCorruptRemediation(filePath);
+    super(`Configuration file is present but is not valid JSON: ${filePath}\n\n${remediation}`);
+    this.name = "ConfigCorruptError";
+    this.configPath = filePath;
+    this.filePath = filePath;
+    this.remediation = remediation;
+  }
 }
 
 export class ConfigPermissionError extends Error {
@@ -98,6 +165,13 @@ export class ConfigPermissionError extends Error {
   }
 }
 
+class ConfigSymlinkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigSymlinkError";
+  }
+}
+
 /**
  * Reject a path if it — or any ancestor up to the user's home — is a symlink.
  * This prevents an attacker from planting e.g. ~/.nemoclaw as a symlink to an
@@ -127,7 +201,7 @@ export function rejectSymlinksOnPath(dirPath: string): void {
       const stat = fs.lstatSync(current);
       if (stat.isSymbolicLink()) {
         const target = fs.readlinkSync(current);
-        throw new Error(
+        throw new ConfigSymlinkError(
           `Refusing to use config directory: ${current} is a symbolic link ` +
             `(target: ${target}). This may indicate a symlink attack. ` +
             `Remove the symlink and retry: rm ${shellQuote(current)}`,
@@ -145,16 +219,56 @@ export function rejectSymlinksOnPath(dirPath: string): void {
   }
 }
 
+/**
+ * Tighten group/world bits on every regular file directly inside `dirPath`.
+ * Symlinks are skipped (we use `lstat`; a chmod on a symlink follows to the
+ * target, which would mutate something outside the config dir). Subdirectories
+ * are skipped — this is intentionally root-level only, matching the issue's
+ * acceptance criteria (#4546). Best-effort: a single file's chmod failure
+ * does not abort the walk.
+ */
+function healRootLevelFiles(dirPath: string): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch {
+    // If we can't list (e.g. dir does not exist), nothing to heal.
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isFile()) continue;
+    const full = path.join(dirPath, entry.name);
+    try {
+      // lstat (not stat) so a TOCTOU-swapped symlink between readdir and
+      // chmod doesn't trick us into chmodding a target outside the dir.
+      const st = fs.lstatSync(full);
+      if (!st.isFile()) continue;
+      if ((st.mode & 0o077) !== 0) {
+        fs.chmodSync(full, 0o600);
+      }
+    } catch {
+      // Best effort — keep walking.
+    }
+  }
+}
+
 export function ensureConfigDir(dirPath: string): void {
   // SECURITY: Block symlink attacks before creating or writing to the directory.
   rejectSymlinksOnPath(dirPath);
 
+  // The 700/dir + 600/file contract is host-state only. Mutable sandbox
+  // OpenClaw config paths use 2770/660 (#4538) and must not be normalized
+  // here even if a caller routes them through ensureConfigDir.
+  const mutableSandboxPath = isMutableSandboxConfigPath(dirPath);
+
   try {
     fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
 
-    const stat = fs.statSync(dirPath);
-    if ((stat.mode & 0o077) !== 0) {
-      fs.chmodSync(dirPath, 0o700);
+    if (!mutableSandboxPath) {
+      const stat = fs.statSync(dirPath);
+      if ((stat.mode & 0o077) !== 0) {
+        fs.chmodSync(dirPath, 0o700);
+      }
     }
   } catch (error) {
     const errnoError = error instanceof Error ? error : null;
@@ -181,11 +295,41 @@ export function ensureConfigDir(dirPath: string): void {
     }
     throw error;
   }
+
+  // Heal every root-level file ONLY when this is the host `~/.nemoclaw`
+  // root. #4546's acceptance criteria scope to that exact dir (sandboxes.json,
+  // onboard-session.json, ollama-auth-proxy.pid, ollama-proxy-token,
+  // usage-notice.json). Walking siblings of arbitrary config dirs could
+  // silently normalize a mutable-sandbox config tree (#4538) or any future
+  // contract where 600 is wrong, so the heal stays opt-in by path.
+  if (isHostNemoclawRoot(dirPath)) {
+    healRootLevelFiles(dirPath);
+  }
 }
 
 export function readConfigFile<T>(filePath: string, fallback: T): T {
+  const dirPath = path.dirname(filePath);
   try {
-    return parseJson<T>(fs.readFileSync(filePath, "utf-8"));
+    ensureConfigDir(dirPath);
+  } catch (error) {
+    if (error instanceof ConfigSymlinkError || error instanceof ConfigPermissionError) {
+      throw error;
+    }
+    const errnoError = error instanceof Error ? error : null;
+    if (isPermissionError(errnoError)) {
+      throw new ConfigPermissionError(
+        `Cannot read config directory: ${dirPath}`,
+        dirPath,
+        toError(errnoError),
+      );
+    }
+    // Directory doesn't exist and can't be created — fall through to let
+    // readFileSync produce the appropriate ENOENT / fallback path.
+  }
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, "utf-8");
   } catch (error) {
     const errnoError = error instanceof Error ? error : null;
     if (isPermissionError(errnoError)) {
@@ -198,8 +342,34 @@ export function readConfigFile<T>(filePath: string, fallback: T): T {
     if (isErrnoException(errnoError) && errnoError.code === "ENOENT") {
       return fallback;
     }
-    return fallback;
+    throw error;
   }
+
+  let content: T;
+  try {
+    content = parseJson<T>(raw);
+  } catch {
+    throw new ConfigCorruptError(filePath);
+  }
+
+  // Heal file-level permission drift: tighten group/world bits. lstat
+  // (not stat) so we don't chmod through a symlink to a target outside
+  // the config dir. Skip mutable-sandbox OpenClaw config paths so a
+  // future caller reading openclaw.json doesn't accidentally tighten
+  // its 660 contract (#4538). Defensive duplicate of healRootLevelFiles
+  // for read paths whose dirname differs from what ensureConfigDir saw.
+  try {
+    if (!isMutableSandboxConfigPath(filePath)) {
+      const st = fs.lstatSync(filePath);
+      if (st.isFile() && (st.mode & 0o077) !== 0) {
+        fs.chmodSync(filePath, 0o600);
+      }
+    }
+  } catch {
+    // Best effort — don't fail the read if we can't heal permissions.
+  }
+
+  return content;
 }
 
 export function writeConfigFile(filePath: string, data: SerializableConfig): void {
@@ -207,11 +377,52 @@ export function writeConfigFile(filePath: string, data: SerializableConfig): voi
   ensureConfigDir(dirPath);
 
   const tmpFile = `${filePath}.tmp.${String(process.pid)}`;
+  const backupFile = `${filePath}.rollback.${String(process.pid)}`;
+  let backupCreated = false;
+  let replacementRenamed = false;
   try {
     fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), { mode: 0o600 });
+    const fileDescriptor = fs.openSync(tmpFile, "r");
+    try {
+      fs.fsyncSync(fileDescriptor);
+    } finally {
+      fs.closeSync(fileDescriptor);
+    }
+    fs.rmSync(backupFile, { force: true });
+    try {
+      fs.linkSync(filePath, backupFile);
+      backupCreated = true;
+      fsyncDirectory(dirPath);
+    } catch (error) {
+      if (!isErrnoException(error) || error.code !== "ENOENT") throw error;
+    }
     fs.renameSync(tmpFile, filePath);
+    replacementRenamed = true;
+    try {
+      fsyncDirectory(dirPath);
+    } catch (commitError) {
+      try {
+        if (backupCreated) {
+          fs.renameSync(backupFile, filePath);
+          backupCreated = false;
+        } else {
+          fs.rmSync(filePath, { force: true });
+        }
+        fsyncDirectory(dirPath);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [commitError, rollbackError],
+          `Could not make config replacement durable or restore '${filePath}'`,
+        );
+      }
+      throw commitError;
+    }
+    if (backupCreated) {
+      cleanupTempFile(backupFile);
+    }
   } catch (error) {
     cleanupTempFile(tmpFile);
+    if (backupCreated && !replacementRenamed) cleanupTempFile(backupFile);
     const errnoError = error instanceof Error ? error : null;
     if (isPermissionError(errnoError)) {
       throw new ConfigPermissionError(

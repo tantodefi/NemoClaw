@@ -1,101 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  baseImageInputsChangedSinceMain,
-  formatBuildFailureDiagnostics,
-  getSourceShortShaTags,
-  parseGlibcVersion,
-  versionGte,
-} from "../../dist/lib/sandbox-base-image";
+import { describe, expect, it } from "vitest";
 
-const tmpRoots: string[] = [];
-const gitEnv = {
-  ...process.env,
-  GIT_AUTHOR_NAME: "Test User",
-  GIT_AUTHOR_EMAIL: "test@example.com",
-  GIT_COMMITTER_NAME: "Test User",
-  GIT_COMMITTER_EMAIL: "test@example.com",
-};
+import { formatBuildFailureDiagnostics } from "./sandbox-base-image";
 
-function git(root: string, args: string[]) {
-  const result = spawnSync("git", ["-C", root, ...args], {
-    encoding: "utf-8",
-    env: gitEnv,
-  });
-  if (result.status !== 0) {
-    throw new Error(`git ${args.join(" ")} failed:\n${result.stderr}\n${result.stdout}`);
-  }
-  return result.stdout.trim();
-}
-
-function writeFixture(root: string, relativePath: string, contents: string) {
-  const absolutePath = path.join(root, relativePath);
-  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-  fs.writeFileSync(absolutePath, contents);
-}
-
-function createGitFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-base-image-test-"));
-  tmpRoots.push(root);
-  git(root, ["init", "-b", "main"]);
-  writeFixture(root, "Dockerfile.base", "FROM node:22\n");
-  writeFixture(root, "nemoclaw-blueprint/blueprint.yaml", "min_openclaw_version: 2026.4.24\n");
-  writeFixture(root, "src/other.ts", "export const value = 1;\n");
-  git(root, ["add", "."]);
-  git(root, ["commit", "-m", "initial"]);
-  git(root, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
-  return root;
-}
-
-function createGitFixtureWithRemoteOnlyBaseRef() {
-  const remote = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-base-image-remote-"));
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-base-image-clone-"));
-  tmpRoots.push(root, remote);
-
-  git(remote, ["init", "--bare"]);
-  git(root, ["init", "-b", "main"]);
-  writeFixture(root, "Dockerfile.base", "FROM node:22\n");
-  writeFixture(root, "nemoclaw-blueprint/blueprint.yaml", "min_openclaw_version: 2026.4.24\n");
-  writeFixture(root, "src/other.ts", "export const value = 1;\n");
-  git(root, ["add", "."]);
-  git(root, ["commit", "-m", "initial"]);
-  git(root, ["remote", "add", "origin", remote]);
-  git(root, ["push", "origin", "main"]);
-  return root;
-}
-
-afterEach(() => {
-  for (const root of tmpRoots.splice(0)) {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-describe("sandbox base image helpers", () => {
-  it("parses glibc versions from ldd output", () => {
-    expect(parseGlibcVersion("ldd (Debian GLIBC 2.41-12+deb13u2) 2.41")).toBe("2.41");
-    expect(parseGlibcVersion("ldd (Ubuntu GLIBC 2.39-0ubuntu8.6) 2.39")).toBe("2.39");
-  });
-
-  it("compares glibc versions numerically", () => {
-    expect(versionGte("2.41", "2.39")).toBe(true);
-    expect(versionGte("2.39", "2.39")).toBe(true);
-    expect(versionGte("2.36", "2.39")).toBe(false);
-  });
-
-  it("derives source-sha tags compatible with base-image workflow metadata", () => {
-    const tags = getSourceShortShaTags("/definitely/not/a/git/repo", {
-      GITHUB_SHA: "1E94F2E207C5456EBC35E2BD5BB380D4430292C6",
-    } as NodeJS.ProcessEnv);
-    expect(tags).toEqual(["1e94f2e2", "1e94f2e"]);
-  });
-
+describe("sandbox base-image build diagnostics", () => {
   it("surfaces stderr build diagnostics on failure (#3584)", () => {
     const output = formatBuildFailureDiagnostics({
       stderr: "the --mount option requires BuildKit",
@@ -104,10 +17,11 @@ describe("sandbox base image helpers", () => {
     expect(output).toContain("the --mount option requires BuildKit");
   });
 
-  it("surfaces stdout-only build diagnostics — BuildKit can land errors there (Codex review on #3584)", () => {
+  it("surfaces stdout-only build diagnostics because BuildKit can put errors there per Codex review (#3584)", () => {
     const output = formatBuildFailureDiagnostics({
       stderr: "",
-      stdout: "ERROR: failed to solve: process \"/bin/sh -c apt-get install\" did not complete successfully",
+      stdout:
+        'ERROR: failed to solve: process "/bin/sh -c apt-get install" did not complete successfully',
     });
     expect(output).toContain("ERROR: failed to solve");
   });
@@ -135,60 +49,124 @@ describe("sandbox base image helpers", () => {
     expect(output).not.toContain("sk-abcdef0123456789abcdef0123456789abcdef0123456789");
   });
 
+  it("redacts structured credentials and credentialed URLs in build output", () => {
+    const basicCredential = Buffer.from(
+      ["build-user", "build-password"].join(":"),
+      "utf8",
+    ).toString("base64");
+    const digestResponse = ["digest", "response", "secret"].join("-");
+    const cookieValue = ["session", "cookie-secret"].join("=");
+    const urlPassword = ["registry", "password"].join("-");
+    const queryToken = ["query", "token", "secret"].join("-");
+    const terminalLink = ["https://", "terminal.example.test", "/hidden"].join("");
+    const homePath = path.join(os.homedir(), ".docker", "config.json");
+    const temporaryPath = path.join(os.tmpdir(), "nemoclaw-build", "metadata.json");
+    const output = formatBuildFailureDiagnostics({
+      stderr: [
+        `Authorization: Basic ${basicCredential}`,
+        `Proxy-Authorization: Digest username="build-user", response="${digestResponse}"`,
+        `Cookie: ${cookieValue}`,
+        `failed to fetch https://build-user:${urlPassword}@registry.example.test/v2/layer?token=${queryToken}`,
+        `terminal link: \u001b]8;;${terminalLink}\u0007open\u001b]8;;\u0007`,
+        `home config: ${homePath}`,
+        `temporary metadata: ${temporaryPath}`,
+      ].join("\n"),
+    });
+
+    expect(output).not.toContain(basicCredential);
+    expect(output).not.toContain(digestResponse);
+    expect(output).not.toContain(cookieValue);
+    expect(output).not.toContain(urlPassword);
+    expect(output).not.toContain(queryToken);
+    expect(output).not.toContain(terminalLink);
+    expect(output).not.toContain("\u001b");
+    expect(output).not.toContain(homePath);
+    expect(output).not.toContain(temporaryPath);
+    expect(output).toContain("Authorization: Basic <REDACTED>");
+    expect(output).toContain("Proxy-Authorization: Digest <REDACTED>");
+    expect(output).toContain("Cookie: <REDACTED>");
+    expect(output).toContain("****");
+  });
+
+  it("removes terminal controls split across captured streams (#10548)", () => {
+    const output = formatBuildFailureDiagnostics({
+      stderr: "build failed\u001b[",
+      stdout: "31mvisible detail\u0007",
+    });
+
+    expect({
+      hasEscape: output.includes("\u001b"),
+      hasBell: output.includes("\u0007"),
+      hasVisibleDetail: output.includes("visible detail"),
+    }).toEqual({ hasEscape: false, hasBell: false, hasVisibleDetail: true });
+  });
+
+  it("bounds captured build diagnostics before returning them", () => {
+    const output = formatBuildFailureDiagnostics({ stderr: "x".repeat(10_000) });
+
+    expect(output.length).toBeLessThan(8_100);
+    expect(output.startsWith("[diagnostic truncated]")).toBe(true);
+  });
+
+  it("retains the failing step when long build output is truncated (#10548)", () => {
+    const output = formatBuildFailureDiagnostics({
+      stderr: `successful build output\n${"x".repeat(10_000)}\nERROR: RUN exit 1 failed`,
+    });
+
+    expect(output.length).toBeLessThan(8_100);
+    expect(output).toContain("[diagnostic truncated]");
+    expect(output).toContain("ERROR: RUN exit 1 failed");
+    expect(output).not.toContain("successful build output");
+  });
+
+  it("retains failure tails from both captured build streams (#10548)", () => {
+    const output = formatBuildFailureDiagnostics({
+      stderr: `stderr successful output\n${"e".repeat(10_000)}\nERROR: stderr build step failed`,
+      stdout: `stdout successful output\n${"o".repeat(10_000)}\nERROR: stdout build step failed`,
+    });
+
+    expect(output.length).toBeLessThan(8_100);
+    expect(output).toContain("ERROR: stderr build step failed");
+    expect(output).toContain("ERROR: stdout build step failed");
+    expect(output).not.toContain("stderr successful output");
+    expect(output).not.toContain("stdout successful output");
+    expect(output).toContain("[diagnostic truncated]");
+  });
+
+  it("reuses a short stream's unused budget for the long failure tail (#10548)", () => {
+    const output = formatBuildFailureDiagnostics({
+      stderr: `successful build output\n${"e".repeat(10_000)}\nERROR: stderr build step failed`,
+      stdout: "short stdout diagnostic",
+    });
+
+    expect({
+      length: output.length,
+      hasFailure: output.includes("ERROR: stderr build step failed"),
+      hasShortStream: output.includes("short stdout diagnostic"),
+      hasSuccessfulHead: output.includes("successful build output"),
+    }).toEqual({
+      length: 8_023,
+      hasFailure: true,
+      hasShortStream: true,
+      hasSuccessfulHead: false,
+    });
+  });
+
+  it("surfaces a redacted spawn failure cause", () => {
+    const token = ["spawn", "secret", "token"].join("-");
+    const output = formatBuildFailureDiagnostics({
+      error: new Error(`spawn docker EACCES: Bearer ${token}`),
+    });
+
+    expect(output).toContain("spawn docker EACCES");
+    expect(output).not.toContain(token);
+  });
+
   it("accepts Buffer streams from spawnSync", () => {
     const output = formatBuildFailureDiagnostics({
       stderr: Buffer.from("buffered build error", "utf8"),
       stdout: null,
     });
     expect(output).toContain("buffered build error");
-  });
-
-  it("detects committed Dockerfile.base changes relative to origin/main", () => {
-    const root = createGitFixture();
-    git(root, ["switch", "-c", "feature"]);
-    writeFixture(root, "Dockerfile.base", "FROM node:22\nRUN echo changed\n");
-    git(root, ["add", "Dockerfile.base"]);
-    git(root, ["commit", "-m", "change base"]);
-
-    expect(baseImageInputsChangedSinceMain(root, gitEnv)).toBe(true);
-  });
-
-  it("fetches the base ref before deciding detached dispatch checkouts can use latest", () => {
-    const root = createGitFixtureWithRemoteOnlyBaseRef();
-    git(root, ["switch", "-c", "feature"]);
-    writeFixture(root, "Dockerfile.base", "FROM node:22\nRUN echo changed\n");
-    git(root, ["add", "Dockerfile.base"]);
-    git(root, ["commit", "-m", "change base"]);
-
-    expect(git(root, ["rev-parse", "--verify", "origin/main"]).length).toBeGreaterThan(0);
-    git(root, ["update-ref", "-d", "refs/remotes/origin/main"]);
-    expect(baseImageInputsChangedSinceMain(root, { ...gitEnv, GITHUB_ACTIONS: "true" })).toBe(true);
-  });
-
-  it("detects committed blueprint minimum-version changes relative to origin/main", () => {
-    const root = createGitFixture();
-    git(root, ["switch", "-c", "feature"]);
-    writeFixture(root, "nemoclaw-blueprint/blueprint.yaml", "min_openclaw_version: 2026.4.25\n");
-    git(root, ["add", "nemoclaw-blueprint/blueprint.yaml"]);
-    git(root, ["commit", "-m", "change base input"]);
-
-    expect(baseImageInputsChangedSinceMain(root, gitEnv)).toBe(true);
-  });
-
-  it("ignores non-base-image source changes relative to origin/main", () => {
-    const root = createGitFixture();
-    git(root, ["switch", "-c", "feature"]);
-    writeFixture(root, "src/other.ts", "export const value = 2;\n");
-    git(root, ["add", "src/other.ts"]);
-    git(root, ["commit", "-m", "change app code"]);
-
-    expect(baseImageInputsChangedSinceMain(root, gitEnv)).toBe(false);
-  });
-
-  it("detects uncommitted Dockerfile.base changes", () => {
-    const root = createGitFixture();
-    writeFixture(root, "Dockerfile.base", "FROM node:22\nRUN echo dirty\n");
-
-    expect(baseImageInputsChangedSinceMain(root, gitEnv)).toBe(true);
   });
 });

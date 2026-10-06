@@ -1,11 +1,14 @@
 # Build artifacts and caches
 .version
+.source-revision
 *.pyc
 *.tsbuildinfo
 .pytest_cache/
 __pycache__/
 coverage/
 dist/
+nemoclaw/runner-dist/
+artifacts/pr-review-advisor-local/
 docs/_build/
 node_modules/
 
@@ -19,6 +22,8 @@ Thumbs.db
 
 # Project-specific
 .nemoclaw-maintainer/
+# Legacy DORI status file; no longer read, kept ignored to prevent accidental commits.
+.dori_user_status
 draft_newsletter_*
 research/
 specs/
@@ -50,3 +55,16 @@ secrets.yaml
 service-account*.json
 token.json
 .e2e/
+.gstack/
+
+# Chad runtime state + backups (never source — see docs/design/MASTER-REVIEW-2026-10.md §1b)
+*.db.bak*
+mcp-health.db
+token-optimize.db
+scripts/chad-smithers/*.db
+scripts/chad-smithers/*.db.bak*
+
+# Terminal loader build backups + vendored CheerpX binaries (reproducible, huge — never source)
+scripts/openwebui/static/loader.js.bak.*
+scripts/owui_probe_served.py
+scripts/openwebui/static/vendor/

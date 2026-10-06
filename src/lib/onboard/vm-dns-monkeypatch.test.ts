@@ -1,23 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { applyOnboardVmDnsMonkeypatch } from "../../../dist/lib/onboard/vm-dns-monkeypatch";
+import { applyOpenShellVmDnsMonkeypatch } from "../actions/sandbox/vm-dns-monkeypatch";
+import { applyOnboardVmDnsMonkeypatch } from "./vm-dns-monkeypatch";
 
 describe("applyOnboardVmDnsMonkeypatch", () => {
   it("logs applied only when the onboard VM DNS monkeypatch changes files", () => {
     const changedLogs: string[] = [];
+    const applyChanged = vi.fn(() => ({
+      attempted: true,
+      changed: true,
+      ok: true,
+      status: "applied" as const,
+    }));
     applyOnboardVmDnsMonkeypatch(
       "demo",
-      { openshellDriver: "vm" },
+      { gatewayPort: 9123, openshellDriver: "vm" },
       {
-        apply: () => ({
-          attempted: true,
-          changed: true,
-          ok: true,
-          status: "applied",
-        }),
+        apply: applyChanged,
         log: (message) => changedLogs.push(message),
         warn: (message) => changedLogs.push(message),
       },
@@ -40,8 +42,37 @@ describe("applyOnboardVmDnsMonkeypatch", () => {
     );
 
     expect(changedLogs).toEqual(["  ✓ Applied OpenShell VM DNS monkeypatch"]);
+    expect(applyChanged).toHaveBeenCalledWith(
+      "demo",
+      { gatewayPort: 9123, openshellDriver: "vm" },
+      expect.any(Object),
+    );
     expect(unchangedLogs).toEqual(["  OpenShell VM DNS monkeypatch already present"]);
     expect(unchangedLogs.join("\n")).not.toContain("Applied");
+  });
+
+  it("withholds VM DNS success when authority changes after the helper returns (#9833)", () => {
+    const log = vi.fn();
+    const apply = vi.fn(() => ({
+      attempted: true,
+      changed: true,
+      ok: true,
+      status: "applied" as const,
+    }));
+    const revalidateSandboxIdentity = vi.fn(() => {
+      throw new Error("sandbox identity changed");
+    });
+
+    expect(() =>
+      applyOnboardVmDnsMonkeypatch(
+        "demo",
+        { openshellDriver: "vm" },
+        { apply, log, revalidateSandboxIdentity },
+      ),
+    ).toThrow("sandbox identity changed");
+
+    expect(apply).toHaveBeenCalledOnce();
+    expect(log).not.toHaveBeenCalled();
   });
 
   it("logs skipped VM DNS monkeypatch state for VM sandboxes", () => {
@@ -92,5 +123,32 @@ describe("applyOnboardVmDnsMonkeypatch", () => {
     expect(warnings).toEqual([
       "  Warning: OpenShell VM DNS monkeypatch did not apply: VM rootfs not found",
     ]);
+  });
+
+  // Regression: #3728. macOS Docker-driver sandboxes were misclassified as VM
+  // and ran the VM-only DNS monkeypatch path, which printed misleading warnings.
+  // The Docker runtime path should be silent — no "skipped", no "Warning".
+  it("emits no output for macOS Docker-driver sandboxes", () => {
+    const logs: string[] = [];
+    const warns: string[] = [];
+
+    applyOnboardVmDnsMonkeypatch(
+      "mac-docker",
+      { openshellDriver: "docker" },
+      {
+        apply: (sandboxName, entry) =>
+          applyOpenShellVmDnsMonkeypatch(sandboxName, entry, {
+            capture: () => ({ status: 0, output: "" }),
+            env: {},
+            platform: "darwin",
+            stateDir: "/tmp/nemoclaw-test-state-3728",
+          }),
+        log: (message) => logs.push(message),
+        warn: (message) => warns.push(message),
+      },
+    );
+
+    expect(logs).toEqual([]);
+    expect(warns).toEqual([]);
   });
 });

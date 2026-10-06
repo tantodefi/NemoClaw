@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenWebUI control-plane access preset.
+#
+# Grants the sandbox HTTPS access to the OpenWebUI deployment at
+# chad.supachad.com so the bundled `chad-webui` CLI can call REST endpoints
+# (calendar, notes, automations, memories, chats, models, knowledge, folders)
+# on behalf of operators. Required for Chad to act on the same UI surface
+# operators see in the browser.
+#
+# Two layers of auth, neither granted by this preset:
+#   1. Cloudflare Access service token (must be added to the CF Access policy
+#      separately, then placed in /sandbox/.nemoclaw/credentials.json as
+#      CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET)
+#   2. OpenWebUI personal API key (generated under Settings → Account; placed
+#      in the same credentials file as OPENWEBUI_API_KEY)
+#
+# Scope is intentionally narrow: only /api/v1/* and the unauthed /api/version.
+# This blocks Chad from scraping the SPA HTML, fetching uploads, or hitting
+# admin-only paths like /api/v1/auths/admin/*.
+
+preset:
+  name: openwebui
+  description: "OpenWebUI control plane (chad.supachad.com REST API for chad-webui)"
+
+network_policies:
+  openwebui:
+    name: openwebui
+    endpoints:
+      - host: chad.supachad.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          # Unauthed version probe used by `chad-webui health`.
+          - allow: { method: GET, path: "/api/version" }
+          # Read all of /api/v1 — calendar, notes, chats, models, knowledge,
+          # automations, memories, folders, plus self-introspection /auths/.
+          - allow: { method: GET,    path: "/api/v1/**" }
+          - allow: { method: POST,   path: "/api/v1/**" }
+          - allow: { method: DELETE, path: "/api/v1/**" }
+    binaries:
+      # chad-webui wrapper itself (sandbox-writable bin location, restored
+      # from chad-state on pod recreate per chad-workspace-files.txt).
+      - { path: /sandbox/.openclaw-data/bin/chad-webui }
+      # Python interpreter that exec's the wrapper. OPA pins by /proc/self/exe,
+      # so the wrapper's shebang (#!/usr/bin/env python3) ultimately resolves
+      # to /usr/bin/python3 — that's the binary that opens the socket.
+      - { path: /usr/bin/python3 }

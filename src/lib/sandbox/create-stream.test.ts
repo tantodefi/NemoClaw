@@ -1,29 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { EventEmitter } from "node:events";
-
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { streamSandboxCreate } from "./create-stream";
 import {
-  type StreamableChildProcess,
-  type StreamableReadable,
-  streamSandboxCreate,
-} from "./create-stream";
-
-class FakeReadable extends EventEmitter implements StreamableReadable {
-  destroy(): void {}
-}
-
-class FakeChild extends EventEmitter implements StreamableChildProcess {
-  stdout = new FakeReadable();
-  stderr = new FakeReadable();
-  kill = vi.fn();
-  unref = vi.fn();
-}
-
-const dockerEnv = { ...process.env, OPENSHELL_DRIVERS: "docker" };
-const vmEnv = { ...process.env, OPENSHELL_DRIVERS: "vm" };
+  dockerEnv,
+  FakeChild,
+  makeDefaultStreamOptions,
+  vmEnv,
+} from "./create-stream-test-fixtures";
 
 describe("sandbox-create-stream", () => {
   afterEach(() => {
@@ -74,8 +60,10 @@ describe("sandbox-create-stream", () => {
   it("streams BuildKit progress lines as build output", async () => {
     const child = new FakeChild();
     const logLine = vi.fn();
+    const traceEvent = vi.fn();
     const promise = streamSandboxCreate("echo create", process.env, {
       logLine,
+      traceEvent,
       spawnImpl: () => child as never,
       heartbeatIntervalMs: 1_000,
       silentPhaseMs: 10_000,
@@ -95,6 +83,62 @@ describe("sandbox-create-stream", () => {
     expect(logLine).toHaveBeenCalledWith("#1 [internal] load build definition from Dockerfile");
     expect(logLine).toHaveBeenCalledWith("#2 CACHED");
     expect(logLine).toHaveBeenCalledWith("#3 DONE 0.1s");
+    expect(traceEvent).toHaveBeenCalledWith(
+      "docker_buildkit_progress",
+      expect.objectContaining({
+        step: 1,
+        detail: "[internal] load build definition from Dockerfile",
+      }),
+    );
+    expect(traceEvent).toHaveBeenCalledWith(
+      "docker_buildkit_progress",
+      expect.objectContaining({ step: 2, detail: "CACHED" }),
+    );
+    expect(traceEvent).toHaveBeenCalledWith(
+      "docker_buildkit_progress",
+      expect.objectContaining({ step: 3, detail: "DONE 0.1s" }),
+    );
+  });
+
+  it("records classic Docker build steps as trace events", async () => {
+    const child = new FakeChild();
+    const traceEvent = vi.fn();
+    const promise = streamSandboxCreate("echo create", process.env, {
+      traceEvent,
+      logLine: vi.fn(),
+      spawnImpl: () => child as never,
+      heartbeatIntervalMs: 1_000,
+      silentPhaseMs: 10_000,
+    });
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        "  Step 1/3 : FROM base\n" +
+          "  Step 2/3 : RUN npm ci\n" +
+          "  Step 3/3 : COPY . /workspace\n" +
+          "Successfully built abc123\n",
+      ),
+    );
+    child.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({ status: 0, sawProgress: true });
+    expect(traceEvent).toHaveBeenCalledWith(
+      "sandbox_create_phase",
+      expect.objectContaining({ phase: "build" }),
+    );
+    expect(traceEvent).toHaveBeenCalledWith(
+      "docker_build_step_start",
+      expect.objectContaining({ step: "Step 1/3", index: 1, total: 3, instruction: "FROM base" }),
+    );
+    expect(traceEvent).toHaveBeenCalledWith(
+      "docker_build_step_end",
+      expect.objectContaining({ status: "completed", step: "Step 1/3", instruction: "FROM base" }),
+    );
+    expect(traceEvent).toHaveBeenCalledWith(
+      "docker_build_end",
+      expect.objectContaining({ status: "completed" }),
+    );
   });
 
   it("forces success when the sandbox becomes ready before the stream exits", async () => {
@@ -127,41 +171,95 @@ describe("sandbox-create-stream", () => {
     expect(child.unref).toHaveBeenCalled();
   });
 
-  it("does not detach on Ready until required startup output appears", async () => {
+  it("aborts when the Ready ownership handoff does not terminate (#8720)", async () => {
     vi.useFakeTimers();
 
     const child = new FakeChild();
-    const logLine = vi.fn();
-    let resolved = false;
-    const promise = streamSandboxCreate("echo create", vmEnv, {
+    const promise = streamSandboxCreate("echo create", dockerEnv, {
       spawnImpl: () => child,
       readyCheck: () => true,
+      waitForReadyTermination: true,
       pollIntervalMs: 5,
       heartbeatIntervalMs: 1_000,
       silentPhaseMs: 10_000,
-      logLine,
-    }).then((result) => {
-      resolved = true;
-      return result;
+      logLine: vi.fn(),
     });
 
     child.stdout.emit("data", Buffer.from("Created sandbox: demo\n"));
-    await vi.advanceTimersByTimeAsync(12);
+    await vi.advanceTimersByTimeAsync(6);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
 
-    expect(resolved).toBe(false);
-    expect(child.kill).not.toHaveBeenCalled();
-    expect(logLine).toHaveBeenCalledWith(
-      "  Sandbox reported Ready; waiting for startup command output before detaching.",
-    );
+    await vi.advanceTimersByTimeAsync(5_001);
+    await expect(promise).resolves.toMatchObject({
+      status: 1,
+      readyTerminationTimedOut: true,
+      output: expect.stringContaining("did not exit after Ready; aborting cutover"),
+    });
+    expect((await promise).forcedReady).toBeUndefined();
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(child.unref).not.toHaveBeenCalled();
+  });
 
-    child.stderr.emit("data", Buffer.from("Setting up NemoClaw (Hermes)...\n"));
+  it("keeps the create client active while the ready check returns false (#10769)", async () => {
+    vi.useFakeTimers();
+
+    const child = new FakeChild();
+    const readyCheck = vi.fn(() => false);
+    const settled = vi.fn();
+    const promise = streamSandboxCreate("echo create", dockerEnv, {
+      spawnImpl: () => child,
+      readyCheck,
+      waitForReadyTermination: true,
+      pollIntervalMs: 5,
+      heartbeatIntervalMs: 1_000,
+      silentPhaseMs: 10_000,
+      logLine: vi.fn(),
+    });
+    void promise.then(settled);
+
+    child.stdout.emit("data", Buffer.from("Created sandbox: demo\n"));
     await vi.advanceTimersByTimeAsync(6);
 
-    await expect(promise).resolves.toMatchObject({
-      status: 0,
-      forcedReady: true,
-      output: expect.stringContaining("Setting up NemoClaw (Hermes)..."),
+    expect(readyCheck).toHaveBeenCalled();
+    expect(settled).not.toHaveBeenCalled();
+    expect(child.kill).not.toHaveBeenCalled();
+
+    child.emit("close", 0);
+    await expect(promise).resolves.toMatchObject({ status: 0 });
+  });
+
+  it("traces ready-check errors and keeps polling without forcing ready", async () => {
+    vi.useFakeTimers();
+
+    const child = new FakeChild();
+    const traceEvent = vi.fn();
+    const readyCheck = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("Authorization: Bearer secret-token");
+      })
+      .mockReturnValueOnce(false)
+      .mockReturnValue(true);
+    const promise = streamSandboxCreate("echo create", dockerEnv, {
+      spawnImpl: () => child,
+      readyCheck,
+      pollIntervalMs: 5,
+      heartbeatIntervalMs: 1_000,
+      silentPhaseMs: 10_000,
+      traceEvent,
+      logLine: vi.fn(),
     });
+
+    child.stdout.emit("data", Buffer.from("  Building image sandbox\n"));
+    await vi.advanceTimersByTimeAsync(6);
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(traceEvent).toHaveBeenCalledWith("sandbox_create_ready_check_error", {
+      message: "Authorization: Bearer secr********",
+    });
+
+    await vi.advanceTimersByTimeAsync(12);
+
+    await expect(promise).resolves.toMatchObject({ status: 0, forcedReady: true });
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
@@ -194,7 +292,8 @@ describe("sandbox-create-stream", () => {
     const promise = streamSandboxCreate("echo create", process.env, {
       spawnImpl: () => child,
       readyCheck: () => false,
-      failureCheck: () => "Docker GPU patch failed while OpenShell sandbox create was still waiting.",
+      failureCheck: () =>
+        "Docker GPU patch failed while OpenShell sandbox create was still waiting.",
       pollIntervalMs: 5,
       heartbeatIntervalMs: 1_000,
       silentPhaseMs: 10_000,
@@ -214,10 +313,11 @@ describe("sandbox-create-stream", () => {
 
   it("flushes the final partial line before resolving", async () => {
     const child = new FakeChild();
-    const promise = streamSandboxCreate("echo create", process.env, {
-      spawnImpl: () => child,
-      logLine: vi.fn(),
-    });
+    const promise = streamSandboxCreate(
+      "echo create",
+      process.env,
+      makeDefaultStreamOptions(child),
+    );
 
     child.stdout.emit("data", Buffer.from("Created sandbox: demo"));
     child.emit("close", 0);
@@ -226,6 +326,25 @@ describe("sandbox-create-stream", () => {
       status: 0,
       output: "Created sandbox: demo",
       sawProgress: true,
+    });
+  });
+
+  it("keeps interleaved stdout and stderr fragments on separate lines", async () => {
+    const child = new FakeChild();
+    const promise = streamSandboxCreate(
+      "echo create",
+      process.env,
+      makeDefaultStreamOptions(child),
+    );
+
+    child.stdout.emit("data", Buffer.from("stdout-partial"));
+    child.stderr.emit("data", Buffer.from("stderr-line\n"));
+    child.stdout.emit("data", Buffer.from("-complete\n"));
+    child.emit("close", 0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 0,
+      output: "stderr-line\nstdout-partial-complete",
     });
   });
 
@@ -429,10 +548,11 @@ describe("sandbox-create-stream", () => {
 
   it("reports spawn errors cleanly", async () => {
     const child = new FakeChild();
-    const promise = streamSandboxCreate("echo create", process.env, {
-      spawnImpl: () => child,
-      logLine: vi.fn(),
-    });
+    const promise = streamSandboxCreate(
+      "echo create",
+      process.env,
+      makeDefaultStreamOptions(child),
+    );
 
     child.emit("error", Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
 

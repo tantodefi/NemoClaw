@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GBrain knowledge brain — allows the sandbox agent to call the gbrain MCP
+# server running on the host and reach OpenAI/Anthropic APIs for embeddings
+# and query expansion.
+
+preset:
+  name: gbrain
+  description: "GBrain knowledge brain — host MCP server + NVIDIA embeddings + Anthropic query expansion."
+
+network_policies:
+  # Note: gbrain is intentionally NOT registered as an MCP server (see
+  # chad-setup.sh comment around step 3a) — PGLite is single-process and
+  # MCP registration causes lock contention. The main agent uses gbrain
+  # via CLI directly, so no host MCP endpoint policy is needed.
+
+  # Binary identity note: /usr/local/bin/gbrain is a shell wrapper that execs
+  # /usr/local/bin/gbrain-bin, which itself execs `bun /…/cli.ts`. The L7 proxy
+  # pins by /proc/self/exe, so the requesting process is always `bun`. Both
+  # the wrapper paths and bun itself need to be on the binaries allowlist —
+  # the wrappers for posix process-tree audits, bun for the actual TLS dial.
+
+  gbrain_nvidia_embeddings:
+    name: gbrain_nvidia_embeddings
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/v1/embeddings" }
+    binaries:
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/gbrain-bin }
+      - { path: /usr/local/bin/bun }
+
+  gbrain_nvidia_local_inference:
+    name: gbrain_nvidia_local_inference
+    # gbrain only calls /v1/embeddings (text-embedding-nomic-embed-text-v1.5)
+    # and /v1/models (capability check during `gbrain doctor`). Locking the
+    # paths instead of /** keeps this preset narrow — a future regression
+    # that uses the gbrain binary as a generic NVIDIA-inference proxy would
+    # be visible at the policy layer instead of silently allowed.
+    endpoints:
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/v1/embeddings" }
+          - allow: { method: GET,  path: "/v1/models" }
+          - allow: { method: GET,  path: "/v1/models/*" }
+    binaries:
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/gbrain-bin }
+      - { path: /usr/local/bin/bun }
+
+  gbrain_anthropic_expansion:
+    name: gbrain_anthropic_expansion
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: POST, path: "/v1/messages" }
+    binaries:
+      - { path: /usr/local/bin/gbrain }
+      - { path: /usr/local/bin/gbrain-bin }
+      - { path: /usr/local/bin/bun }

@@ -14,12 +14,28 @@ import { describe, expect, it, vi } from "vitest";
 import { gpuPassthroughRecoveryLines, reportGpuPassthroughRecovery } from "./gpu-recovery";
 
 describe("gpuPassthroughRecoveryLines", () => {
-  it("never emits a literal `<name>` placeholder for any input", () => {
-    for (const names of [null, [], ["alpha"], ["alpha", "beta"], ["alpha", "beta", "gamma"]]) {
-      const lines = gpuPassthroughRecoveryLines(names);
-      expect(lines.join("\n")).not.toMatch(/<name>/);
-    }
+  it.each(
+    [null, [], ["alpha"], ["alpha", "beta"], ["alpha", "beta", "gamma"]].map(
+      (names) => [names] as const,
+    ),
+  )("never emits a literal `<name>` placeholder for any input [case %#]", (names) => {
+    const lines = gpuPassthroughRecoveryLines(names);
+    expect(lines.join("\n")).not.toMatch(/<name>/);
   });
+
+  // OpenShell dropped `gateway destroy` before 0.0.44 and now rejects it as an
+  // unrecognized subcommand, so the command fails on every OpenShell version
+  // NemoClaw installs (#8139).
+  it.each(
+    [null, [], ["alpha"], ["alpha", "beta"], ["alpha", "beta", "gamma"]].map(
+      (names) => [names] as const,
+    ),
+  )(
+    "omits openshell gateway destroy for every registered-sandbox count [case %#] (#8139)",
+    (names) => {
+      expect(gpuPassthroughRecoveryLines(names).join("\n")).not.toContain("gateway destroy");
+    },
+  );
 
   it("suggests targeted gateway cleanup when no sandboxes are registered (null input)", () => {
     const lines = gpuPassthroughRecoveryLines(null);
@@ -27,10 +43,13 @@ describe("gpuPassthroughRecoveryLines", () => {
     expect(joined).toContain("Existing gateway was started without GPU passthrough");
     expect(joined).toContain("attempted safe gateway replacement automatically");
     expect(joined).toContain("openshell gateway remove nemoclaw");
-    expect(joined).toContain("openshell gateway destroy -g nemoclaw");
+    expect(joined).toContain("do not use a host-wide process match");
+    expect(joined).toContain("PID file, runtime marker, and loaded sandbox namespace");
+    expect(joined).not.toContain("pkill");
     expect(joined).toContain("nemoclaw onboard --gpu");
     expect(joined).not.toContain("nemoclaw uninstall");
-    // Must NOT suggest the destroy form — there is nothing to destroy.
+    // Must NOT suggest the per-sandbox `nemoclaw <name> destroy` form — there
+    // is nothing to destroy.
     expect(joined).not.toMatch(/nemoclaw [a-z-]+ destroy/);
   });
 
@@ -75,6 +94,18 @@ describe("gpuPassthroughRecoveryLines", () => {
     // No double-spaced "nemoclaw  destroy" rendering.
     expect(joined).not.toMatch(/nemoclaw\s{2,}destroy/);
   });
+
+  it("does not suggest destroy/recreate as sufficient for a missing Jetson NVIDIA runtime", () => {
+    const lines = gpuPassthroughRecoveryLines(["jetson-box"], {
+      missingRuntimePlatform: "jetson",
+    });
+    const joined = lines.join("\n");
+    expect(joined).toContain("Jetson/Tegra sandbox GPU requires Docker NVIDIA runtime support");
+    expect(joined).toContain("--no-gpu");
+    expect(joined).toContain("missing NVIDIA runtime");
+    expect(joined).not.toContain("destroy --yes");
+    expect(joined).not.toContain("nemoclaw onboard --gpu");
+  });
 });
 
 describe("reportGpuPassthroughRecovery", () => {
@@ -93,5 +124,19 @@ describe("reportGpuPassthroughRecovery", () => {
     const joined = emit.mock.calls.map((c) => c[0]).join("\n");
     expect(joined).toContain("nemoclaw alpha destroy --yes");
     expect(joined).toContain("nemoclaw beta destroy --yes --cleanup-gateway");
+  });
+
+  it("does not load registered names for missing Jetson NVIDIA runtime recovery", () => {
+    const emit = vi.fn();
+    const loadNames = vi.fn(() => ["jetson-box"]);
+    reportGpuPassthroughRecovery(emit, loadNames, {
+      missingRuntimePlatform: "jetson",
+    });
+    const joined = emit.mock.calls.map((c) => c[0]).join("\n");
+
+    expect(loadNames).not.toHaveBeenCalled();
+    expect(joined).toContain("Jetson/Tegra sandbox GPU requires Docker NVIDIA runtime support");
+    expect(joined).toContain("nemoclaw onboard --no-gpu");
+    expect(joined).not.toContain("jetson-box");
   });
 });

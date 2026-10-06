@@ -32,16 +32,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         with:
           languages: ${{ matrix.language }}
           queries: security-and-quality
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
 
   shellcheck:
     name: ShellCheck SARIF
@@ -49,16 +51,66 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: source
+
+      - name: Check out the trusted ShellCheck converter
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.workflow_sha }}
+          path: trusted-shellcheck-converter
+          sparse-checkout: |
+            scripts/shellcheck-json1-to-sarif.mts
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.1
+
+      - name: Install reviewed npm
+        uses: NVIDIA/NemoClaw/.github/actions/setup-reviewed-npm@98669f24d35f18e49b6b2769cd68709509ea24f2
 
       - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        run: |
+          set -euo pipefail
+          probe="$RUNNER_TEMP/shellcheck-json1-probe.sh"
+          printf '#!/bin/sh\ntrue\n' > "$probe"
+          if command -v shellcheck >/dev/null 2>&1 &&
+            shellcheck --format=json1 "$probe" >/dev/null 2>&1; then
+            echo "Using preinstalled ShellCheck"
+            shellcheck --version
+          else
+            apt_options=(
+              -o Acquire::Retries=3
+              -o Acquire::http::Timeout=15
+              -o Acquire::https::Timeout=15
+            )
+            if ! sudo apt-get "${apt_options[@]}" update; then
+              echo "Failed to update apt package indexes for ShellCheck" >&2
+              exit 1
+            fi
+            if ! sudo apt-get "${apt_options[@]}" install -y shellcheck; then
+              echo "Failed to install ShellCheck" >&2
+              exit 1
+            fi
+            if ! shellcheck --format=json1 "$probe" >/dev/null 2>&1; then
+              echo "Installed ShellCheck does not support --format=json1" >&2
+              exit 1
+            fi
+            echo "Using installed ShellCheck"
+            shellcheck --version
+          fi
 
       - name: Collect shell files
         id: shell-files
+        working-directory: source
         run: |
-          git ls-files '*.sh' 'install.sh' 'uninstall.sh' | sort -u > shell-files.txt
-          if [ -s shell-files.txt ]; then
+          git ls-files -z -- '*.sh' 'install.sh' 'uninstall.sh' | sort -zu > "$GITHUB_WORKSPACE/shell-files.txt"
+          if [ -s "$GITHUB_WORKSPACE/shell-files.txt" ]; then
             echo "has_files=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_files=false" >> "$GITHUB_OUTPUT"
@@ -66,82 +118,43 @@ jobs:
 
       - name: Generate ShellCheck SARIF
         if: steps.shell-files.outputs.has_files == 'true'
+        working-directory: source
         run: |
           # Ubuntu's packaged ShellCheck may not support --format=sarif.
           # Generate json1 and convert it to SARIF for upload.
+          mapfile -d '' -t shell_files < "$GITHUB_WORKSPACE/shell-files.txt"
           sc_exit=0
-          if xargs -r shellcheck --format=json1 < shell-files.txt > shellcheck.json; then
+          if shellcheck --format=json1 -- "${shell_files[@]}" > "$GITHUB_WORKSPACE/shellcheck.json"; then
             sc_exit=0
           else
             sc_exit=$?
           fi
 
-          if jq -e . shellcheck.json >/dev/null 2>&1; then
-            jq '
-              def level_map:
-                if . == "error" then "error"
-                elif . == "warning" then "warning"
-                else "note"
-                end;
-              {
-                "version": "2.1.0",
-                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-                "runs": [
-                  {
-                    "tool": {
-                      "driver": {
-                        "name": "ShellCheck",
-                        "informationUri": "https://www.shellcheck.net/",
-                        "rules": (
-                          .comments
-                          | map(select(.code != null) | {
-                            "id": ("SC" + (.code | tostring)),
-                            "name": ("SC" + (.code | tostring)),
-                            "shortDescription": { "text": .level }
-                          }) | unique_by(.id)
-                        )
-                      }
-                    },
-                    "results": (
-                      .comments
-                      | map({
-                        "ruleId": ("SC" + (.code | tostring)),
-                        "level": (.level | level_map),
-                        "message": { "text": .message },
-                        "locations": [
-                          {
-                            "physicalLocation": {
-                              "artifactLocation": { "uri": .file },
-                              "region": (
-                                {
-                                  "startLine": .line,
-                                  "startColumn": .column,
-                                  "endLine": .endLine,
-                                  "endColumn": .endColumn
-                                } | with_entries(select(.value != null))
-                              )
-                            }
-                          }
-                        ]
-                      })
-                    )
-                  }
-                ]
-              }
-            ' shellcheck.json > shellcheck.sarif
+          echo "ShellCheck invocation exit status: $sc_exit"
+          case "$sc_exit" in
+            0) ;;
+            1)
+              echo "ShellCheck found issues; continuing because json1 output is available for SARIF conversion."
+              ;;
+            *)
+              echo "ShellCheck failed to process the input files (exit=$sc_exit); refusing to convert or upload incomplete results."
+              exit "$sc_exit"
+              ;;
+          esac
+
+          conversion_exit=0
+          if env -i PATH="$PATH" node \
+            "$GITHUB_WORKSPACE/trusted-shellcheck-converter/scripts/shellcheck-json1-to-sarif.mts" \
+            "$GITHUB_WORKSPACE/shellcheck.json" "$GITHUB_WORKSPACE/shellcheck.sarif"; then
+            conversion_exit=0
           else
-            echo "ShellCheck produced invalid JSON (exit=$sc_exit); writing empty SARIF fallback."
-            cat > shellcheck.sarif <<'EOF'
-          {
-            "version": "2.1.0",
-            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-            "runs": []
-          }
-          EOF
+            conversion_exit=$?
           fi
 
-          if [ "$sc_exit" -ne 0 ]; then
-            echo "ShellCheck reported findings (exit=$sc_exit); continuing so SARIF can be uploaded."
+          echo "SARIF conversion exit status: $conversion_exit"
+          if [ "$conversion_exit" -ne 0 ]; then
+            echo "ShellCheck SARIF conversion failed; refusing to upload invalid or stale output."
+            exit "$conversion_exit"
           fi
 
       - name: Check SARIF has runs
@@ -158,6 +171,7 @@ jobs:
 
       - name: Upload ShellCheck SARIF
         if: steps.shell-files.outputs.has_files == 'true' && steps.sarif-runs.outputs.has_runs == 'true'
-        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         with:
           sarif_file: shellcheck.sarif
+          checkout_path: source

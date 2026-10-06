@@ -11,16 +11,13 @@
  * time.
  */
 
-import { readFileSync } from "node:fs";
 import { renderBox } from "./banner.js";
 import { handleSlashCommand } from "./commands/slash.js";
-import {
-  describeOnboardEndpoint,
-  describeOnboardProvider,
-  loadOnboardConfig,
-} from "./onboard/config.js";
+import { readNativeRoute } from "./onboard/native-route.js";
+import { getPluginConfig } from "./plugin-config.js";
 import { registerRuntimeContext } from "./runtime-context.js";
-import { scanForSecrets, isMemoryPath } from "./security/secret-scanner.js";
+import { safeResolvePath } from "./security/safe-resolve-path.js";
+import { isMemoryPath, scanForSecrets } from "./security/secret-scanner.js";
 
 type PluginScalar = string | number | boolean | null | undefined;
 type PluginValue = PluginScalar | PluginRecord | PluginValue[];
@@ -38,14 +35,6 @@ function readStringProperty(value: unknown, key: string): string | undefined {
   }
   const property = value[key];
   return typeof property === "string" ? property : undefined;
-}
-
-function readObjectProperty(value: unknown, key: string): ToolParams | undefined {
-  if (!isToolParams(value)) {
-    return undefined;
-  }
-  const property = value[key];
-  return isToolParams(property) ? property : undefined;
 }
 
 function readBeforeToolCallEvent(value: unknown): Partial<BeforeToolCallEvent> | undefined {
@@ -207,131 +196,28 @@ export interface NemoClawConfig {
   inferenceProvider: string;
 }
 
-// Gateway plugins run inside the sandbox, where OpenClaw keeps its active config here.
-const OPENCLAW_CONFIG_PATH = "/sandbox/.openclaw/openclaw.json";
-const DEFAULT_INFERENCE_MODEL = "nvidia/nemotron-3-super-120b-a12b";
-
-function normalizeInferenceModel(value: string): string {
-  const trimmed = value.trim();
-  return trimmed.startsWith("inference/") ? trimmed.slice("inference/".length) : trimmed;
-}
-
-function readOpenClawPrimaryModel(
-  logger?: PluginLogger,
-  configPath = OPENCLAW_CONFIG_PATH,
-): string {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(configPath, "utf-8"));
-    const agents = readObjectProperty(parsed, "agents");
-    const defaults = readObjectProperty(agents, "defaults");
-    const model = readObjectProperty(defaults, "model");
-    const primary = readStringProperty(model, "primary");
-    return primary ? normalizeInferenceModel(primary) : "";
-  } catch (err) {
-    logger?.debug(
-      `Could not read OpenClaw primary model from ${configPath}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return "";
-  }
-}
-
-function activeModelEntries(activeModel: string): ModelProviderEntry[] {
-  if (!activeModel) {
-    return [
-      {
-        id: "nvidia/nemotron-3-super-120b-a12b",
-        label: "Nemotron 3 Super 120B (March 2026)",
-        contextWindow: 131072,
-        maxOutput: 8192,
-      },
-      {
-        id: "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-        label: "Nemotron Ultra 253B",
-        contextWindow: 131072,
-        maxOutput: 4096,
-      },
-      {
-        id: "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        label: "Nemotron Super 49B v1.5",
-        contextWindow: 131072,
-        maxOutput: 4096,
-      },
-      {
-        id: "nvidia/nemotron-3-nano-30b-a3b",
-        label: "Nemotron 3 Nano 30B",
-        contextWindow: 131072,
-        maxOutput: 4096,
-      },
-    ];
-  }
-
-  return [
-    {
-      id: `inference/${activeModel}`,
-      label: activeModel,
-      contextWindow: 131072,
-      maxOutput: 8192,
-    },
-  ];
-}
-
-function registeredProviderForConfig(
-  activeModel: string,
-  providerCredentialEnv: string,
-): ProviderPlugin {
-  const authLabel =
-    providerCredentialEnv === "NVIDIA_API_KEY"
-      ? `NVIDIA API Key (${providerCredentialEnv})`
-      : `OpenAI API Key (${providerCredentialEnv})`;
-
+function registeredProviderForConfig(route: ReturnType<typeof readNativeRoute>): ProviderPlugin {
   return {
     id: "inference",
     label: "Managed Inference Route",
     aliases: ["inference-local", "nemoclaw"],
-    envVars: [providerCredentialEnv],
-    models: { chat: activeModelEntries(activeModel) },
-    auth: [
-      {
-        id: "bearer",
-        type: "bearer",
-        envVar: providerCredentialEnv,
-        headerName: "Authorization",
-        label: authLabel,
-      },
-    ],
+    envVars: route.credentialEnv ? [route.credentialEnv] : [],
+    models: { chat: route.managedModel ? [route.managedModel] : [] },
+    auth: route.credentialEnv
+      ? [
+          {
+            id: "bearer",
+            type: "bearer",
+            envVar: route.credentialEnv,
+            headerName: "Authorization",
+            label: `API Key (${route.credentialEnv})`,
+          },
+        ]
+      : [],
   };
 }
 
-const DEFAULT_PLUGIN_CONFIG: NemoClawConfig = {
-  blueprintVersion: "latest",
-  blueprintRegistry: "ghcr.io/nvidia/nemoclaw-blueprint",
-  sandboxName: "openclaw",
-  inferenceProvider: "nvidia",
-};
-
-export function getPluginConfig(api: OpenClawPluginApi): NemoClawConfig {
-  const raw = api.pluginConfig ?? {};
-  return {
-    blueprintVersion:
-      typeof raw["blueprintVersion"] === "string"
-        ? raw["blueprintVersion"]
-        : DEFAULT_PLUGIN_CONFIG.blueprintVersion,
-    blueprintRegistry:
-      typeof raw["blueprintRegistry"] === "string"
-        ? raw["blueprintRegistry"]
-        : DEFAULT_PLUGIN_CONFIG.blueprintRegistry,
-    sandboxName:
-      typeof raw["sandboxName"] === "string"
-        ? raw["sandboxName"]
-        : DEFAULT_PLUGIN_CONFIG.sandboxName,
-    inferenceProvider:
-      typeof raw["inferenceProvider"] === "string"
-        ? raw["inferenceProvider"]
-        : DEFAULT_PLUGIN_CONFIG.inferenceProvider,
-  };
-}
+export { getPluginConfig };
 
 // ---------------------------------------------------------------------------
 // Plugin entry point
@@ -349,10 +235,8 @@ export default function register(api: OpenClawPluginApi): void {
     handler: (ctx) => handleSlashCommand(ctx, api),
   });
 
-  // 2. Register nvidia-nim provider from the active OpenClaw config, falling
-  // back to the onboard snapshot and then the NemoClaw default.
-  const onboardCfg = loadOnboardConfig();
-  const activeModel = readOpenClawPrimaryModel(api.logger) || onboardCfg?.model || "";
+  // Native host configuration is the only route owner.
+  const route = readNativeRoute(api.config);
 
   // 4. Register runtime context injection (sandbox-awareness hook)
   const pluginConfig = getPluginConfig(api);
@@ -364,12 +248,11 @@ export default function register(api: OpenClawPluginApi): void {
     );
   }
 
-  const bannerEndpoint = onboardCfg ? describeOnboardEndpoint(onboardCfg) : "build.nvidia.com";
-  const bannerProvider = onboardCfg ? describeOnboardProvider(onboardCfg) : "NVIDIA Endpoints";
-  const bannerModel = activeModel || DEFAULT_INFERENCE_MODEL;
+  const bannerEndpoint = route.endpoint;
+  const bannerProvider = route.provider;
+  const bannerModel = route.model;
 
-  const providerCredentialEnv = onboardCfg?.credentialEnv ?? "NVIDIA_API_KEY";
-  api.registerProvider(registeredProviderForConfig(activeModel, providerCredentialEnv));
+  if (route.managedModel) api.registerProvider(registeredProviderForConfig(route));
 
   // 3. Register before_tool_call hook to block secrets in memory writes (#1233)
   // NOTE: This relies on OpenClaw's before_tool_call plugin hook contract
@@ -391,8 +274,13 @@ export default function register(api: OpenClawPluginApi): void {
         const rawPath = event.params["file_path"] ?? event.params["path"];
         if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
         // Resolve symlinks and traversal before checking — prevents bypasses like
-        // /sandbox/project/../../.openclaw/memory/secrets.md
-        const filePath = api.resolvePath(rawPath);
+        // /sandbox/project/../../.openclaw/memory/secrets.md. The host's
+        // resolver may be missing or return undefined under embedded-fallback
+        // runtimes, so route through safeResolvePath which falls back to the
+        // raw path rather than crashing the hook. isMemoryPath knows how to
+        // classify both absolute resolved paths and canonical memory
+        // basenames written through a relative path.
+        const filePath = safeResolvePath(api, rawPath);
         if (!isMemoryPath(filePath)) return undefined;
 
         const content =
@@ -429,9 +317,9 @@ export default function register(api: OpenClawPluginApi): void {
     "  Slash:     /nemoclaw",
   ];
 
-  api.logger.info("");
+  process.stderr.write("\n");
   for (const line of renderBox(bannerLines)) {
-    api.logger.info(line);
+    process.stderr.write(`[gateway] ${line}\n`);
   }
-  api.logger.info("");
+  process.stderr.write("\n");
 }

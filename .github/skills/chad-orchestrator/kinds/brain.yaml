@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sub-agent kind: brain
+# Dedicated gbrain query/store operations. Cheaper and faster than a
+# full researcher spawn when the question is answerable from the local
+# knowledge graph. Brain-kind sub-agents are read-write: they may
+# store new pages as well as query existing ones.
+#
+# Routing heuristics (chad-route):
+#   remember, recall, store, what do you know, brain query, entity,
+#   summarise for memory, extract, knowledge graph
+
+kind: brain
+description: "Query or update the gbrain knowledge brain. Use for recall, entity lookup, memory store, timeline, and relationship queries. Cheaper than researcher — no inference unless gbrain results are insufficient."
+
+binary: /usr/local/bin/gbrain
+invocation: prompt-stdin
+
+# Brain ops don't need external network — all local PGLite.
+# If gbrain has no answer and the sub-agent needs to call inference,
+# the parent should re-route to researcher instead.
+network_policy_preset: ""
+
+default_timeout: 60
+default_budget_tokens: 2000
+
+prompt_template: |
+  You are a brain sub-agent. Use the gbrain CLI to answer the task.
+
+  Available commands (run them as shell commands):
+    gbrain query "<question>"       — hybrid vector + graph search
+    gbrain put-page --title "T" --content "C" --tags t1,t2
+                                    — store a new page
+    gbrain embed --stale            — embed pages that lack vectors
+    gbrain doctor                   — health check
+
+  Rules:
+  - Try gbrain query first. If it returns relevant results, base your
+    answer on them without calling any inference API.
+  - If you store a new page, emit its page id in the JSON summary.
+  - Write your response to stdout. Last line MUST be JSON:
+      {"status": "done"|"failed", "summary": "...", "pages_found": N, "pages_written": N}
+
+  Task id: {{task_id}}
+  Task:
+  {{task}}

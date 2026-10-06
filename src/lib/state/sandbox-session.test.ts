@@ -1,83 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  resolveOpenshell: vi.fn<() => string | null>(),
+}));
+
+vi.mock("../adapters/openshell/resolve", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../adapters/openshell/resolve")>()),
+  resolveOpenshell: mocks.resolveOpenshell,
+}));
+
 import {
-  parseForwardList,
-  parseSshProcesses,
-  hasActiveForwards,
-  getForwardsForSandbox,
-  classifySessionState,
+  createSystemDeps,
   getActiveSandboxSessions,
-  type ForwardEntry,
+  parseSshProcesses,
   type SessionDetectionDeps,
 } from "./sandbox-session";
 
-describe("parseForwardList", () => {
-  it("returns empty array for empty/null input", () => {
-    expect(parseForwardList("")).toEqual([]);
-    expect(parseForwardList(null)).toEqual([]);
-    expect(parseForwardList(undefined)).toEqual([]);
-  });
-
-  it("skips header row", () => {
-    const output = "SANDBOX  BIND  PORT  PID  STATUS\n";
-    expect(parseForwardList(output)).toEqual([]);
-  });
-
-  it("parses single forward entry", () => {
-    const output = `SANDBOX  BIND  PORT  PID  STATUS
-my-sandbox  127.0.0.1  18789  12345  running`;
-    const entries = parseForwardList(output);
-    expect(entries).toHaveLength(1);
-    expect(entries[0]).toEqual({
-      sandboxName: "my-sandbox",
-      bind: "127.0.0.1",
-      port: "18789",
-      pid: 12345,
-      status: "running",
-    });
-  });
-
-  it("strips ANSI colors from forward list output", () => {
-    const output = `SANDBOX BIND      PORT     PID        STATUS
-hermes  127.0.0.1 8642     50394      \u001b[32mrunning\u001b[39m`;
-    expect(parseForwardList(output)).toEqual([
-      {
-        sandboxName: "hermes",
-        bind: "127.0.0.1",
-        port: "8642",
-        pid: 50394,
-        status: "running",
-      },
-    ]);
-  });
-
-  it("parses multiple forward entries", () => {
-    const output = `SANDBOX  BIND  PORT  PID  STATUS
-sandbox-1  127.0.0.1  18789  100  running
-sandbox-2  127.0.0.1  18790  200  running
-sandbox-1  127.0.0.1  11434  101  stopped`;
-    const entries = parseForwardList(output);
-    expect(entries).toHaveLength(3);
-    expect(entries[0].sandboxName).toBe("sandbox-1");
-    expect(entries[1].sandboxName).toBe("sandbox-2");
-    expect(entries[2].status).toBe("stopped");
-  });
-
-  it("handles missing PID gracefully", () => {
-    const output = "my-sandbox  127.0.0.1  18789  -  running";
-    const entries = parseForwardList(output);
-    expect(entries).toHaveLength(1);
-    expect(entries[0].pid).toBeNull();
-  });
-
-  it("handles lines with insufficient columns", () => {
-    const output = "incomplete line\nmy-sandbox  127.0.0.1  18789  999  running";
-    const entries = parseForwardList(output);
-    expect(entries).toHaveLength(1);
-    expect(entries[0].sandboxName).toBe("my-sandbox");
-  });
+afterEach(() => {
+  vi.unstubAllEnvs();
+  mocks.resolveOpenshell.mockReset();
 });
 
 describe("parseSshProcesses", () => {
@@ -87,25 +31,79 @@ describe("parseSshProcesses", () => {
   });
 
   it("returns empty array for empty sandbox name", () => {
-    expect(parseSshProcesses("12345 ssh openshell-test", "")).toEqual([]);
+    expect(parseSshProcesses("12345 ssh openshell-test.default", "")).toEqual([]);
   });
 
   it("detects SSH process targeting sandbox", () => {
-    const output = `12345 ssh -F /tmp/config openshell-my-sandbox
-67890 ssh -F /tmp/config openshell-other-sandbox`;
+    const output = `12345 ssh -F /tmp/config openshell-my-sandbox.default
+67890 ssh -F /tmp/config openshell-other-sandbox.default`;
     const sessions = parseSshProcesses(output, "my-sandbox");
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toEqual({
       sandboxName: "my-sandbox",
       pid: 12345,
-      sshHost: "openshell-my-sandbox",
+      sshHost: "openshell-my-sandbox.default",
     });
   });
 
+  // Newer OpenShell routes every sandbox through one fixed `sandbox` alias and
+  // names the target only on its proxy command, so the SSH host carries no
+  // sandbox reference at all (#9316).
+  const PROXY = (id: string) =>
+    `ssh -o ProxyCommand=/usr/local/bin/openshell ssh-proxy --gateway 'https://127.0.0.1:8080' --sandbox-id ${id} --token t --gateway-name nemoclaw -o StrictHostKeyChecking=no`;
+  const SANDBOX_ID = "de7eab7a-002f-41e9-acad-5fd4749e07bb";
+  const interactiveLine = `12345 ${PROXY(SANDBOX_ID)} -tt -o RequestTTY=force -o SetEnv=TERM=xterm-256color sandbox`;
+  const forwardLine = `12300 ${PROXY(SANDBOX_ID)} -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18789:127.0.0.1:18789 sandbox`;
+
+  it("detects a proxied interactive session by sandbox ID (#9316)", () => {
+    expect(parseSshProcesses(interactiveLine, "my-sandbox", SANDBOX_ID)).toEqual([
+      {
+        sandboxName: "my-sandbox",
+        pid: 12345,
+        sshHost: "openshell-my-sandbox.default",
+      },
+    ]);
+  });
+
+  it("does not count the dashboard forward as a session (#9316)", () => {
+    // The forward runs through the same proxy and sandbox ID; only the
+    // interactive session requests a TTY. Counting it would report a session
+    // on every Ready sandbox.
+    expect(parseSshProcesses(forwardLine, "my-sandbox", SANDBOX_ID)).toEqual([]);
+    expect(
+      parseSshProcesses(`${forwardLine}\n${interactiveLine}`, "my-sandbox", SANDBOX_ID),
+    ).toHaveLength(1);
+  });
+
+  it("does not attribute a proxied session without a known sandbox ID (#9316)", () => {
+    // The command line carries no sandbox name, so guessing would attribute one
+    // sandbox's session to another.
+    expect(parseSshProcesses(interactiveLine, "my-sandbox")).toEqual([]);
+    expect(parseSshProcesses(interactiveLine, "my-sandbox", "")).toEqual([]);
+  });
+
+  it("does not match another sandbox's ID (#9316)", () => {
+    expect(
+      parseSshProcesses(interactiveLine, "other-sandbox", "aaaaaaaa-0000-0000-0000-000000000000"),
+    ).toEqual([]);
+  });
+
+  it("detects a legacy SSH process during the upgrade window", () => {
+    const output = `12345 ssh -F /tmp/config openshell-my-sandbox
+67890 ssh -F /tmp/config openshell-other-sandbox`;
+    expect(parseSshProcesses(output, "my-sandbox")).toEqual([
+      {
+        sandboxName: "my-sandbox",
+        pid: 12345,
+        sshHost: "openshell-my-sandbox",
+      },
+    ]);
+  });
+
   it("detects multiple SSH sessions to the same sandbox", () => {
-    const output = `111 ssh -F /tmp/a.conf openshell-dev
-222 ssh -F /tmp/b.conf openshell-dev
-333 ssh -F /tmp/c.conf openshell-prod`;
+    const output = `111 ssh -F /tmp/a.conf openshell-dev.default
+222 ssh -F /tmp/b.conf openshell-dev.default
+333 ssh -F /tmp/c.conf openshell-prod.default`;
     const sessions = parseSshProcesses(output, "dev");
     expect(sessions).toHaveLength(2);
     expect(sessions.map((s) => s.pid)).toEqual([111, 222]);
@@ -113,7 +111,7 @@ describe("parseSshProcesses", () => {
 
   it("ignores unrelated SSH processes", () => {
     const output = `100 ssh user@remote-host
-200 ssh -F config openshell-my-sandbox
+200 ssh -F config openshell-my-sandbox.default
 300 /usr/bin/ssh-agent`;
     const sessions = parseSshProcesses(output, "my-sandbox");
     expect(sessions).toHaveLength(1);
@@ -121,127 +119,147 @@ describe("parseSshProcesses", () => {
   });
 
   it("does not match partial sandbox name prefixes", () => {
-    // openshell-my-sandbox-extended should NOT match openshell-my-sandbox
-    const output = `100 ssh -F /tmp/cfg openshell-my-sandbox-extended`;
+    // openshell-my-sandbox-extended.default should NOT match
+    // openshell-my-sandbox.default
+    const output = `100 ssh -F /tmp/cfg openshell-my-sandbox-extended.default`;
     const sessions = parseSshProcesses(output, "my-sandbox");
-    // Word-boundary matching ensures `openshell-my-sandbox` does not match
-    // inside `openshell-my-sandbox-extended`.
+    // Word-boundary matching ensures `openshell-my-sandbox.default` does not
+    // match inside `openshell-my-sandbox-extended.default`.
     expect(sessions).toHaveLength(0);
   });
 
+  it("does not match partial legacy sandbox name prefixes", () => {
+    const output = `100 ssh -F /tmp/cfg openshell-my-sandbox-extended`;
+    expect(parseSshProcesses(output, "my-sandbox")).toHaveLength(0);
+  });
+
   it("matches sandbox name at end of line", () => {
-    const output = `100 ssh -F /tmp/cfg openshell-my-sandbox`;
+    const output = `100 ssh -F /tmp/cfg openshell-my-sandbox.default`;
     const sessions = parseSshProcesses(output, "my-sandbox");
     expect(sessions).toHaveLength(1);
     expect(sessions[0].pid).toBe(100);
   });
 
   it("matches sandbox name followed by whitespace", () => {
-    const output = `100 ssh -F /tmp/cfg -o StrictHostKeyChecking=no openshell-dev -t bash`;
+    const output = `100 ssh -F /tmp/cfg -o StrictHostKeyChecking=no openshell-dev.default -t bash`;
     const sessions = parseSshProcesses(output, "dev");
     expect(sessions).toHaveLength(1);
   });
 });
 
-describe("hasActiveForwards", () => {
-  const entries: ForwardEntry[] = [
-    { sandboxName: "dev", bind: "127.0.0.1", port: "18789", pid: 100, status: "running" },
-    { sandboxName: "prod", bind: "127.0.0.1", port: "18790", pid: 200, status: "stopped" },
-  ];
-
-  it("returns true when sandbox has running forwards", () => {
-    expect(hasActiveForwards(entries, "dev")).toBe(true);
-  });
-
-  it("returns false when sandbox has only stopped forwards", () => {
-    expect(hasActiveForwards(entries, "prod")).toBe(false);
-  });
-
-  it("returns false for unknown sandbox", () => {
-    expect(hasActiveForwards(entries, "unknown")).toBe(false);
-  });
-});
-
-describe("getForwardsForSandbox", () => {
-  const entries: ForwardEntry[] = [
-    { sandboxName: "dev", bind: "127.0.0.1", port: "18789", pid: 100, status: "running" },
-    { sandboxName: "dev", bind: "127.0.0.1", port: "11434", pid: 101, status: "running" },
-    { sandboxName: "prod", bind: "127.0.0.1", port: "18790", pid: 200, status: "running" },
-  ];
-
-  it("filters entries for specific sandbox", () => {
-    const result = getForwardsForSandbox(entries, "dev");
-    expect(result).toHaveLength(2);
-    expect(result.every((e) => e.sandboxName === "dev")).toBe(true);
-  });
-
-  it("returns empty for unknown sandbox", () => {
-    expect(getForwardsForSandbox(entries, "unknown")).toEqual([]);
-  });
-});
-
-describe("classifySessionState", () => {
-  it("detects active sessions from SSH processes", () => {
-    const forwards: ForwardEntry[] = [];
-    const sessions = [{ sandboxName: "dev", pid: 100, sshHost: "openshell-dev" }];
-    const result = classifySessionState(forwards, sessions, "dev");
-    expect(result.hasActiveSessions).toBe(true);
-    expect(result.sessionCount).toBe(1);
-    expect(result.forwardCount).toBe(0);
-    expect(result.sources).toContain("ssh");
-  });
-
-  it("forward-only does not count as active SSH session", () => {
-    const forwards: ForwardEntry[] = [
-      { sandboxName: "dev", bind: "127.0.0.1", port: "18789", pid: 100, status: "running" },
-    ];
-    const sessions: { sandboxName: string; pid: number; sshHost: string }[] = [];
-    const result = classifySessionState(forwards, sessions, "dev");
-    expect(result.hasActiveSessions).toBe(false);
-    expect(result.forwardCount).toBe(1);
-    expect(result.sources).toContain("forward");
-    expect(result.sources).not.toContain("ssh");
-  });
-
-  it("reports both sources when present", () => {
-    const forwards: ForwardEntry[] = [
-      { sandboxName: "dev", bind: "127.0.0.1", port: "18789", pid: 100, status: "running" },
-    ];
-    const sessions = [{ sandboxName: "dev", pid: 200, sshHost: "openshell-dev" }];
-    const result = classifySessionState(forwards, sessions, "dev");
-    expect(result.hasActiveSessions).toBe(true);
-    expect(result.sessionCount).toBe(1);
-    expect(result.forwardCount).toBe(1);
-    expect(result.sources).toContain("forward");
-    expect(result.sources).toContain("ssh");
-  });
-
-  it("ignores sessions for other sandboxes", () => {
-    const forwards: ForwardEntry[] = [];
-    const sessions = [{ sandboxName: "prod", pid: 100, sshHost: "openshell-prod" }];
-    const result = classifySessionState(forwards, sessions, "dev");
-    expect(result.hasActiveSessions).toBe(false);
-    expect(result.sessionCount).toBe(0);
-    expect(result.forwardCount).toBe(0);
-  });
-
-  it("counts multiple sessions", () => {
-    const forwards: ForwardEntry[] = [];
-    const sessions = [
-      { sandboxName: "dev", pid: 100, sshHost: "openshell-dev" },
-      { sandboxName: "dev", pid: 200, sshHost: "openshell-dev" },
-    ];
-    const result = classifySessionState(forwards, sessions, "dev");
-    expect(result.hasActiveSessions).toBe(true);
-    expect(result.sessionCount).toBe(2);
-    expect(result.forwardCount).toBe(0);
-  });
-});
-
 describe("getActiveSandboxSessions", () => {
+  it("uses the default OpenShell resolver for proxied session lookup", () => {
+    const sandboxId = "de7eab7a-002f-41e9-acad-5fd4749e07bb";
+    mocks.resolveOpenshell.mockReturnValue("/resolved/openshell");
+    const spawn = vi
+      .fn()
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: `12345 ssh -o ProxyCommand=/resolved/openshell ssh-proxy --sandbox-id ${sandboxId} --token t -tt -o RequestTTY=force sandbox`,
+        stderr: "",
+      })
+      .mockReturnValueOnce({ status: 0, stdout: `Id: ${sandboxId}\n`, stderr: "" });
+
+    const result = getActiveSandboxSessions(
+      "my-sandbox",
+      createSystemDeps(undefined, { spawnSync: spawn as never }),
+    );
+
+    expect(mocks.resolveOpenshell).toHaveBeenCalledOnce();
+    expect(spawn).toHaveBeenNthCalledWith(
+      2,
+      "/resolved/openshell",
+      ["sandbox", "get", "my-sandbox"],
+      expect.any(Object),
+    );
+    expect(result.sessions).toEqual([
+      {
+        sandboxName: "my-sandbox",
+        pid: 12345,
+        sshHost: "openshell-my-sandbox.default",
+      },
+    ]);
+  });
+
+  it("preserves legacy session lookup when the default OpenShell resolver is unavailable", () => {
+    const sandboxId = "de7eab7a-002f-41e9-acad-5fd4749e07bb";
+    mocks.resolveOpenshell.mockReturnValue(null);
+    const spawn = vi.fn().mockReturnValue({
+      status: 0,
+      stdout: `12345 ssh -o ProxyCommand=/usr/local/bin/openshell ssh-proxy --sandbox-id ${sandboxId} --token t -tt -o RequestTTY=force sandbox
+67890 ssh -F /tmp/config openshell-my-sandbox.default`,
+      stderr: "",
+    });
+
+    const result = getActiveSandboxSessions(
+      "my-sandbox",
+      createSystemDeps(undefined, { spawnSync: spawn as never }),
+    );
+
+    expect(mocks.resolveOpenshell).toHaveBeenCalledOnce();
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(result).toEqual({
+      detected: true,
+      sessions: [
+        {
+          sandboxName: "my-sandbox",
+          pid: 67890,
+          sshHost: "openshell-my-sandbox.default",
+        },
+      ],
+    });
+  });
+
+  it("pins a proxied session lookup to the recorded OpenShell target (#10514)", () => {
+    const sandboxId = "de7eab7a-002f-41e9-acad-5fd4749e07bb";
+    vi.stubEnv("OPENSHELL_GATEWAY", "hostile-gateway");
+    vi.stubEnv("OPENSHELL_WORKSPACE", "hostile-workspace");
+    vi.stubEnv("OPENSHELL_LOCAL_TLS_DIR", "/hostile/tls");
+    vi.stubEnv("OPENSHELL_GATEWAY_ENDPOINT", "https://hostile.invalid");
+    vi.stubEnv("OPENSHELL_TOKEN", "hostile-token");
+    const spawn = vi
+      .fn()
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: `12345 ssh -o ProxyCommand=/usr/local/bin/openshell ssh-proxy --sandbox-id ${sandboxId} --token t -tt -o RequestTTY=force sandbox`,
+        stderr: "",
+      })
+      .mockReturnValueOnce({ status: 0, stdout: `Id: ${sandboxId}\n`, stderr: "" });
+    const runtimeSelection = {
+      gatewayName: "nemoclaw-9090",
+      workspace: "default",
+      localTlsDir: "/authority/tls",
+    };
+
+    const result = getActiveSandboxSessions(
+      "my-sandbox",
+      createSystemDeps("/usr/bin/openshell", {
+        runtimeSelection,
+        spawnSync: spawn as never,
+      }),
+    );
+
+    expect(result.sessions).toHaveLength(1);
+    expect(spawn).toHaveBeenNthCalledWith(
+      2,
+      "/usr/bin/openshell",
+      ["sandbox", "get", "-g", "nemoclaw-9090", "my-sandbox"],
+      expect.any(Object),
+    );
+    const openshellOptions = spawn.mock.calls[1]?.[2] as
+      | { env?: Record<string, string> }
+      | undefined;
+    expect(openshellOptions?.env).toMatchObject({
+      OPENSHELL_GATEWAY: "nemoclaw-9090",
+      OPENSHELL_WORKSPACE: "default",
+      OPENSHELL_LOCAL_TLS_DIR: "/authority/tls",
+    });
+    expect(openshellOptions?.env).not.toHaveProperty("OPENSHELL_GATEWAY_ENDPOINT");
+    expect(openshellOptions?.env).not.toHaveProperty("OPENSHELL_TOKEN");
+  });
+
   it("returns detected=false when no deps available", () => {
     const deps: SessionDetectionDeps = {
-      getForwardList: () => null,
       getSshProcesses: () => null,
     };
     const result = getActiveSandboxSessions("dev", deps);
@@ -251,7 +269,6 @@ describe("getActiveSandboxSessions", () => {
 
   it("returns detected=false for empty sandbox name", () => {
     const deps: SessionDetectionDeps = {
-      getForwardList: () => "some output",
       getSshProcesses: () => "some output",
     };
     const result = getActiveSandboxSessions("", deps);
@@ -260,8 +277,7 @@ describe("getActiveSandboxSessions", () => {
 
   it("detects sessions from pgrep output", () => {
     const deps: SessionDetectionDeps = {
-      getForwardList: () => "",
-      getSshProcesses: () => "12345 ssh -F /tmp/cfg openshell-my-sandbox\n",
+      getSshProcesses: () => "12345 ssh -F /tmp/cfg openshell-my-sandbox.default\n",
     };
     const result = getActiveSandboxSessions("my-sandbox", deps);
     expect(result.detected).toBe(true);
@@ -269,24 +285,55 @@ describe("getActiveSandboxSessions", () => {
     expect(result.sessions[0].pid).toBe(12345);
   });
 
-  it("returns detected=false when pgrep unavailable (forward list alone insufficient)", () => {
+  it("resolves a durable ID for a proxied interactive session (#9316)", () => {
+    const sandboxId = "de7eab7a-002f-41e9-acad-5fd4749e07bb";
+    const resolveSandboxId = vi.fn(() => sandboxId);
     const deps: SessionDetectionDeps = {
-      getForwardList: () =>
-        "SANDBOX  BIND  PORT  PID  STATUS\nmy-sandbox  127.0.0.1  18789  999  running\n",
+      getSshProcesses: () =>
+        `12345 ssh -o ProxyCommand=/usr/local/bin/openshell ssh-proxy --sandbox-id ${sandboxId} --token t -tt -o RequestTTY=force sandbox`,
+      resolveSandboxId,
+    };
+
+    const result = getActiveSandboxSessions("my-sandbox", deps);
+
+    expect(resolveSandboxId).toHaveBeenCalledExactlyOnceWith("my-sandbox");
+    expect(result).toEqual({
+      detected: true,
+      sessions: [
+        {
+          sandboxName: "my-sandbox",
+          pid: 12345,
+          sshHost: "openshell-my-sandbox.default",
+        },
+      ],
+    });
+  });
+
+  it("does not resolve a durable ID for a host-alias session (#9316)", () => {
+    const resolveSandboxId = vi.fn(() => "unused-id");
+    const deps: SessionDetectionDeps = {
+      getSshProcesses: () => "12345 ssh -F /tmp/cfg openshell-my-sandbox.default\n",
+      resolveSandboxId,
+    };
+
+    const result = getActiveSandboxSessions("my-sandbox", deps);
+
+    expect(resolveSandboxId).not.toHaveBeenCalled();
+    expect(result.sessions).toHaveLength(1);
+  });
+
+  it("returns detected=false when SSH process discovery is unavailable", () => {
+    const deps: SessionDetectionDeps = {
       getSshProcesses: () => null,
     };
     const result = getActiveSandboxSessions("my-sandbox", deps);
-    // SSH process detection is the authoritative source; forward list alone
-    // cannot determine interactive sessions (dashboard forward always runs).
     expect(result.detected).toBe(false);
     expect(result.sessions).toEqual([]);
   });
 
-  it("integrates both sources", () => {
+  it("returns discovered SSH sessions", () => {
     const deps: SessionDetectionDeps = {
-      getForwardList: () =>
-        "SANDBOX  BIND  PORT  PID  STATUS\ndev  127.0.0.1  18789  100  running\n",
-      getSshProcesses: () => "200 ssh -F /tmp/cfg openshell-dev\n",
+      getSshProcesses: () => "200 ssh -F /tmp/cfg openshell-dev.default\n",
     };
     const result = getActiveSandboxSessions("dev", deps);
     expect(result.detected).toBe(true);

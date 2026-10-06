@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Docs / Link Check
+name: Docs / Check Changed Markdown Links
 
 on:
   pull_request:
@@ -9,7 +9,6 @@ on:
     types: [opened, reopened, synchronize]
     paths:
       - "**/*.md"
-      - "**/*.mdx"
       - ".github/workflows/docs-links-pr.yaml"
       - "test/e2e/e2e-cloud-experimental/check-docs.sh"
 
@@ -18,12 +17,14 @@ permissions:
 
 jobs:
   markdown-links:
+    name: Docs / Check changed Markdown links
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Determine changed documentation files
@@ -34,9 +35,10 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           mapfile -t doc_files < <(
+            # Fern preview validates MDX routes after building variant navigation.
+            # This raw Markdown checker only verifies repository-local .md links.
             git diff --name-only --diff-filter=ACMR "$base" "$head" -- \
               '*.md' \
-              '*.mdx' \
               ':(exclude)node_modules/**' \
               ':(exclude)dist/**' \
               ':(exclude)vendor/**' \
