@@ -30,7 +30,7 @@ import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 import { postNote } from "../lib/note.js";
 
 const DB = process.env.CHAD_CODEREVIEW_DB || "./code-review-loop.db";
-const REPO = process.env.CHAD_CODEREVIEW_REPO || "tantodefi/NemoClaw";
+const REPO = process.env.CHAD_CODEREVIEW_REPO || "tantodefi/supachad";
 const MAX_ITERS = Number(process.env.CHAD_CODEREVIEW_MAX_ITERS || 3);
 const POST = process.env.CHAD_CODEREVIEW_POST === "1"; // post the review as a note
 const DIFF_CAP = Number(process.env.CHAD_CODEREVIEW_DIFF_CAP || 24000); // prompt budget

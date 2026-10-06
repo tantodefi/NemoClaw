@@ -28,7 +28,7 @@ REMOTE_HOST="openshell-${SANDBOX}"
 CREDENTIALS_SRC="${HOME}/.nemoclaw/credentials.json"
 BACKUP_BASE="${HOME}/.nemoclaw/backups"
 CHAD_STATE_REPO="${CHAD_STATE_REPO:-tantodefi/chad-state}"
-CHAD_SOURCE_REPO="${CHAD_SOURCE_REPO:-tantodefi/NemoClaw}"
+CHAD_SOURCE_REPO="${CHAD_SOURCE_REPO:-tantodefi/supachad}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

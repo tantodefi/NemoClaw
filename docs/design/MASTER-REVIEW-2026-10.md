@@ -359,7 +359,7 @@ whole monetization gate is **one place**:
   set) so it persists across restarts; `chad-webui` gets `tier set/get` verbs.
 
 ### Upstream auto-sync (§E) — remotes already configured
-`git remote`: `origin=tantodefi/NemoClaw`, **`upstream=NVIDIA/NemoClaw`**. So the
+`git remote`: `origin=tantodefi/supachad`, **`upstream=NVIDIA/NemoClaw`**. So the
 cron only needs: fetch upstream → sync branch → merge → **conflict ⇒ open a PR**
 (never auto-merge to `chad-dev`/`main`; honor [[project_chad_autonomy_git_boundary]])
 → gate on `make check` + tests. Codify the Chad-local fileset that must survive

@@ -12,7 +12,7 @@
 // Shadow by default: issues are filed only when CHAD_BUGREPORT_POST=1 AND the
 // operator approves. Read-only gh (list) is always safe; create is the sole
 // mutation and it's gated twice (approval + the POST flag). Repo via
-// CHAD_BUGREPORT_REPO (default tantodefi/NemoClaw). Uses the sqlite3 CLI (not
+// CHAD_BUGREPORT_REPO (default tantodefi/supachad). Uses the sqlite3 CLI (not
 // bun:sqlite) so it runs identically under node or bun.
 
 import { createSmithers } from "smithers-orchestrator";
@@ -23,7 +23,7 @@ import { homedir } from "node:os";
 import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_BUGREPORT_DB || "./bug-report.db";
-const REPO = process.env.CHAD_BUGREPORT_REPO || "tantodefi/NemoClaw";
+const REPO = process.env.CHAD_BUGREPORT_REPO || "tantodefi/supachad";
 const POST = process.env.CHAD_BUGREPORT_POST === "1";
 const LABEL = process.env.CHAD_BUGREPORT_LABEL || "chad-bug";
 const MAX_BUGS = Number(process.env.CHAD_BUGREPORT_MAX || 3);

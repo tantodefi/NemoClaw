@@ -57,7 +57,7 @@ Chad's persistence pipeline crosses three boundaries:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Source code lives in a separate repo (`tantodefi/NemoClaw`, public). See Backup Policy §1.1 (use the `nemoclaw-resources` skill) for the full source-vs-state split.
+Source code lives in a separate repo (`tantodefi/supachad`, public). See Backup Policy §1.1 (use the `nemoclaw-resources` skill) for the full source-vs-state split.
 
 ## Script Catalog
 
@@ -68,7 +68,7 @@ Source code lives in a separate repo (`tantodefi/NemoClaw`, public). See Backup 
 | `chad-setup.sh` | One-shot host-side bootstrapper. Restores workspace from local backup or chad-state, syncs skills, deploys credentials, installs cron wrappers + `chad-shim.py`, registers cron jobs, applies network policies, clones source. | First-time setup, after major upgrades, after a sandbox rebuild. |
 | `chad-deploy.sh` | **Incremental, manifest-driven, checksum-based deploy of wrappers, data files, and sandbox tools.** Reads `scripts/chad-deploy-manifest.txt` (single source of truth for src→dst mappings). `--verify` md5-compares every entry and exits 1 on drift; `--push` installs only what differs; `--file PATH` pushes one entry; `--dry-run` previews. Fails loud on errors (unlike `chad-setup.sh` which warns-and-continues). | After editing any wrapper or data file in source. Daily/CI as a drift watchdog (`--verify`). |
 | `chad-sync.sh` (`npm run chad:sync`) | Single-command snapshot orchestrator: dump → backup → cron audit → summary. | Before pod resets, after meaningful changes you want durably stored, on demand. |
-| `chad-clone-source.sh` | Clones `tantodefi/NemoClaw` into `/sandbox/source/` for in-sandbox read/grep access. | Auto-invoked by `chad-setup.sh`. Standalone if you need to refresh the source clone. |
+| `chad-clone-source.sh` | Clones `tantodefi/supachad` into `/sandbox/source/` for in-sandbox read/grep access. | Auto-invoked by `chad-setup.sh`. Standalone if you need to refresh the source clone. |
 | `backup-host.sh` | Snapshots `~/.nemoclaw/` (credentials, onboard session, sandbox metadata, draft policies, WIP skills) to `~/.nemoclaw/backups/host/<ts>/`. | Before re-onboarding, before destructive host operations, weekly. |
 | `backup-workspace.sh` | Manual workspace download/restore via `openshell sandbox download`. Uses the same sectioned manifest as the cron-driven backup. | Cross-host migrations, manifest-gap workarounds. |
 | `chad-dump-state.sh` | Generates a markdown state-dump (memory tail, ledger, sub-agent results, env). Local-only by default; `--tar` bundles raw logs. | Bug reports, before destructive ops, ad-hoc triage. |

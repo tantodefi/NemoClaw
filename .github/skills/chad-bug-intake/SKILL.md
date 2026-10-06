@@ -29,8 +29,8 @@ This skill is the orchestration layer that sits on top of the existing GitHub is
 
 ## Target Repository
 
-Supachad files issues on the **fork** `tantodefi/NemoClaw`, not upstream
-`NVIDIA/NemoClaw`. The scripts default to `tantodefi/NemoClaw` when not
+Supachad files issues on the **fork** `tantodefi/supachad`, not upstream
+`NVIDIA/NemoClaw`. The scripts default to `tantodefi/supachad` when not
 inside a git checkout. Override with `--repo` if needed.
 
 ## First-Time Setup

@@ -31,11 +31,11 @@ The `backup-workspace.sh` and `chad-backup-to-github.sh` scripts cover the works
 
 Chad uses two distinct GitHub repos with different visibility and contents — do not confuse them:
 
-| Aspect | `tantodefi/NemoClaw` | `tantodefi/chad-state` |
+| Aspect | `tantodefi/supachad` | `tantodefi/chad-state` |
 |---|---|---|
 | Visibility | Public (Apache-2.0 source) | **Private** |
 | Contents | Source code, docs, blueprint, scripts | Workspace markdown, memory, queue, cron jobs, runtime state, gbrain export |
-| Default env var | `CHAD_SOURCE_REPO=tantodefi/NemoClaw` | `CHAD_STATE_REPO=tantodefi/chad-state` |
+| Default env var | `CHAD_SOURCE_REPO=tantodefi/supachad` | `CHAD_STATE_REPO=tantodefi/chad-state` |
 | Sandbox path | `/sandbox/source/` (read-only clone via `chad-clone-source`) | `/sandbox/.openclaw/workspace/` + `/sandbox/.openclaw-data/` (restore target) |
 | Push mechanism | `git push` (manual, reviewed) | `gh api PUT` per file (cron-driven, sha-skip) |
 | Pull mechanism | `git clone` (`chad-clone-source`) | `git clone` then `cp -a` (`chad-restore-from-github`) |
@@ -392,7 +392,7 @@ NVIDIA/NemoClaw (upstream/main)
         │
         │  git fetch upstream && git rebase upstream/main
         ▼
-tantodefi/NemoClaw (origin/chad-dev)   ← your fork
+tantodefi/supachad (origin/chad-dev)   ← your fork
         │
         │  nemoclaw onboard --recreate-sandbox
         │  (Docker build → image push → pod restart)

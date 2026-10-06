@@ -29,7 +29,7 @@ import { runSpawn, scoreIssue, route, spawnResultSchema } from "../lib/spawn.js"
 import { postNote } from "../lib/note.js";
 
 const DB = process.env.CHAD_TRIAGE_DB || "./issue-triage.db";
-const REPO = process.env.CHAD_TRIAGE_REPO || "tantodefi/NemoClaw";
+const REPO = process.env.CHAD_TRIAGE_REPO || "tantodefi/supachad";
 const TOP = Number(process.env.CHAD_TRIAGE_TOP || 2);
 const LABEL = process.env.CHAD_TRIAGE_LABEL || ""; // optional filter
 const SUBSTRATE = process.env.CHAD_TRIAGE_SUBSTRATE || "gha"; // heavy/isolated → GH runner

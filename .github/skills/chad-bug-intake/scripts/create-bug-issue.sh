@@ -8,14 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default fork repo — Supachad files issues here, not on the upstream
 # NVIDIA/NemoClaw repo.  Override with --repo if needed.
-DEFAULT_REPO="tantodefi/NemoClaw"
+DEFAULT_REPO="tantodefi/supachad"
 
 usage() {
   cat <<'EOF'
 Usage: create-bug-issue.sh --subject TEXT [options]
 
 Options:
-  --repo OWNER/REPO      Target repository (default: tantodefi/NemoClaw).
+  --repo OWNER/REPO      Target repository (default: tantodefi/supachad).
   --subject TEXT         Raw chat or ProtonMail subject. Required.
   --body TEXT            Report body.
   --body-file PATH       Read report body from a file.

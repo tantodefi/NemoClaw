@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# chad-upstream-sync.sh — keep tantodefi/NemoClaw (fork) current with
+# chad-upstream-sync.sh — keep tantodefi/supachad (fork) current with
 # NVIDIA/NemoClaw (upstream), WITHOUT ever auto-merging a conflict onto a
 # protected branch.
 #

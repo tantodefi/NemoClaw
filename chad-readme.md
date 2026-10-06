@@ -273,7 +273,7 @@ Or, the source-agnostic shortcut:
 ```bash
 chad-intake --from chat   --task-file /tmp/task.md
 chad-intake --from proton --message-id <id>
-chad-intake --from issue  --repo tantodefi/NemoClaw --issue 42
+chad-intake --from issue  --repo tantodefi/supachad --issue 42
 chad-intake --from cron   --task-file /sandbox/.openclaw-data/queue/cron-task.md
 ```
 

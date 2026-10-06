@@ -23,7 +23,7 @@ import { prAction, shepherdSummary, PR_ACTIONS } from "../lib/pr.js";
 import { postNote } from "../lib/note.js";
 
 const DB = process.env.CHAD_PRSHEP_DB || "./pr-shepherd.db";
-const REPO = process.env.CHAD_PRSHEP_REPO || "tantodefi/NemoClaw";
+const REPO = process.env.CHAD_PRSHEP_REPO || "tantodefi/supachad";
 const STALE_DAYS = Number(process.env.CHAD_PRSHEP_STALE_DAYS || 3);
 const POST = process.env.CHAD_PRSHEP_POST === "1";
 

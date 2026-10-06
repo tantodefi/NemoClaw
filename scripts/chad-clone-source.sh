@@ -9,7 +9,7 @@
 # setup step called from scripts/chad-setup.sh after credentials are deployed.
 #
 # Defaults:
-#   CHAD_SOURCE_REPO   — tantodefi/NemoClaw
+#   CHAD_SOURCE_REPO   — tantodefi/supachad
 #   CHAD_SOURCE_BRANCH — main
 #   CHAD_SOURCE_DIR    — /sandbox/source
 #
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-REPO="${CHAD_SOURCE_REPO:-tantodefi/NemoClaw}"
+REPO="${CHAD_SOURCE_REPO:-tantodefi/supachad}"
 BRANCH="${CHAD_SOURCE_BRANCH:-main}"
 DEST="${CHAD_SOURCE_DIR:-/sandbox/source}"
 CREDS="${CHAD_CREDENTIALS:-/sandbox/.nemoclaw/credentials.json}"

@@ -20,7 +20,7 @@ import { execFile } from "node:child_process";
 import { pickAgent, pickFallback, taskOpts } from "../agents.js";
 
 const DB = process.env.CHAD_SKILLIMPROVE_DB || "./skill-improve.db";
-const REPO = process.env.CHAD_SKILLIMPROVE_REPO || "tantodefi/NemoClaw";
+const REPO = process.env.CHAD_SKILLIMPROVE_REPO || "tantodefi/supachad";
 const POST = process.env.CHAD_SKILLIMPROVE_POST === "1";
 const LABEL = process.env.CHAD_SKILLIMPROVE_LABEL || "chad-skill-improve";
 const MAX = Number(process.env.CHAD_SKILLIMPROVE_MAX || 3);
