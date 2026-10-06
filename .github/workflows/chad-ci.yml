@@ -45,8 +45,15 @@ jobs:
       - name: Install deps (no lifecycle scripts)
         run: npm install --ignore-scripts --no-audit --no-fund
 
+      # Build the CLI first — many scripts/*.mts import from dist/, so typecheck
+      # fails with phantom "Cannot find module '../dist/...'" errors without it.
+      - name: Build CLI
+        run: npm run build:cli
+
       # Pure tsc over bin/ + scripts/ — deterministic, no infra. 8 GB heap because
-      # the merged tree is large enough to OOM the default 4 GB.
+      # the merged tree is large enough to OOM the default 4 GB. (The lone
+      # @nvidia/openshell-sdk installer is excluded in tsconfig.cli.json — that
+      # optional dep isn't installable on a fork.)
       - name: Typecheck CLI
         run: NODE_OPTIONS=--max-old-space-size=8192 npm run typecheck:cli
 
