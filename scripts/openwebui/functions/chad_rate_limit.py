@@ -1,9 +1,9 @@
 """
 title: Chad Lite Rate Limit
 author: chad
-version: 0.1.0
+version: 0.2.0
 required_open_webui_version: 0.5.0
-description: Per-user daily message cap for the free tier (Chad Lite / nemotron-nano). Premium models (chad) are exempt. Tunable via valves.
+description: Per-user metering for the free tier. Credit-metered users (who bought credits via Square) consume 1 credit/message and skip the daily cap while in balance; everyone else gets the free daily message cap. Premium models (chad) and admins are exempt.
 """
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -48,6 +48,42 @@ def _save(state: dict) -> None:
         pass  # best-effort; a read-only FS just means in-memory-only for this call
 
 
+# Credit metering: the supachad Worker is the source of truth for credit balances
+# (topped up by Square checkouts). The filter consumes 1 credit/message via its
+# admin API. Gated on CHAD_CREDITS_ADMIN_SECRET being set, so the filter still works
+# (free-cap only) before the Worker is wired.
+_CREDITS_API = os.environ.get("CHAD_CREDITS_API", "https://supachad.com/api/credits")
+_CREDITS_SECRET = os.environ.get("CHAD_CREDITS_ADMIN_SECRET", "")
+
+
+def _consume_credit(email: str, amount: int = 1) -> str:
+    """Consume `amount` credits for `email` via the Worker. Returns:
+    "ok" (consumed — allow, skip daily cap), "insufficient" (0 balance),
+    "unconfigured" (no secret/email), or "error" (network/other). Any non-"ok"
+    result makes the caller fall through to the free daily cap — so a Worker
+    outage never hard-blocks, it just reverts to free-tier limits."""
+    if not _CREDITS_SECRET or not email or "@" not in email:
+        return "unconfigured"
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({"email": email, "amount": amount}).encode()
+    req = urllib.request.Request(
+        _CREDITS_API.rstrip("/") + "/consume",
+        data=body,
+        headers={"content-type": "application/json", "X-Admin-Secret": _CREDITS_SECRET},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            d = json.loads(resp.read() or b"{}")
+            return "ok" if d.get("ok") else "insufficient"
+    except urllib.error.HTTPError as e:
+        return "insufficient" if e.code == 402 else "error"
+    except Exception:
+        return "error"
+
+
 class Filter:
     class Valves(BaseModel):
         free_daily_limit: int = Field(
@@ -84,7 +120,14 @@ class Filter:
         user = __user__ or {}
         if self.valves.exempt_admins and user.get("role") == "admin":
             return body
-        uid = user.get("id") or user.get("email") or "anon"
+        email = user.get("email") or ""
+        uid = user.get("id") or email or "anon"
+
+        # Credit-metered users (bought credits via Square) pay per message and
+        # skip the free daily cap while they have a balance. Any non-"ok" result
+        # (no credits, or Worker unreachable) falls through to the free cap below.
+        if _CREDITS_SECRET and email and _consume_credit(email) == "ok":
+            return body
 
         state = _load()
         day = _today()
